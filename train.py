@@ -28,8 +28,18 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
+from RL.PPO import PPOTrainer,Critic
+from data.RL_dataset import get_rl_prompts
+import tiktoken
+from transformers import AutoModelForCausalLM, AutoModel, AutoModelForSequenceClassification, AutoTokenizer
 
 # -----------------------------------------------------------------------------
+# RLHF
+use_ppo = False
+use_grpo = False
+use_dapo = False
+use_token_entropy = False
+
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
@@ -56,6 +66,7 @@ dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
+RL_learning_rate=1e-5
 max_iters = 600000 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
@@ -78,6 +89,37 @@ config_keys = [k for k,v in globals().items() if not k.startswith('_') and isins
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
+# RL
+enc = tiktoken.get_encoding("gpt2")
+# 加载Skywork奖励模型
+reward_model_name = "Skywork/Skywork-Reward-V2-Qwen3-0.6B"
+reward_model = AutoModelForSequenceClassification.from_pretrained(reward_model_name).to(device).eval()
+reward_tokenizer = AutoTokenizer.from_pretrained(reward_model_name)
+class TokenizerWrapper:
+    def __init__(self, enc, max_length):
+        self.enc = enc
+        self.max_length = max_length
+        self.pad_token_id = 0
+        self.eos_token_id = 50304 
+    def __call__(self, texts, **kwargs):
+        input_ids = []
+        attention_mask = []
+        for text in texts:
+            ids = self.enc.encode(text)
+            if len(ids) > self.max_length:
+                ids = ids[:self.max_length]
+            mask = [1]*len(ids)
+
+            while len(ids) < self.max_length:
+                ids.append(self.pad_token_id)
+                mask.append(0)
+            input_ids.append(ids)
+            attention_mask.append(mask)
+        return {
+            'input_ids': torch.tensor(input_ids, device=device),
+            'attention_mask': torch.tensor(attention_mask, device=device)
+        }
+enc_wrapper = TokenizerWrapper(enc, max_length=block_size)
 
 # various inits, derived attributes, I/O setup
 # DDP 分布式训练初始化
@@ -256,91 +298,158 @@ if wandb_log and master_process:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
+# RL,后续再添加逻辑：选择哪种RL算法
+actor_model = model
+# 创建ref_model（actor的冻结副本）
+import copy
+ref_model = copy.deepcopy(actor_model).to(device)
+for param in ref_model.parameters():
+    param.requires_grad = False
+ref_model.eval()
+# 创建critic_model，基于actor_model的config
+critic_model = Critic(actor_model).to(device)
+# PPO 优化器
+optimizer_actor = torch.optim.AdamW(actor_model.parameters(), lr=RL_learning_rate, betas=(beta1, beta2), weight_decay=weight_decay)
+optimizer_critic = torch.optim.AdamW(critic_model.parameters(), lr=RL_learning_rate, betas=(beta1, beta2), weight_decay=weight_decay)
+# 初始化 PPOTrainer
+ppo_trainer = PPOTrainer(
+    actor_model=actor_model,
+    ref_model=ref_model,
+    reward_model=reward_model,
+    critic_model=critic_model,
+    actor_tokenizer=enc_wrapper,       # 做了适配，暂时不知道对不对
+    reward_tokenizer=reward_tokenizer,
+    optimizer_actor=optimizer_actor,
+    optimizer_critic=optimizer_critic,
+    device=device
+)
+
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
-while True:
 
-    # determine and set the learning rate for this iteration
-    lr = get_lr(iter_num) if decay_lr else learning_rate
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+if use_ppo:
+    while True:
+        # PPO主循环（替代原监督学习方式）
+        # Step 1: 从prompt生成经验
+        prompts = get_rl_prompts(batch_size)  # 后续定义
+        samples = ppo_trainer.generate_samples(prompts, max_length=block_size, max_new_tokens=block_size // 4)
+        experiences = ppo_trainer.evaluate_experience(samples[0])  # 只取一个sample列表，多个可扩展
 
-    # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0 and master_process:
-        losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-        if wandb_log:
-            wandb.log({
-                "iter": iter_num,
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
-                "lr": lr,
-                "mfu": running_mfu*100, # convert to percentage
-            })
-        if losses['val'] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses['val']
-            if iter_num > 0: # 保存了model state_dict、优化器状态、当前迭代、最佳loss等 # RLHF自定义保存逻辑
-                checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'model_args': model_args,
-                    'iter_num': iter_num,
-                    'best_val_loss': best_val_loss,
-                    'config': config,
-                }
-                print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
-    if iter_num == 0 and eval_only:
-        break
+        # Step 2: 多次更新 PPO
+        for exp in experiences:
+            policy_loss, value_loss = ppo_trainer.train_on_experience(exp)
 
-    # forward backward update, with optional gradient accumulation to simulate larger batch size
-    # and using the GradScaler if data type is float16
-    for micro_step in range(gradient_accumulation_steps):
-        if ddp:
-            # in DDP training we only need to sync gradients at the last micro step.
-            # the official way to do this is with model.no_sync() context manager, but
-            # I really dislike that this bloats the code and forces us to repeat code
-            # looking at the source of that context manager, it just toggles this variable
-            model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
-        with ctx:
-            logits, loss = model(X, Y)
-            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
-        # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train')
-        # backward pass, with gradient scaling if training in fp16
-        scaler.scale(loss).backward()# 缩放loss保证float16稳定性
-    # clip the gradient梯度裁剪
-    if grad_clip != 0.0:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    # step the optimizer and scaler if training in fp16
-    scaler.step(optimizer)
-    scaler.update()
-    # flush the gradients as soon as we can, no need for this memory anymore
-    optimizer.zero_grad(set_to_none=True)
+        # Step 3: Soft更新ref model,暂时冻结ref，不更新
+        # for ref_param, actor_param in zip(ref_model.parameters(), actor_model.parameters()):
+        #     ref_param.data.copy_(0.99 * ref_param.data + 0.01 * actor_param.data)
 
-    # timing and logging
-    t1 = time.time()
-    dt = t1 - t0
-    t0 = t1
-    if iter_num % log_interval == 0 and master_process:
-        # get loss as float. note: this is a CPU-GPU sync point
-        # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
-        lossf = loss.item() * gradient_accumulation_steps
-        if local_iter_num >= 5: # let the training loop settle a bit
-            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
-            running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
-    iter_num += 1
-    local_iter_num += 1
+        # Step 4: 日志与保存，与常规训练保持一致
+        if iter_num % eval_interval == 0 and master_process:
+            print(f"iter {iter_num}: policy_loss={policy_loss:.4f}, value_loss={value_loss:.4f}")
+            if wandb_log:
+                wandb.log({
+                    "iter": iter_num,
+                    "train/policy_loss": policy_loss,
+                    "train/value_loss": value_loss,
+                    # "lr": lr, # 暂时没加学习率调度
+                })
+            checkpoint = {
+                'model': raw_model.state_dict(),
+                'critic': critic_model.state_dict(),
+                'optimizer_actor': optimizer_actor.state_dict(),
+                'optimizer_critic': optimizer_critic.state_dict(),
+                'iter_num': iter_num,
+            }
+            print(f"saving PPO checkpoint to {out_dir}")
+            torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
 
-    # termination conditions
-    if iter_num > max_iters:
-        break
+        iter_num += 1
+        if iter_num > max_iters:
+            break
+else:
+    while True:
+        # determine and set the learning rate for this iteration
+        lr = get_lr(iter_num) if decay_lr else learning_rate
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+
+        # evaluate the loss on train/val sets and write checkpoints
+        if iter_num % eval_interval == 0 and master_process:
+            losses = estimate_loss()
+            print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+            if wandb_log:
+                wandb.log({
+                    "iter": iter_num,
+                    "train/loss": losses['train'],
+                    "val/loss": losses['val'],
+                    "lr": lr,
+                    "mfu": running_mfu*100, # convert to percentage
+                })
+            if losses['val'] < best_val_loss or always_save_checkpoint:
+                best_val_loss = losses['val']
+                if iter_num > 0: # 保存了model state_dict、优化器状态、当前迭代、最佳loss等 # RLHF自定义保存逻辑
+                    checkpoint = {
+                        'model': raw_model.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'model_args': model_args,
+                        'iter_num': iter_num,
+                        'best_val_loss': best_val_loss,
+                        'config': config,
+                    }
+                    print(f"saving checkpoint to {out_dir}")
+                    torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+        if iter_num == 0 and eval_only:
+            break
+
+        # forward backward update, with optional gradient accumulation to simulate larger batch size
+        # and using the GradScaler if data type is float16
+        # 主循环逻辑
+        for micro_step in range(gradient_accumulation_steps):
+            if ddp:
+                # in DDP training we only need to sync gradients at the last micro step.
+                # the official way to do this is with model.no_sync() context manager, but
+                # I really dislike that this bloats the code and forces us to repeat code
+                # looking at the source of that context manager, it just toggles this variable
+                model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
+            with ctx:
+                logits, loss = model(X, Y)
+                loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+            # immediately async prefetch next batch while model is doing the forward pass on the GPU
+            X, Y = get_batch('train')
+            # backward pass, with gradient scaling if training in fp16
+            scaler.scale(loss).backward()# 缩放loss保证float16稳定性
+        # clip the gradient梯度裁剪
+        if grad_clip != 0.0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        # step the optimizer and scaler if training in fp16
+        scaler.step(optimizer)
+        scaler.update()
+        # flush the gradients as soon as we can, no need for this memory anymore
+        optimizer.zero_grad(set_to_none=True)
+
+        # timing and logging
+        t1 = time.time()
+        dt = t1 - t0
+        t0 = t1
+        if iter_num % log_interval == 0 and master_process:
+            # get loss as float. note: this is a CPU-GPU sync point
+            # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
+            lossf = loss.item() * gradient_accumulation_steps
+            if local_iter_num >= 5: # let the training loop settle a bit
+                mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
+                running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
+            print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        iter_num += 1
+        local_iter_num += 1
+
+        # termination conditions
+        if iter_num > max_iters:
+            break
 
 if ddp:
     destroy_process_group()

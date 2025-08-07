@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-# LN,标准预处理层
+# 标准LayerNorm实现，但允许去掉bias（可在config控制）
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -27,7 +27,9 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
-# 多头注意力机制 + causal masking:防止模型看到未来token
+# 多头注意力 + 因果mask（不能看到未来token）
+# 输入: x -> (B, T, C)
+# 输出: y -> (B, T, C)
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -80,6 +82,7 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
+#transformer block中的FFN：投影到高维再投影回来，非线性GELU
 class MLP(nn.Module):
 
     def __init__(self, config):
@@ -131,6 +134,7 @@ class GPT(nn.Module):
         assert config.block_size is not None
         self.config = config
         
+        # 初始化各层：词嵌入、位置嵌入、block层、最终LayerNorm,按顺序堆叠
         # token embedding # position embedding
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
@@ -177,7 +181,8 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    # 输入token序列：idx: LongTensor, shape (B, T)
+    # 输入 idx: (B, T)
+    # 输出: logits (B, T, vocab_size)
     # 如果给定，表示训练标签：targets: Optional[LongTensor]
     def forward(self, idx, targets=None):
         device = idx.device
@@ -188,7 +193,7 @@ class GPT(nn.Module):
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        x = self.transformer.drop(tok_emb + pos_emb)# (B, T, C)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
@@ -321,7 +326,8 @@ class GPT(nn.Module):
         return mfu
 
     #从一个输入token序列idx开始，生成max_new_tokens个新的token
-    #idx: 初始输入token的索引序列，shape为(batch_size, seq_len)，prompt
+    # 输入 idx: 初始prompt (B, T)
+    # 输出: 扩展后的token序列 (B, T+max_new_tokens)
     @torch.no_grad()#不需要反向传播
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         """

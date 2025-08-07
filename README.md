@@ -3,16 +3,6 @@
 + python data/shakespeare_char/prepare.py
 + python train.py config/finetune_yourdata.py
 
-## 
-+ from google.colab import drive
-+ drive.mount('/content/drive')
-+ cd /content/drive/MyDrive/LLM+RL
-+ git clone https://github.com/zu-zi/LLM-RL.git
-+ finetue:
-+ git add .
-+ git commit -m "...."
-+ git push origin main
-
 ## autodl 
 ```
 !apt-get update
@@ -32,3 +22,64 @@ os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
 //注：如果减小（gradient_accumulation_steps = 32；block_size =128）显存仍不够，可以换成更小的gpt2-medium/gpt2-large先验证跑通
 
 最终在4090D上设置的可行结果：32/1024/large
+
+## Process
+### Model
++ input:idx (B, T)
++ Embedding（token + position）:(B, T, C)
++ Transformer Block：
+   + LayerNorm:(B, T, C)
+   + Causal Self-Attention:x -> (B, T, C);y -> (B, T, C)
+   + MLP:(B, T, C);(B, T, 4*C);(B, T, C)
++ LayerNorm:(B, T, C)
++ lm_head:logits(B, T, vocab_size)
++ loss(train)/sampling(eval):(B, T+max_new_tokens)
+
+### Superparameter
+#### 现在配置下(large)，各数值：
++ B = batch_size*gradient_accumulation_steps = 1 * 32 = 32
++ T = block_size = 1024
++ C = n_embd = 1280
++ vocab_size = 50304
++ n_layer = 36
++ n_head = 20
+#### 用于PPO设计:
++ log_probs:
+```
+probs = F.softmax(logits, dim=-1)         # (B, T, vocab_size)
+dist = Categorical(probs)
+log_probs = dist.log_prob(actions)        # (B, T)
+```
++ old_log_probs:(B, T)
++ actions.shape == (B, T)
++ rewards:
+  + sentence-level:rewards.shape == (B,) 
+  + token-level:(B, T)
++ value estimate
+```
+x = self.transformer.ln_f(x)             # (B, T, C)
+value = value_head(hidden_states)        # (B, T)
+```
++ advantages:(B, T)
++ ratio:(B, T):exp(log_prob - old_log_prob)
+
+
+### Train & config
+```
+# 根据3种情况初始化模型和优化器
+model = GPT(config)
+optimizer = optim.AdamW(...)
+
+# 加载训练集
+train_data = ...
+
+for iter in range(max_iters):
+
+    x, y = get_batch(...)
+    
+    logits, loss = model(x, y)
+
+    loss.backward()
+    optimizer.step()
+    ...
+```
