@@ -43,17 +43,39 @@ class ExperienceBuffer:
     def clear(self):
         self.buffer = []
 
+@staticmethod
+def contains_chinese(text):
+    #检查是否含中文字符
+    return any('\u4e00' <= c <= '\u9fff' for c in text)
+
+def normalize_for_reward(self, text):
+    #确保GPT-2生成文本适配Qwen分词器
+    # 1. 替换EOS（必须）
+    if hasattr(self.reward_tokenizer, "eos_token"):
+        text = text.replace("<|endoftext|>", self.reward_tokenizer.eos_token)
+    
+    # 2. 统一换行符（预防性）
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    
+    # 3. 中文标点→英文（可选，依数据集而定）
+    if contains_chinese(text):
+        text = text.replace("，", ",").replace("。", ".")
+    
+    # 4. 移除控制字符（必须）
+    return "".join(c for c in text if c.isprintable())
+
 class Critic(nn.Module):
     def __init__(self, base_model):
         super().__init__()
-        self.base_model = base_model
-        self.base_model.eval()
-        self.value_head = nn.Linear(base_model.config.hidden_size, 1)
-
+        self.transformer = base_model.transformer  # 共享底层transformer
+        self.value_head = nn.Linear(base_model.config.n_embd, 1)
+        
     def forward(self, input_ids, attention_mask, num_actions):
-        hidden = self.base_model(input_ids, attention_mask=attention_mask).last_hidden_state
-        value = self.value_head(hidden).squeeze(-1)[:, -num_actions:]
-        return value
+        hidden = self.transformer(input_ids, attention_mask=attention_mask)[0]
+        values = self.value_head(hidden).squeeze(-1)
+        prompt_len = attention_mask.sum(1) - num_actions
+        values = torch.stack([values[i, prompt_len[i]:] for i in range(len(prompt_len))])
+        return values
 
 class PPOTrainer:
     def __init__(
@@ -66,9 +88,9 @@ class PPOTrainer:
         reward_tokenizer,
         optimizer_actor,
         optimizer_critic,
-        kl_ctl=0.1,
-        clip_reward=0.2,
-        gamma=0.99,
+        kl_ctl=0.02,# 需要调整，初始较小的KL惩罚
+        clip_reward=5.0,# 需要调整，更大的奖励裁剪范围
+        gamma=0.9,
         lambd=0.95,
         device="cuda"
     ):
@@ -85,29 +107,48 @@ class PPOTrainer:
         self.gamma = gamma
         self.lambd = lambd
         self.device = device
+        self.pad_token_id = getattr(actor_tokenizer, "pad_token_id", 0)
+        self.eos_token_id = getattr(actor_tokenizer, "eos_token_id", 50304)
 
-    def generate_samples(self, prompts: List[str], max_length, max_new_tokens):
+    def generate_samples(self, inputs, max_length, max_new_tokens):
+        # inputs: (input_ids, attention_mask) 来自 prepare.py 预处理的 prompt.bin
         model = self.actor.eval()
-        inputs = self.actor_tokenizer(prompts, return_tensors='pt', padding='max_length',
-                                      truncation=True, max_length=max_length).to(self.device)
-        prompt_len = (inputs['attention_mask'] == 1).sum(1)
+
+        input_ids, attention_mask = inputs
+        input_ids = input_ids.to(self.device)
+        attention_mask = attention_mask.to(self.device)
+
+        # prompt 长度（非 pad 部分的长度）
+        prompt_len = attention_mask.sum(1)
 
         with torch.no_grad():
             outputs = model.generate(
-                **inputs,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
                 max_new_tokens=max_new_tokens,
-                eos_token_id=self.actor_tokenizer.eos_token_id,
-                pad_token_id=self.actor_tokenizer.pad_token_id,
+                eos_token_id=self.eos_token_id,
+                pad_token_id=self.pad_token_id
             )
 
         seqs = outputs
-        attention_mask = (seqs != self.actor_tokenizer.pad_token_id).long()
+        # 新的 attention_mask：生成后的序列中，非 pad 部分标 1
+        new_attention_mask = (seqs != self.pad_token_id).long()
+
+        # action_mask：从 prompt_len 之后的部分为动作
         action_mask = torch.zeros_like(seqs)
         for i in range(seqs.size(0)):
-            action_mask[i, prompt_len[i]:] = (seqs[i, prompt_len[i]:] != self.actor_tokenizer.eos_token_id)
+            action_mask[i, prompt_len[i]:] = (seqs[i, prompt_len[i]:] != self.eos_token_id)
 
-        return [Samples(seqs, attention_mask, action_mask, action_mask.size(1) - prompt_len.min().item(),
-                        action_mask.sum(-1), attention_mask.sum(-1))]
+        return [
+            Samples(
+                seqs=seqs,
+                attention_mask=new_attention_mask,
+                action_mask=action_mask,
+                num_actions=action_mask.size(1) - prompt_len.min().item(),
+                response_length=action_mask.sum(-1),
+                total_length=new_attention_mask.sum(-1)
+            )
+        ]
 
     def compute_kl(self, log_probs, ref_log_probs, action_mask):
         kl = (log_probs - ref_log_probs) * action_mask
@@ -115,11 +156,13 @@ class PPOTrainer:
 
     def compute_rewards(self, kl, reward_scores, action_mask):
         rewards = -self.kl_ctl * kl
-        ends = action_mask.sum(1)
+        # 更平滑的奖励分配
         reward_clip = torch.clamp(reward_scores, -self.clip_reward, self.clip_reward)
+        response_lengths = action_mask.sum(1)
         for j in range(rewards.size(0)):
-            if ends[j] > 0:
-                rewards[j, ends[j] - 1] += reward_clip[j]
+            if response_lengths[j] > 0:
+                # 将奖励均匀分配到response的每个token
+                rewards[j] += reward_clip[j] / response_lengths[j]
         return rewards
 
     def get_advantages(self, values, rewards, action_mask):
@@ -150,7 +193,13 @@ class PPOTrainer:
 
             kl = self.compute_kl(log_probs, ref_log_probs, act_mask)
             values = self.critic(seqs, attn_mask, num_actions)
-            texts = self.actor_tokenizer.batch_decode(seqs, skip_special_tokens=True)
+            # 用GPT-2解码
+            # texts = self.actor_tokenizer.batch_decode(seqs, skip_special_tokens=True)
+            texts = [
+                normalize_for_reward(t) 
+                for t in self.actor_tokenizer.batch_decode(seqs)
+            ]
+            # 用Qwen重新编码
             reward_inputs = self.reward_tokenizer(texts, return_tensors="pt", padding=True).to(self.device)
             reward_scores = self.reward_model(**reward_inputs).logits[:, 0]
             rewards = self.compute_rewards(kl, reward_scores, act_mask)
@@ -187,21 +236,31 @@ class PPOTrainer:
         return ((loss * action_mask).sum(-1) / action_mask.sum(-1)).mean()
 
     def train_on_experience(self, experience: Experience):
+        # 训练actor
         self.actor.train()
+        with torch.cuda.amp.autocast(enabled=(self.device.type == 'cuda')):
+            logits = self.actor(experience.seqs, attention_mask=experience.attention_mask).logits
+            log_probs = F.log_softmax(logits[:, :-1], dim=-1)
+            indices = experience.seqs[:, 1:].unsqueeze(-1)
+            new_log_probs = log_probs.gather(-1, indices).squeeze(-1)[:, -experience.num_actions:]
+            policy_loss = self.policy_loss(new_log_probs, experience.action_log_probs, 
+                                        experience.advantages, experience.action_mask)
+        
         self.optimizer_actor.zero_grad()
-        logits = self.actor(experience.seqs, attention_mask=experience.attention_mask).logits
-        log_probs = F.log_softmax(logits[:, :-1], dim=-1)
-        indices = experience.seqs[:, 1:].unsqueeze(-1)
-        new_log_probs = log_probs.gather(-1, indices).squeeze(-1)[:, -experience.num_actions:]
-        policy_loss = self.policy_loss(new_log_probs, experience.action_log_probs, experience.advantages, experience.action_mask)
         policy_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)  # 在step之前裁剪，可尝试更宽松的裁剪
         self.optimizer_actor.step()
 
+        # 训练critic
         self.critic.train()
+        with torch.cuda.amp.autocast(enabled=(self.device.type == 'cuda')):
+            values = self.critic(experience.seqs, experience.attention_mask, experience.num_actions)
+            value_loss = self.value_loss(values, experience.values, 
+                                    experience.returns, experience.action_mask)
+        
         self.optimizer_critic.zero_grad()
-        values = self.critic(experience.seqs, experience.attention_mask, experience.num_actions)
-        value_loss = self.value_loss(values, experience.values, experience.returns, experience.action_mask)
         value_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)  # 在step之前裁剪
         self.optimizer_critic.step()
 
         return policy_loss.item(), value_loss.item()

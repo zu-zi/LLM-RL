@@ -29,7 +29,7 @@ from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
 from RL.PPO import PPOTrainer,Critic
-from data.RL_dataset import get_rl_prompts
+from data.RL_dataset.prepare import enc_wrapper
 import tiktoken
 from transformers import AutoModelForCausalLM, AutoModel, AutoModelForSequenceClassification, AutoTokenizer
 
@@ -90,36 +90,23 @@ exec(open('configurator.py').read()) # overrides from command line or config fil
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 # RL
-enc = tiktoken.get_encoding("gpt2")
+PROMPT_FILE = os.path.join(os.path.dirname(__file__), "prompt.bin")
+print(f"Loading pre-tokenized prompts from {PROMPT_FILE} ...")
+prompt_data = torch.load(PROMPT_FILE)   # {'input_ids': Tensor, 'attention_mask': Tensor}
+num_prompts = prompt_data['input_ids'].size(0)
+print(f"Loaded {num_prompts} prompts.")
+
+def get_prompt_batch(batch_size, device):
+    #从 prompt.bin 中随机取 batch
+    idx = torch.randint(0, num_prompts, (batch_size,))
+    input_ids = prompt_data['input_ids'][idx].to(device)
+    attention_mask = prompt_data['attention_mask'][idx].to(device)
+    return input_ids, attention_mask
+
 # 加载Skywork奖励模型
 reward_model_name = "Skywork/Skywork-Reward-V2-Qwen3-0.6B"
 reward_model = AutoModelForSequenceClassification.from_pretrained(reward_model_name).to(device).eval()
 reward_tokenizer = AutoTokenizer.from_pretrained(reward_model_name)
-class TokenizerWrapper:
-    def __init__(self, enc, max_length):
-        self.enc = enc
-        self.max_length = max_length
-        self.pad_token_id = 0
-        self.eos_token_id = 50304 
-    def __call__(self, texts, **kwargs):
-        input_ids = []
-        attention_mask = []
-        for text in texts:
-            ids = self.enc.encode(text)
-            if len(ids) > self.max_length:
-                ids = ids[:self.max_length]
-            mask = [1]*len(ids)
-
-            while len(ids) < self.max_length:
-                ids.append(self.pad_token_id)
-                mask.append(0)
-            input_ids.append(ids)
-            attention_mask.append(mask)
-        return {
-            'input_ids': torch.tensor(input_ids, device=device),
-            'attention_mask': torch.tensor(attention_mask, device=device)
-        }
-enc_wrapper = TokenizerWrapper(enc, max_length=block_size)
 
 # various inits, derived attributes, I/O setup
 # DDP 分布式训练初始化
@@ -317,7 +304,7 @@ ppo_trainer = PPOTrainer(
     ref_model=ref_model,
     reward_model=reward_model,
     critic_model=critic_model,
-    actor_tokenizer=enc_wrapper,       # 做了适配，暂时不知道对不对
+    actor_tokenizer=enc_wrapper,       # 只是占位，不会再重复分词
     reward_tokenizer=reward_tokenizer,
     optimizer_actor=optimizer_actor,
     optimizer_critic=optimizer_critic,
@@ -335,9 +322,13 @@ if use_ppo:
     while True:
         # PPO主循环（替代原监督学习方式）
         # Step 1: 从prompt生成经验
-        prompts = get_rl_prompts(batch_size)  # 后续定义
-        samples = ppo_trainer.generate_samples(prompts, max_length=block_size, max_new_tokens=block_size // 4)
-        experiences = ppo_trainer.evaluate_experience(samples[0])  # 只取一个sample列表，多个可扩展
+        input_ids, attention_mask = get_prompt_batch(batch_size, device)
+        samples = ppo_trainer.generate_samples(
+            (input_ids, attention_mask), 
+            max_length=block_size, 
+            max_new_tokens=block_size // 4
+        )
+        experiences = ppo_trainer.evaluate_experience(samples[0])
 
         # Step 2: 多次更新 PPO
         for exp in experiences:
@@ -365,7 +356,8 @@ if use_ppo:
                 'iter_num': iter_num,
             }
             print(f"saving PPO checkpoint to {out_dir}")
-            torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+            # 暂时设置的都存
+            torch.save(checkpoint, os.path.join(out_dir, 'RL_ckpt.pt'))
 
         iter_num += 1
         if iter_num > max_iters:

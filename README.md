@@ -83,3 +83,18 @@ for iter in range(max_iters):
     optimizer.step()
     ...
 ```
+
+### Tokenizer
+```
+get_rl_prompts()               # prompt 是字符串
+    ↓ enc_wrapper(prompt)      # tiktoken → token id → Actor
+Actor.generate()
+    ↓ enc.decode(token_id)     # tiktoken 解码
+Reward_tokenizer.encode(text)  # reward 模型自己的分词器
+    ↓ Reward Model 
+
+```
+
+### 代做
++ 小规模测试：先用很小的模型(如1层transformer)和少量数据测试流程能否跑通；检查各环节的输入输出形状是否匹配
++ 指标监控：初始阶段应看到：奖励值缓慢上升；KL散度保持在一定范围内(建议0.5-5之间)；价值损失逐渐下降
