@@ -86,7 +86,7 @@ for iter in range(max_iters):
 
 ### Tokenizer
 ```
-get_rl_prompts()               # prompt 是字符串
+collect_prompts()              # prompt 是字符串
     ↓ enc_wrapper(prompt)      # tiktoken → token id → Actor
 Actor.generate()
     ↓ enc.decode(token_id)     # tiktoken 解码
