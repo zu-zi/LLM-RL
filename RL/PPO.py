@@ -118,45 +118,83 @@ class PPOTrainer:
         self.eos_token_id = getattr(actor_tokenizer, "eos_token_id", 50304)
 
     # 用actor模型生成文本，从input_ids和attention_mask中给定的prompt开始生成max_new_tokens个token
-    def generate_samples(self, inputs, max_length, max_new_tokens):
-        # inputs: (input_ids, attention_mask) 来自 prepare.py 预处理的 prompt.bin
-        model = self.actor.eval()
+    # def generate_samples(self, inputs, max_length, max_new_tokens):
+    #     # inputs: (input_ids, attention_mask) 来自 prepare.py 预处理的 prompt.bin
+    #     model = self.actor.eval()
 
+    #     input_ids, attention_mask = inputs
+    #     input_ids = input_ids.to(self.device)
+    #     attention_mask = attention_mask.to(self.device)
+
+    #     # prompt 长度（非 pad 部分的长度）
+    #     prompt_len = attention_mask.sum(1)
+
+    #     with torch.no_grad():# 要改一下，跟nanogpt对齐
+    #         outputs = model.generate(
+    #             ids=input_ids,
+    #             attention_mask=attention_mask,
+    #             max_new_tokens=max_new_tokens,
+    #             eos_token_id=self.eos_token_id,
+    #             pad_token_id=self.pad_token_id
+    #         )
+
+    #     seqs = outputs
+    #     # 新的attention_mask：生成后的序列中，非pad部分标 1
+    #     new_attention_mask = (seqs != self.pad_token_id).long()
+
+    #     # action_mask：从prompt_len之后的部分为动作
+    #     action_mask = torch.zeros_like(seqs)
+    #     for i in range(seqs.size(0)):
+    #         action_mask[i, prompt_len[i]:] = (seqs[i, prompt_len[i]:] != self.eos_token_id)
+
+    #     return [
+    #         Samples(
+    #             seqs=seqs,
+    #             attention_mask=new_attention_mask,
+    #             action_mask=action_mask,
+    #             num_actions=action_mask.size(1) - prompt_len.min().item(),
+    #             response_length=action_mask.sum(-1),
+    #             total_length=new_attention_mask.sum(-1)
+    #         )
+    #     ]#返回一个Samples对象，封装生成的序列和对应mask信息
+    def generate_samples(self, inputs, max_length, max_new_tokens):
+        model = self.actor  # actor 应该是 raw_model（非 DDP wrapper）
         input_ids, attention_mask = inputs
         input_ids = input_ids.to(self.device)
         attention_mask = attention_mask.to(self.device)
+        prompt_len = attention_mask.sum(1).long()
 
-        # prompt 长度（非 pad 部分的长度）
-        prompt_len = attention_mask.sum(1)
-
-        with torch.no_grad():# 要改一下，跟nanogpt对齐
+        # 使用 nanoGPT 的 generate 签名
+        with torch.no_grad():
             outputs = model.generate(
-                ids=input_ids,
-                attention_mask=attention_mask,
+                input_ids,
                 max_new_tokens=max_new_tokens,
-                eos_token_id=self.eos_token_id,
-                pad_token_id=self.pad_token_id
+                eos_token_id=self.eos_token_id
             )
 
-        seqs = outputs
-        # 新的attention_mask：生成后的序列中，非pad部分标 1
+        seqs = outputs  # (B, T+gen)
         new_attention_mask = (seqs != self.pad_token_id).long()
 
-        # action_mask：从prompt_len之后的部分为动作
         action_mask = torch.zeros_like(seqs)
         for i in range(seqs.size(0)):
-            action_mask[i, prompt_len[i]:] = (seqs[i, prompt_len[i]:] != self.eos_token_id)
+            # prompt_len[i] 是 long，可能需要 int
+            start = int(prompt_len[i].item())
+            # 标记从 prompt 之后直到 eos 的 tokens 都是动作（不包括 pad）
+            action_mask[i, start: seqs.size(1)] = (seqs[i, start:] != self.pad_token_id).long()
 
-        return [
-            Samples(
-                seqs=seqs,
-                attention_mask=new_attention_mask,
-                action_mask=action_mask,
-                num_actions=action_mask.size(1) - prompt_len.min().item(),
-                response_length=action_mask.sum(-1),
-                total_length=new_attention_mask.sum(-1)
-            )
-        ]#返回一个Samples对象，封装生成的序列和对应mask信息
+        num_actions = action_mask.size(1) - int(prompt_len.min().item())
+        response_length = action_mask.sum(-1)
+        total_length = new_attention_mask.sum(-1)
+
+        return [Samples(
+            seqs=seqs,
+            attention_mask=new_attention_mask,
+            action_mask=action_mask,
+            num_actions=num_actions,
+            response_length=response_length,
+            total_length=total_length
+        )]
+
 
     #计算当前策略(log_probs)和参考策略(ref_log_probs)的KL散度#只计算动作位置
     def compute_kl(self, log_probs, ref_log_probs, action_mask):
@@ -193,47 +231,99 @@ class PPOTrainer:
         return advantages.detach(), returns.detach()
 
     #根据生成的样本samples计算各种训练所需的信号
+    # def evaluate_experience(self, samples: Samples):
+    #     seqs, attn_mask, act_mask, num_actions = samples.seqs, samples.attention_mask, samples.action_mask, samples.num_actions
+    #     with torch.no_grad():
+    #         #先通过actor和ref模型算出动作对应的log概率，用来计算KL
+    #         logits = self.actor(seqs, attention_mask=attn_mask).logits
+    #         ref_logits = self.ref(seqs, attention_mask=attn_mask).logits
+    #         log_probs = F.log_softmax(logits[:, :-1], dim=-1)
+    #         ref_log_probs = F.log_softmax(ref_logits[:, :-1], dim=-1)
+    #         indices = seqs[:, 1:].unsqueeze(-1)
+    #         log_probs = log_probs.gather(-1, indices).squeeze(-1)[:, -num_actions:]
+    #         ref_log_probs = ref_log_probs.gather(-1, indices).squeeze(-1)[:, -num_actions:]
+    #         kl = self.compute_kl(log_probs, ref_log_probs, act_mask)
+
+    #         #用critic模型计算价值估计
+    #         values = self.critic(seqs, attn_mask, num_actions)
+    #         # 用GPT-2解码
+    #         # texts = self.actor_tokenizer.batch_decode(seqs, skip_special_tokens=True)
+    #         texts = [
+    #             normalize_for_reward(t) 
+    #             for t in self.actor_tokenizer.batch_decode(seqs)
+    #         ]
+    #         # 用Qwen重新编码
+    #         reward_inputs = self.reward_tokenizer(texts, return_tensors="pt", padding=True).to(self.device)
+    #         reward_scores = self.reward_model(**reward_inputs).logits[:, 0]
+    #         rewards = self.compute_rewards(kl, reward_scores, act_mask)
+    #         advantages, returns = self.get_advantages(values, rewards, act_mask)
+
+    #     return [
+    #         Experience(
+    #             seqs=seqs,
+    #             action_log_probs=log_probs,
+    #             values=values,
+    #             returns=returns,
+    #             advantages=advantages,
+    #             attention_mask=attn_mask,
+    #             action_mask=act_mask,
+    #             reward=reward_scores.unsqueeze(1),
+    #             num_actions=num_actions,
+    #             kl=kl
+    #         )
+    #     ]
     def evaluate_experience(self, samples: Samples):
         seqs, attn_mask, act_mask, num_actions = samples.seqs, samples.attention_mask, samples.action_mask, samples.num_actions
+        seqs = seqs.to(self.device)
+        attn_mask = attn_mask.to(self.device)
+        act_mask = act_mask.to(self.device)
         with torch.no_grad():
-            #先通过actor和ref模型算出动作对应的log概率，用来计算KL
-            logits = self.actor(seqs, attention_mask=attn_mask).logits
-            ref_logits = self.ref(seqs, attention_mask=attn_mask).logits
-            log_probs = F.log_softmax(logits[:, :-1], dim=-1)
-            ref_log_probs = F.log_softmax(ref_logits[:, :-1], dim=-1)
-            indices = seqs[:, 1:].unsqueeze(-1)
-            log_probs = log_probs.gather(-1, indices).squeeze(-1)[:, -num_actions:]
-            ref_log_probs = ref_log_probs.gather(-1, indices).squeeze(-1)[:, -num_actions:]
+            # 得到每个 time step 的 logits
+            logits_all, _ = self.actor(seqs, return_all_logits=True)  # (B, T, V)
+            ref_logits_all, _ = self.ref(seqs, return_all_logits=True)
+
+            # 计算 token 级 log_probs：shifted by 1
+            log_probs_all = F.log_softmax(logits_all, dim=-1)  # (B, T, V)
+            ref_log_probs_all = F.log_softmax(ref_logits_all, dim=-1)
+            # token index for next-token prediction (shifted)
+            indices = seqs[:, 1:].unsqueeze(-1)  # (B, T-1, 1)
+            log_probs = log_probs_all[:, :-1].gather(-1, indices).squeeze(-1)  # (B, T-1)
+            ref_log_probs = ref_log_probs_all[:, :-1].gather(-1, indices).squeeze(-1)
+
+            # 取出动作部分（最后 num_actions tokens）
+            if num_actions > 0:
+                log_probs = log_probs[:, -num_actions:]
+                ref_log_probs = ref_log_probs[:, -num_actions:]
+                # action mask 对齐到 num_actions 长度
+                act_mask = act_mask[:, -num_actions:]
+            else:
+                log_probs = torch.zeros(seqs.size(0), 0, device=self.device)
+                ref_log_probs = torch.zeros_like(log_probs)
+
             kl = self.compute_kl(log_probs, ref_log_probs, act_mask)
 
-            #用critic模型计算价值估计
+            # critic 估值（你已有实现，确保 critic 接口与输入一致）
             values = self.critic(seqs, attn_mask, num_actions)
-            # 用GPT-2解码
-            # texts = self.actor_tokenizer.batch_decode(seqs, skip_special_tokens=True)
-            texts = [
-                normalize_for_reward(t) 
-                for t in self.actor_tokenizer.batch_decode(seqs)
-            ]
-            # 用Qwen重新编码
+
+            # reward model 部分保持不变（你把 texts decode 后喂给 reward_model）
+            texts = [normalize_for_reward(t) for t in self.actor_tokenizer.batch_decode(seqs)]
             reward_inputs = self.reward_tokenizer(texts, return_tensors="pt", padding=True).to(self.device)
             reward_scores = self.reward_model(**reward_inputs).logits[:, 0]
             rewards = self.compute_rewards(kl, reward_scores, act_mask)
             advantages, returns = self.get_advantages(values, rewards, act_mask)
 
-        return [
-            Experience(
-                seqs=seqs,
-                action_log_probs=log_probs,
-                values=values,
-                returns=returns,
-                advantages=advantages,
-                attention_mask=attn_mask,
-                action_mask=act_mask,
-                reward=reward_scores.unsqueeze(1),
-                num_actions=num_actions,
-                kl=kl
-            )
-        ]
+        return [Experience(
+            seqs=seqs,
+            action_log_probs=log_probs,
+            values=values,
+            returns=returns,
+            advantages=advantages,
+            attention_mask=attn_mask,
+            action_mask=act_mask,
+            reward=reward_scores.unsqueeze(1),
+            num_actions=num_actions,
+            kl=kl
+        )]
 
     #
     def policy_loss(self, new_log_probs, old_log_probs, advantages, action_mask, clip_eps=0.2):

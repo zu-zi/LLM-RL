@@ -248,7 +248,32 @@ if compile:
 # wrap model into DDP container
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
+# unwrap raw model for saving / for using custom methods (generate, forward return_all_logits)
+raw_model = model.module if ddp else model
+# RL,后续再添加逻辑：选择哪种RL算法
+actor_model = raw_model
+import copy
+ref_model = copy.deepcopy(actor_model).to(device)
+for param in ref_model.parameters():
+    param.requires_grad = False
+ref_model.eval()
 
+critic_model = Critic(actor_model).to(device)
+
+optimizer_actor = torch.optim.AdamW(actor_model.parameters(), lr=RL_learning_rate, betas=(beta1, beta2), weight_decay=weight_decay)
+optimizer_critic = torch.optim.AdamW(critic_model.parameters(), lr=RL_learning_rate, betas=(beta1, beta2), weight_decay=weight_decay)
+
+ppo_trainer = PPOTrainer(
+    actor_model=actor_model,
+    ref_model=ref_model,
+    reward_model=reward_model,
+    critic_model=critic_model,
+    actor_tokenizer=enc_wrapper,
+    reward_tokenizer=reward_tokenizer,
+    optimizer_actor=optimizer_actor,
+    optimizer_critic=optimizer_critic,
+    device=device
+)
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
 def estimate_loss():#每隔一段时间会用这个函数来估算当前模型在train和val上的loss
@@ -285,37 +310,10 @@ if wandb_log and master_process:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
-# RL,后续再添加逻辑：选择哪种RL算法
-actor_model = model
-# 创建ref_model（actor的冻结副本）
-import copy
-ref_model = copy.deepcopy(actor_model).to(device)
-for param in ref_model.parameters():
-    param.requires_grad = False
-ref_model.eval()
-# 创建critic_model，基于actor_model的config
-critic_model = Critic(actor_model).to(device)
-# PPO 优化器
-optimizer_actor = torch.optim.AdamW(actor_model.parameters(), lr=RL_learning_rate, betas=(beta1, beta2), weight_decay=weight_decay)
-optimizer_critic = torch.optim.AdamW(critic_model.parameters(), lr=RL_learning_rate, betas=(beta1, beta2), weight_decay=weight_decay)
-# 初始化 PPOTrainer
-ppo_trainer = PPOTrainer(
-    actor_model=actor_model,
-    ref_model=ref_model,
-    reward_model=reward_model,
-    critic_model=critic_model,
-    actor_tokenizer=enc_wrapper,       # 只是占位，不会再重复分词
-    reward_tokenizer=reward_tokenizer,
-    optimizer_actor=optimizer_actor,
-    optimizer_critic=optimizer_critic,
-    device=device
-)
-
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
-raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
 
 if use_ppo:
