@@ -14,7 +14,7 @@ class Samples:
     seqs: torch.Tensor#文本输入+生成输出的token序列
     attention_mask: torch.Tensor #用于Transformer计算时屏蔽无效token
     action_mask: torch.Tensor#哪些位置是“可动作”的位置
-    num_actions: torch.Tensor  # shape: (batch_size,)，每个样本动作token数 #?Union[int, torch.Tensor]
+    num_actions: int#动作数，生成序列中实际动作（token）的数量
     response_length: torch.Tensor#回复长度，生成的token数
     total_length: torch.Tensor#整个序列的长度，包含prompt+回复
 
@@ -29,7 +29,7 @@ class Experience:
     attention_mask: torch.Tensor#模型mask操作
     action_mask: torch.Tensor
     reward: torch.Tensor#该经历对应的奖励值
-    num_actions: torch.Tensor  # shape: (batch_size,)
+    num_actions: int#动作数量
     kl: torch.Tensor#PPO中用来控制策略更新的步长，防止偏离原策略太远
 
 #存储一定数量的Experience对象
@@ -50,38 +50,37 @@ class ExperienceBuffer:
     def clear(self):
         self.buffer = []
 
+@staticmethod
 def contains_chinese(text):
-    # 检查是否含中文字符
+    #检查是否含中文字符
     return any('\u4e00' <= c <= '\u9fff' for c in text)
 
-def normalize_for_reward(text, reward_tokenizer=None):
-    # 确保GPT-2生成文本适配Qwen分词器
-    # 1. 替换EOS
-    if reward_tokenizer is not None and hasattr(reward_tokenizer, "eos_token"):
-        text = text.replace("<|endoftext|>", reward_tokenizer.eos_token)
+def normalize_for_reward(self, text):
+    #确保GPT-2生成文本适配Qwen分词器
+    # 1. 替换EOS（必须）
+    if hasattr(self.reward_tokenizer, "eos_token"):
+        text = text.replace("<|endoftext|>", self.reward_tokenizer.eos_token)
     
-    # 2. 统一换行符
+    # 2. 统一换行符（预防性）
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     
-    # 3. 中文标点→英文
+    # 3. 中文标点→英文（可选，依数据集而定）
     if contains_chinese(text):
         text = text.replace("，", ",").replace("。", ".")
     
-    # 4. 移除控制字符
+    # 4. 移除控制字符（必须）
     return "".join(c for c in text if c.isprintable())
 
 class Critic(nn.Module):
     def __init__(self, base_model):
         super().__init__()
-        self.base_model = base_model
+        self.transformer = base_model.transformer  # 共享底层transformer
         self.value_head = nn.Linear(base_model.config.n_embd, 1)
-
-    def forward(self, input_ids, attention_mask, num_actions):
-        hidden = self.base_model.forward_hidden(input_ids)  # (B, T, n_embd)
-        values = self.value_head(hidden).squeeze(-1)        # (B, T)
         
-        prompt_len = attention_mask.sum(dim=1) - num_actions
-        # 取动作token对应的value
+    def forward(self, input_ids, attention_mask, num_actions):
+        hidden = self.transformer(input_ids, attention_mask=attention_mask)[0]
+        values = self.value_head(hidden).squeeze(-1)
+        prompt_len = attention_mask.sum(1) - num_actions
         values = torch.stack([values[i, prompt_len[i]:] for i in range(len(prompt_len))])
         return values
 
@@ -114,7 +113,7 @@ class PPOTrainer:
         self.clip_reward = clip_reward
         self.gamma = gamma
         self.lambd = lambd
-        self.device = torch.device(device)
+        self.device = device
         self.pad_token_id = getattr(actor_tokenizer, "pad_token_id", 0)
         self.eos_token_id = getattr(actor_tokenizer, "eos_token_id", 50304)
 
@@ -183,7 +182,7 @@ class PPOTrainer:
             # 标记从 prompt 之后直到 eos 的 tokens 都是动作（不包括 pad）
             action_mask[i, start: seqs.size(1)] = (seqs[i, start:] != self.pad_token_id).long()
 
-        num_actions = action_mask.sum(dim=1).long()
+        num_actions = action_mask.size(1) - int(prompt_len.min().item())
         response_length = action_mask.sum(-1)
         total_length = new_attention_mask.sum(-1)
 
@@ -215,50 +214,20 @@ class PPOTrainer:
         return rewards
 
     #GAE计算优势函数advantages
-    # def get_advantages(self, values, rewards, action_mask):
-    #     T = min(values.size(1), rewards.size(1), action_mask.size(1))
-    #     values = values[:, :T]
-    #     rewards = rewards[:, :T]
-    #     action_mask = action_mask[:, :T]
-    
-    #     lastgaelam = 0
-    #     advantages = []
-    #     for t in reversed(range(T)):
-    #         nextval = values[:, t+1] if t < T - 1 else 0
-    #         delta = rewards[:, t] + self.gamma * nextval - values[:, t]
-    #         lastgaelam = delta + self.gamma * self.lambd * lastgaelam
-    #         advantages.insert(0, lastgaelam)
-    
-    #     advantages = torch.stack(advantages, dim=1)
-    #     advantages = advantages * action_mask
-    #     returns = (advantages + values) * action_mask
-    #     return advantages.detach(), returns.detach()
     def get_advantages(self, values, rewards, action_mask):
-        # print("get_advantages input shapes:")
-        # print("values:", values.shape)
-        # print("rewards:", rewards.shape)
-        # print("action_mask:", action_mask.shape)
-    
-        T = min(values.size(1), rewards.size(1), action_mask.size(1))
-        
-        if T == 0:
-            # 返回零张量防止程序崩溃
-            batch_size = values.size(0)
-            advantages = torch.zeros(batch_size, 0, device=values.device)
-            returns = torch.zeros(batch_size, 0, device=values.device)
-            return advantages, returns
-    
         lastgaelam = 0
         advantages = []
+        T = rewards.size(1)
         for t in reversed(range(T)):
             nextval = values[:, t+1] if t < T - 1 else 0
+            #delta = reward + gamma * next_value - value 是TD误差
             delta = rewards[:, t] + self.gamma * nextval - values[:, t]
             lastgaelam = delta + self.gamma * self.lambd * lastgaelam
             advantages.insert(0, lastgaelam)
-    
+
         advantages = torch.stack(advantages, dim=1)
         advantages = advantages * action_mask
-        returns = (advantages + values) * action_mask
+        returns = (advantages + values) * action_mask#训练critic的目标
         return advantages.detach(), returns.detach()
 
     #根据生成的样本samples计算各种训练所需的信号
@@ -308,48 +277,41 @@ class PPOTrainer:
         seqs = seqs.to(self.device)
         attn_mask = attn_mask.to(self.device)
         act_mask = act_mask.to(self.device)
-        num_actions = num_actions.to(self.device)  # tensor
-    
         with torch.no_grad():
+            # 得到每个 time step 的 logits
             logits_all, _ = self.actor(seqs, return_all_logits=True)  # (B, T, V)
             ref_logits_all, _ = self.ref(seqs, return_all_logits=True)
-    
+
+            # 计算 token 级 log_probs：shifted by 1
             log_probs_all = F.log_softmax(logits_all, dim=-1)  # (B, T, V)
             ref_log_probs_all = F.log_softmax(ref_logits_all, dim=-1)
-    
+            # token index for next-token prediction (shifted)
             indices = seqs[:, 1:].unsqueeze(-1)  # (B, T-1, 1)
             log_probs = log_probs_all[:, :-1].gather(-1, indices).squeeze(-1)  # (B, T-1)
             ref_log_probs = ref_log_probs_all[:, :-1].gather(-1, indices).squeeze(-1)
-    
-            batch_log_probs = []
-            batch_ref_log_probs = []
-            batch_act_mask = []
-            
-            for i in range(seqs.size(0)):
-                na = num_actions[i].item()
-                if na > 0:
-                    batch_log_probs.append(log_probs[i, -na:])
-                    batch_ref_log_probs.append(ref_log_probs[i, -na:])
-                    batch_act_mask.append(act_mask[i, -na:])
-                else:
-                    batch_log_probs.append(torch.tensor([], device=self.device))
-                    batch_ref_log_probs.append(torch.tensor([], device=self.device))
-                    batch_act_mask.append(torch.tensor([], device=self.device))
-            
-            log_probs = torch.nn.utils.rnn.pad_sequence(batch_log_probs, batch_first=True)
-            ref_log_probs = torch.nn.utils.rnn.pad_sequence(batch_ref_log_probs, batch_first=True)
-            act_mask = torch.nn.utils.rnn.pad_sequence(batch_act_mask, batch_first=True)
-    
+
+            # 取出动作部分（最后 num_actions tokens）
+            if num_actions > 0:
+                log_probs = log_probs[:, -num_actions:]
+                ref_log_probs = ref_log_probs[:, -num_actions:]
+                # action mask 对齐到 num_actions 长度
+                act_mask = act_mask[:, -num_actions:]
+            else:
+                log_probs = torch.zeros(seqs.size(0), 0, device=self.device)
+                ref_log_probs = torch.zeros_like(log_probs)
+
             kl = self.compute_kl(log_probs, ref_log_probs, act_mask)
-    
+
+            # critic估值
             values = self.critic(seqs, attn_mask, num_actions)
-    
+
+            # reward model 部分保持不变
             texts = [normalize_for_reward(t) for t in self.actor_tokenizer.batch_decode(seqs)]
             reward_inputs = self.reward_tokenizer(texts, return_tensors="pt", padding=True).to(self.device)
             reward_scores = self.reward_model(**reward_inputs).logits[:, 0]
             rewards = self.compute_rewards(kl, reward_scores, act_mask)
             advantages, returns = self.get_advantages(values, rewards, act_mask)
-    
+
         return [Experience(
             seqs=seqs,
             action_log_probs=log_probs,
@@ -380,40 +342,31 @@ class PPOTrainer:
         return ((loss * action_mask).sum(-1) / action_mask.sum(-1)).mean()
 
     def train_on_experience(self, experience: Experience):
+        # 训练actor
         self.actor.train()
         with torch.cuda.amp.autocast(enabled=(self.device.type == 'cuda')):
-            logits, *_ = self.actor(experience.seqs, return_all_logits=True)
+            logits = self.actor(experience.seqs, attention_mask=experience.attention_mask).logits
             log_probs = F.log_softmax(logits[:, :-1], dim=-1)
             indices = experience.seqs[:, 1:].unsqueeze(-1)
-    
-            gathered_log_probs = log_probs.gather(-1, indices).squeeze(-1)  # (B, T-1)
-            new_log_probs_list = []
-            for i in range(experience.seqs.size(0)):
-                na = experience.num_actions[i].item()
-                if na > 0:
-                    new_log_probs_list.append(gathered_log_probs[i, -na:])
-                else:
-                    # 使用new_empty而不是torch.tensor([])
-                    new_log_probs_list.append(gathered_log_probs.new_empty(0))
-            new_log_probs = torch.nn.utils.rnn.pad_sequence(new_log_probs_list, batch_first=True)
-            policy_loss = self.policy_loss(new_log_probs, experience.action_log_probs,
-                                       experience.advantages, experience.action_mask)
-    
+            new_log_probs = log_probs.gather(-1, indices).squeeze(-1)[:, -experience.num_actions:]
+            policy_loss = self.policy_loss(new_log_probs, experience.action_log_probs, 
+                                        experience.advantages, experience.action_mask)
+        
         self.optimizer_actor.zero_grad()
         policy_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)  # 在step之前裁剪，可尝试更宽松的裁剪
         self.optimizer_actor.step()
-    
+
+        # 训练critic
         self.critic.train()
         with torch.cuda.amp.autocast(enabled=(self.device.type == 'cuda')):
             values = self.critic(experience.seqs, experience.attention_mask, experience.num_actions)
             value_loss = self.value_loss(values, experience.values, 
-                                        experience.returns, experience.action_mask)
-    
+                                    experience.returns, experience.action_mask)
+        
         self.optimizer_critic.zero_grad()
         value_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)  # 在step之前裁剪
         self.optimizer_critic.step()
-    
-        return policy_loss.item(), value_loss.item()
 
+        return policy_loss.item(), value_loss.item()

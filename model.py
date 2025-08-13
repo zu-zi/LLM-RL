@@ -222,7 +222,8 @@ class GPT(nn.Module):
     #     for block in self.transformer.h:
     #         if hasattr(block.attn, 'bias'):
     #             block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
-    # 修改后的 forward，增加 return_all_logits 参数
+    
+    # 修改后的 forward，增加 return_all_logits 逻辑，方便分配奖励到token
     def forward(self, idx, targets=None, return_all_logits: bool = False):
         device = idx.device
         b, t = idx.size()
@@ -384,6 +385,7 @@ class GPT(nn.Module):
     #         idx = torch.cat((idx, idx_next), dim=1)#把新采样的token拼接到当前序列末尾，继续下一轮生成
 
     #     return idx
+    # 根据forwrd的接口改变，相应改变
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, eos_token_id=None):
         for _ in range(max_new_tokens):
@@ -401,4 +403,16 @@ class GPT(nn.Module):
                 if (idx_next == eos_token_id).all():
                     break
         return idx
+    # 给Critic底层共享transformer使用    
+    def forward_hidden(self, idx):
+        device = idx.device
+        b, t = idx.size()
+        pos = torch.arange(0, t, dtype=torch.long, device=device)
+        tok_emb = self.transformer.wte(idx)
+        pos_emb = self.transformer.wpe(pos)
+        x = self.transformer.drop(tok_emb + pos_emb)
+        for block in self.transformer.h:
+            x = block(x)
+        x = self.transformer.ln_f(x)  # 最终隐藏状态
+        return x  # 返回形状 (B, T, n_embd)
 
