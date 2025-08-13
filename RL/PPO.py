@@ -302,10 +302,10 @@ class PPOTrainer:
 
             kl = self.compute_kl(log_probs, ref_log_probs, act_mask)
 
-            # critic 估值（你已有实现，确保 critic 接口与输入一致）
+            # critic估值
             values = self.critic(seqs, attn_mask, num_actions)
 
-            # reward model 部分保持不变（你把 texts decode 后喂给 reward_model）
+            # reward model 部分保持不变
             texts = [normalize_for_reward(t) for t in self.actor_tokenizer.batch_decode(seqs)]
             reward_inputs = self.reward_tokenizer(texts, return_tensors="pt", padding=True).to(self.device)
             reward_scores = self.reward_model(**reward_inputs).logits[:, 0]

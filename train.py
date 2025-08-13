@@ -90,7 +90,7 @@ exec(open('configurator.py').read()) # overrides from command line or config fil
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 # RL
-PROMPT_FILE = os.path.join(os.path.dirname(__file__), "RL_dataset/prompt.bin")
+PROMPT_FILE = os.path.join(os.path.dirname(__file__), "data/RL_dataset/prompt.bin")
 print(f"Loading pre-tokenized prompts from {PROMPT_FILE} ...")
 prompt_data = torch.load(PROMPT_FILE)   # {'input_ids': Tensor, 'attention_mask': Tensor}
 num_prompts = prompt_data['input_ids'].size(0)
