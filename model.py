@@ -223,35 +223,41 @@ class GPT(nn.Module):
     #         if hasattr(block.attn, 'bias'):
     #             block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
     
-    # 修改后的 forward，增加 return_all_logits 逻辑，方便分配奖励到token
-    def forward(self, idx, targets=None, return_all_logits: bool = False):
+    # 修改后的 forward，兼容 return_all_logits 和 return_hidden
+    def forward(self, idx, targets=None, return_all_logits: bool = False, return_hidden: bool = False):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)# (B, T, C)
+        tok_emb = self.transformer.wte(idx) # (b, t, n_embd)
+        pos_emb = self.transformer.wpe(pos) # (t, n_embd)
+        x = self.transformer.drop(tok_emb + pos_emb) # (B, T, C)
         for block in self.transformer.h:
             x = block(x)
-        x = self.transformer.ln_f(x)
+        x = self.transformer.ln_f(x)  # 最终隐藏状态 (B, T, C)
 
-        # 如果用户想要所有时间步的 logits（用于 RL 计算 token 级 log_probs）
+        # 需要所有时间步 logits（RL）
         if return_all_logits:
-            logits_all = self.lm_head(x)  # (B, T, vocab)
+            logits_all = self.lm_head(x)  # (B, T, V)
+            if return_hidden:
+                return logits_all, None, x
             return logits_all, None
 
-        # 如果给了 targets，返回完整 logits 并计算 loss（旧行为）
+        # 监督学习/常规模式
         if targets is not None:
-            logits = self.lm_head(x)
+            logits = self.lm_head(x)  # (B, T, V)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            if return_hidden:
+                return logits, loss, x
             return logits, loss
         else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # (B,1,vocab_size)
-            return logits, None
+            # 推理优化：只算最后一个位置的 lm_head
+            logits_last = self.lm_head(x[:, [-1], :]) # (B,1,V)
+            if return_hidden:
+                return logits_last, None, x
+            return logits_last, None
 
 
     #从Hugging Face的GPT2权重加载到当前nanoGPT
@@ -387,32 +393,51 @@ class GPT(nn.Module):
     #     return idx
     # 根据forwrd的接口改变，相应改变
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, eos_token_id=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, eos_token_id=None, eos_id=None):
+        # 兼容别名
+        if eos_token_id is None and eos_id is not None:
+            eos_token_id = eos_id
+
+        B = idx.size(0)
+        finished = torch.zeros(B, dtype=torch.bool, device=idx.device)
+
         for _ in range(max_new_tokens):
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-            logits, _ = self(idx_cond, return_all_logits=True)  # logits: (B, T, vocab)
+            logits, _ = self(idx_cond, return_all_logits=True)  # (B, T, V)
             logits = logits[:, -1, :] / temperature
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
             probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat((idx, idx_next), dim=1)
+            idx_next = torch.multinomial(probs, num_samples=1)  # (B,1)
+
+            # 已经结束的样本保持追加 eos（不再改变）
             if eos_token_id is not None:
-                # 如果所有样本在本步都生成了 eos，就可以提前结束
-                if (idx_next == eos_token_id).all():
+                idx_next = torch.where(
+                    finished.unsqueeze(1),
+                    torch.full_like(idx_next, eos_token_id),
+                    idx_next,
+                )
+
+            idx = torch.cat((idx, idx_next), dim=1)
+
+            if eos_token_id is not None:
+                just_finished = (idx_next.squeeze(1) == eos_token_id)
+                finished = finished | just_finished
+                if finished.all():
                     break
         return idx
+
     # 给Critic底层共享transformer使用    
-    def forward_hidden(self, idx):
-        device = idx.device
-        b, t = idx.size()
-        pos = torch.arange(0, t, dtype=torch.long, device=device)
-        tok_emb = self.transformer.wte(idx)
-        pos_emb = self.transformer.wpe(pos)
-        x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
-            x = block(x)
-        x = self.transformer.ln_f(x)  # 最终隐藏状态
-        return x  # 返回形状 (B, T, n_embd)
+    # def forward_hidden(self, idx):
+    #     device = idx.device
+    #     b, t = idx.size()
+    #     pos = torch.arange(0, t, dtype=torch.long, device=device)
+    #     tok_emb = self.transformer.wte(idx)
+    #     pos_emb = self.transformer.wpe(pos)
+    #     x = self.transformer.drop(tok_emb + pos_emb)
+    #     for block in self.transformer.h:
+    #         x = block(x)
+    #     x = self.transformer.ln_f(x)  # 最终隐藏状态
+    #     return x  # 返回形状 (B, T, n_embd)
 

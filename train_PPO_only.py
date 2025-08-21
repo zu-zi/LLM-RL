@@ -251,9 +251,10 @@ if ddp:
 # unwrap raw model for saving / for using custom methods (generate, forward return_all_logits)
 raw_model = model.module if ddp else model
 # RL,后续再添加逻辑：选择哪种RL算法
-actor_model = raw_model
-import copy
-ref_model = copy.deepcopy(actor_model).to(device)
+actor_model = raw_model  # 确保 raw_model 是未DDP包裹的原始模型
+from model import GPT  # 或你实际类名/导入路径
+ref_model = GPT(actor_model.config).to(device)
+ref_model.load_state_dict(actor_model.state_dict(), strict=True)
 for param in ref_model.parameters():
     param.requires_grad = False
 ref_model.eval()
@@ -317,49 +318,50 @@ local_iter_num = 0 # number of iterations in the lifetime of this process
 running_mfu = -1.0
 
 if use_ppo:
+    iter_num = globals().get("iter_num", 0)
+    policy_loss = value_loss = 0.0
     while True:
-        # PPO主循环（替代原监督学习方式）
-        # Step 1: 从prompt生成经验
-        input_ids, attention_mask = get_prompt_batch(batch_size, device)
-        samples = ppo_trainer.generate_samples(
-            (input_ids, attention_mask), 
-            max_length=block_size, 
-            max_new_tokens=block_size - input_ids.size(1)
+        # --- 1) sample prompts ---
+        input_ids, attention_mask = get_prompt_batch(batch_size, device)  # (B, Lp), (B, Lp)
+        # 生成 samples（PPOTrainer.generate_samples 返回 list[Samples]）
+        samples_list = ppo_trainer.generate_samples(
+            (input_ids, attention_mask),
+            max_length=block_size,
+            max_new_tokens=(block_size - input_ids.size(1))
         )
-        experiences = ppo_trainer.evaluate_experience(samples[0])
+        samples = samples_list[0]  # 批次 Samples
 
-        # Step 2: 多次更新 PPO
+        # --- 2) evaluate samples -> experiences (and avg_kl for logging) ---
+        experiences, avg_kl = ppo_trainer.evaluate_experience(samples)
+
+        # --- 3) 多次/多轮更新 PPO（你原本是 1-step，保持不变） ---
         for exp in experiences:
             policy_loss, value_loss = ppo_trainer.train_on_experience(exp)
 
-        # Step 3: Soft更新ref model,暂时冻结ref，不更新
-        # for ref_param, actor_param in zip(ref_model.parameters(), actor_model.parameters()):
-        #     ref_param.data.copy_(0.99 * ref_param.data + 0.01 * actor_param.data)
-
-        # Step 4: 日志与保存，与常规训练保持一致
+        # --- 4) 日志与保存 ---
         if iter_num % eval_interval == 0 and master_process:
-            print(f"iter {iter_num}: policy_loss={policy_loss:.4f}, value_loss={value_loss:.4f}")
+            print(f"iter {iter_num}: policy_loss={policy_loss:.4f}, value_loss={value_loss:.4f}, avg_kl={avg_kl:.6f}")
             if wandb_log:
                 wandb.log({
                     "iter": iter_num,
                     "train/policy_loss": policy_loss,
                     "train/value_loss": value_loss,
-                    # "lr": lr, # 暂时没加学习率调度
+                    "train/avg_kl": avg_kl,
                 })
             checkpoint = {
-                'model': raw_model.state_dict(),
+                'model': actor_model.state_dict(),
                 'critic': critic_model.state_dict(),
                 'optimizer_actor': optimizer_actor.state_dict(),
                 'optimizer_critic': optimizer_critic.state_dict(),
                 'iter_num': iter_num,
             }
             print(f"saving PPO checkpoint to {out_dir}")
-            # 暂时设置的都存
             torch.save(checkpoint, os.path.join(out_dir, 'RL_ckpt.pt'))
 
         iter_num += 1
         if iter_num > max_iters:
             break
+
 else:
     
     # while True:

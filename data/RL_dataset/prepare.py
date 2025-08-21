@@ -31,23 +31,21 @@ class TokenizerWrapper:
         input_ids = []
         attention_mask = []
         for text in texts:
-            # allowed_special="all" 允许所有特殊 token，不然 '<|endoftext|>' 会报错
             ids = self.enc.encode(text, allowed_special="all")
-            if len(ids) > self.max_length:
-                ids = ids[:self.max_length]
+            ids = ids[:self.max_length]
             mask = [1] * len(ids)
-
-            while len(ids) < self.max_length:
-                ids.append(self.pad_token_id)
-                mask.append(0)
-
+            # 右侧 pad 到 max_length（只用于张量对齐）
+            pad_len = self.max_length - len(ids)
+            if pad_len > 0:
+                ids  = ids  + [self.pad_token_id] * pad_len
+                mask = mask + [0] * pad_len
             input_ids.append(ids)
             attention_mask.append(mask)
-
         return {
             'input_ids': torch.tensor(input_ids, dtype=torch.long),
-            'attention_mask': torch.tensor(attention_mask, dtype=torch.long)
+            'attention_mask': torch.tensor(attention_mask, dtype=torch.long),
         }
+
 
 enc = tiktoken.get_encoding("gpt2")
 enc_wrapper = TokenizerWrapper(enc, max_length=BLOCK_SIZE)
