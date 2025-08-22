@@ -328,15 +328,16 @@ if use_ppo:
         # --- 1) sample prompts ---
         input_ids, attention_mask = get_prompt_batch(batch_size, device)  # (B, Lp), (B, Lp)
         # 生成 samples（PPOTrainer.generate_samples 返回 list[Samples]）
+        max_new_tokens = block_size - 256
         samples_list = ppo_trainer.generate_samples(
             (input_ids, attention_mask),
             max_length=block_size,
-            max_new_tokens=max(1, block_size - input_ids.size(1))
+            max_new_tokens=max_new_tokens
         )
         samples = samples_list[0]  # 批次 Samples
 
         # --- 2) evaluate samples -> experiences (and avg_kl for logging) ---
-        experiences, avg_kl = ppo_trainer.evaluate_experience(samples,debug=True)
+        experiences, avg_kl = ppo_trainer.evaluate_experience(samples)
 
         # --- 3) 多次/多轮更新 PPO（你原本是 1-step，保持不变） ---
         for exp in experiences:

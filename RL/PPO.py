@@ -146,48 +146,48 @@ class PPOTrainer:
         self.pad_token_id = getattr(actor_tokenizer, "pad_token_id", 0)
         self.eos_token_id = getattr(actor_tokenizer, "eos_token_id", 50304)
         self.use_amp = (self.device.type == 'cuda')
-        self.scaler_actor  = torch.cuda.amp.GradScaler(enabled=self.use_amp)
-        self.scaler_critic = torch.cuda.amp.GradScaler(enabled=self.use_amp)
-
+        self.scaler_actor  = torch.amp.GradScaler(device="cuda", enabled=self.use_amp)
+        self.scaler_critic = torch.amp.GradScaler(device="cuda", enabled=self.use_amp)
 
     def generate_samples(self, inputs, max_length, max_new_tokens):
+        # print(f">>>max_new_tokens: {max_new_tokens}")
         model = self.actor
         input_ids, attention_mask = inputs
         input_ids = input_ids.to(self.device)
         attention_mask = attention_mask.to(self.device)
-        
-        prompt_len = attention_mask.sum(1).long()
-        
-        # --- 限制生成长度，防止超过 block_size ---
-        max_new_tokens = min(max_new_tokens, model.config.block_size - input_ids.size(1))
-        if max_new_tokens <= 0:
-            max_new_tokens = 1  # 至少生成 1 个 token
     
+        prompt_len = attention_mask.sum(1).long()
+    
+        # 强制 prompt_len <= block_size - max_new_tokens
+        max_prompt_len = model.config.block_size - max_new_tokens
+        prompt_len = torch.clamp(prompt_len, max=max_prompt_len)
+    
+        # 生成长度
+        max_new_tokens = max_new_tokens
         with torch.no_grad():
             outputs = model.generate(
-                input_ids,
+                input_ids[:, :prompt_len.max()],
                 max_new_tokens=max_new_tokens,
                 eos_token_id=self.eos_token_id
             )
     
-        # --- 裁剪 seqs 到 block_size ---
         seqs = outputs[:, :model.config.block_size]
         B, T = seqs.size()
     
-        # --- 初始化 action_mask ---
         action_mask = torch.zeros_like(seqs, dtype=torch.long, device=self.device)
         for i in range(B):
-            start = int(prompt_len[i].item())
+            start = prompt_len[i].item()
+            if start >= T:
+                start = T - 1
             action_mask[i, start:T] = (seqs[i, start:T] != self.pad_token_id).long()
     
-        # --- 其它 mask 和统计 ---
         new_attention_mask = (seqs != self.pad_token_id).long()
         num_actions = action_mask.sum(dim=1).long()
         response_length = num_actions
         total_length = new_attention_mask.sum(-1)
     
-        print(f">>> seqs.shape: {seqs.shape}, max_new_tokens: {max_new_tokens}")
-        print(f">>> num_actions: {num_actions}")
+        # print(f">>> seqs.shape: {seqs.shape}, max_new_tokens: {max_new_tokens}")
+        # print(f">>> num_actions: {num_actions}")
     
         return [Samples(
             seqs=seqs,
@@ -197,8 +197,6 @@ class PPOTrainer:
             response_length=response_length,
             total_length=total_length
         )]
-
-
 
     #计算当前策略(log_probs)和参考策略(ref_log_probs)的KL散度#只计算动作位置
     def compute_kl(self, log_probs, ref_log_probs, action_mask):
@@ -350,10 +348,6 @@ class PPOTrainer:
     #     return [exp], float(avg_kl.item())
 
     def evaluate_experience(self, samples: Samples, debug=False):
-        """
-        输入 samples（单个 Samples，batch 的张量在其内），返回 ( [Experience(...)], avg_kl )
-        debug=True 时打印每个样本信息
-        """
         seqs = samples.seqs.to(self.device)           # (B, L)
         attn_mask = samples.attention_mask.to(self.device)
         act_mask_full = samples.action_mask.to(self.device)  # (B, L)
