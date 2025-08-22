@@ -28,7 +28,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
-from nanoGPT.RL.PPO import PPOTrainer,Critic
+from RL.PPO import PPOTrainer,Critic
 from data.RL_dataset.prepare import enc_wrapper
 import tiktoken
 from transformers import AutoModelForCausalLM, AutoModel, AutoModelForSequenceClassification, AutoTokenizer
@@ -251,10 +251,14 @@ if ddp:
 # unwrap raw model for saving / for using custom methods (generate, forward return_all_logits)
 raw_model = model.module if ddp else model
 # RL,后续再添加逻辑：选择哪种RL算法
+import copy
+
 actor_model = raw_model  # 确保 raw_model 是未DDP包裹的原始模型
-from model import GPT  # 或你实际类名/导入路径
-ref_model = GPT(actor_model.config).to(device)
-ref_model.load_state_dict(actor_model.state_dict(), strict=True)
+
+# 直接深拷贝 actor_model 作为 ref_model
+ref_model = copy.deepcopy(actor_model).to(device)
+
+# 冻结 ref_model 参数
 for param in ref_model.parameters():
     param.requires_grad = False
 ref_model.eval()
@@ -327,12 +331,12 @@ if use_ppo:
         samples_list = ppo_trainer.generate_samples(
             (input_ids, attention_mask),
             max_length=block_size,
-            max_new_tokens=(block_size - input_ids.size(1))
+            max_new_tokens=max(1, block_size - input_ids.size(1))
         )
         samples = samples_list[0]  # 批次 Samples
 
         # --- 2) evaluate samples -> experiences (and avg_kl for logging) ---
-        experiences, avg_kl = ppo_trainer.evaluate_experience(samples)
+        experiences, avg_kl = ppo_trainer.evaluate_experience(samples,debug=True)
 
         # --- 3) 多次/多轮更新 PPO（你原本是 1-step，保持不变） ---
         for exp in experiences:

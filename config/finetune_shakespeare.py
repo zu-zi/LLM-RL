@@ -1,6 +1,6 @@
 import time
 
-out_dir = 'out-shakespeare'
+out_dir = 'Results'
 eval_interval = 20 #up
 eval_iters = 40
 wandb_log = False # feel free to turn on
@@ -8,7 +8,7 @@ wandb_project = 'shakespeare'
 wandb_run_name = 'ft-' + str(time.time())
 
 dataset = 'shakespeare'
-init_from = 'gpt2-large' # this is the largest GPT-2 model
+init_from = 'gpt2-medium' # this is the largest GPT-2 model
 
 # only save checkpoints if the validation loss improves
 always_save_checkpoint = False
