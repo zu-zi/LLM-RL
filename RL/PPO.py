@@ -5,71 +5,7 @@ import random
 from typing import List
 from dataclasses import dataclass
 from torch import amp
-
-# Samples = 一次完整文本生成的“样本”
-# Experience = 在此基础上，结合强化学习信号封装的训练用经历
-
-#存储一个batch的模型输入和相关信息
-@dataclass
-class Samples:
-    seqs: torch.Tensor#文本输入+生成输出的token序列
-    attention_mask: torch.Tensor #用于Transformer计算时屏蔽无效token
-    action_mask: torch.Tensor#哪些位置是“可动作”的位置
-    num_actions: torch.Tensor  # shape: (batch_size,)，每个样本动作token数 #?Union[int, torch.Tensor]
-    response_length: torch.Tensor#回复长度，生成的token数
-    total_length: torch.Tensor#整个序列的长度，包含prompt+回复
-
-#PPO训练中保存的每条经历数据
-@dataclass
-class Experience:
-    seqs: torch.Tensor
-    action_log_probs: torch.Tensor#动作的对数概率
-    values: torch.Tensor#critic网络给出的状态值
-    returns: torch.Tensor#经过折扣的累积奖励，训练critic用
-    advantages: torch.Tensor#表示“该动作相对于平均水平好多少”
-    attention_mask: torch.Tensor#模型mask操作
-    action_mask: torch.Tensor
-    reward: torch.Tensor#该经历对应的奖励值
-    num_actions: torch.Tensor  # shape: (batch_size,)
-    kl: torch.Tensor#PPO中用来控制策略更新的步长，防止偏离原策略太远
-
-#存储一定数量的Experience对象
-class ExperienceBuffer:
-    def __init__(self, limit):
-        self.limit = limit#最大缓存大小，先进先出
-        self.buffer = []
-
-    def append(self, experiences: List[Experience]):
-        self.buffer.extend(experiences)
-        if len(self.buffer) > self.limit:
-            self.buffer = self.buffer[-self.limit:]
-
-    #随机采样一批经验，训练时用
-    def sample(self, batch_size):
-        return random.sample(self.buffer, batch_size)
-
-    def clear(self):
-        self.buffer = []
-
-def contains_chinese(text):
-    # 检查是否含中文字符
-    return any('\u4e00' <= c <= '\u9fff' for c in text)
-
-def normalize_for_reward(text, reward_tokenizer=None):
-    # 确保GPT-2生成文本适配Qwen分词器
-    # 1. 替换EOS
-    if reward_tokenizer is not None and hasattr(reward_tokenizer, "eos_token"):
-        text = text.replace("<|endoftext|>", reward_tokenizer.eos_token)
-    
-    # 2. 统一换行符
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    
-    # 3. 中文标点→英文
-    if contains_chinese(text):
-        text = text.replace("，", ",").replace("。", ".")
-    
-    # 4. 移除控制字符
-    return "".join(c for c in text if c.isprintable())
+from common import Samples,Experience,ExperienceBuffer,normalize_for_reward
 
 class Critic(nn.Module):
     def __init__(self, base_model):
@@ -126,7 +62,7 @@ class PPOTrainer:
         optimizer_critic,
         kl_ctl=0.02,# 需要调整，初始较小的KL惩罚
         clip_reward=5.0,# 需要调整，更大的奖励裁剪范围
-        gamma=0.9,# 折扣因子（计算优势函数）
+        gamma=0.95,# 折扣因子（计算优势函数）
         lambd=0.95,# GAE参数，平衡偏差和方差
         device="cuda"
     ):
@@ -239,113 +175,6 @@ class PPOTrainer:
         adv = adv * masks
         ret = (adv + values) * masks
         return adv.detach(), ret.detach()
-
-    # def evaluate_experience(self, samples: Samples):
-    #     """
-    #     输入 samples（单个 Samples，batch 的张量在其内），返回 ( [Experience(...)], avg_kl )
-    #     Experience 里的字段保持你原来的批量形式（tensor batch）
-    #     """
-    #     seqs = samples.seqs.to(self.device)           # (B, L)
-    #     attn_mask = samples.attention_mask.to(self.device)
-    #     act_mask_full = samples.action_mask.to(self.device)  # (B, L)
-    #     num_actions = samples.num_actions.to(self.device)    # (B,)
-
-    #     B, L = seqs.size()
-
-    #     with torch.no_grad():
-    #         # 1) actor 和 ref 的 token-level log_probs（对 next-token）
-    #         out_act = self.actor(seqs, return_all_logits=True)
-    #         logits_all = out_act[0] if isinstance(out_act, tuple) else out_act  # (B, L, V)
-    #         out_ref = self.ref(seqs, return_all_logits=True)
-    #         ref_logits_all = out_ref[0] if isinstance(out_ref, tuple) else out_ref
-
-    #         log_probs_all = F.log_softmax(logits_all, dim=-1)      # (B, L, V)
-    #         ref_log_probs_all = F.log_softmax(ref_logits_all, dim=-1)
-
-    #         # gather next-token logprobs
-    #         # indices are the actual token ids we observed (next-token prediction)
-    #         indices = seqs[:, 1:].unsqueeze(-1)  # (B, L-1, 1)
-    #         logp_next = log_probs_all[:, :-1].gather(-1, indices).squeeze(-1)      # (B, L-1)
-    #         ref_logp_next = ref_log_probs_all[:, :-1].gather(-1, indices).squeeze(-1)
-
-    #         # We want token-level log_probs aligned to seq positions of tokens produced (exclude first prompt token)
-    #         # For simplicity, we'll align actions to the tail: take last na tokens from logp_next
-    #         na_list = [int(x.item()) for x in num_actions]
-    #         max_na = max(na_list) if len(na_list) > 0 else 0
-
-    #         if max_na == 0:
-    #             # 没有动作，全返回空 Experience（避免 crash）
-    #             empty_exp = Experience(
-    #                 seqs=seqs,
-    #                 action_log_probs=torch.zeros((B, 0), device=self.device),
-    #                 values=torch.zeros((B, 0), device=self.device),
-    #                 returns=torch.zeros((B, 0), device=self.device),
-    #                 advantages=torch.zeros((B, 0), device=self.device),
-    #                 attention_mask=attn_mask,
-    #                 action_mask=torch.zeros((B, 0), device=self.device, dtype=torch.long),
-    #                 reward=torch.zeros((B, 1), device=self.device),
-    #                 num_actions=num_actions,
-    #                 kl=torch.zeros((B, 0), device=self.device)
-    #             )
-    #             return [empty_exp], 0.0
-
-    #         # allocate left-aligned tensors (B, max_na)
-    #         new_logp = logp_next.new_full((B, max_na), fill_value=0.0)
-    #         new_ref_logp = new_logp.clone()
-    #         new_act_mask = torch.zeros((B, max_na), dtype=torch.long, device=self.device)
-
-    #         for i in range(B):
-    #             na = na_list[i]
-    #             if na <= 0:
-    #                 continue
-    #             # take last na tokens from logp_next[i]
-    #             new_logp[i, :na] = logp_next[i, -na:]
-    #             new_ref_logp[i, :na] = ref_logp_next[i, -na:]
-    #             # corresponding action mask: take last na of act_mask_full
-    #             new_act_mask[i, :na] = act_mask_full[i, -na:]
-
-    #         # KL (token-level) on the actions
-    #         kl = (new_logp - new_ref_logp) * new_act_mask.float()  # (B, max_na)  (masked)
-
-    #         # 2) reward model: decode texts from seqs (move to CPU for tokenizer)
-    #         seqs_cpu = seqs.detach().cpu().tolist()
-    #         texts = [normalize_for_reward(t, reward_tokenizer=self.reward_tokenizer)
-    #                 for t in self.actor_tokenizer.batch_decode(seqs_cpu)]
-    #         reward_inputs = self.reward_tokenizer(texts, return_tensors="pt", padding=True, truncation=True,
-    #                                             max_length=getattr(self.reward_tokenizer, "model_max_length", 2048))
-    #         reward_inputs = {k: v.to(self.device) for k, v in reward_inputs.items()}
-    #         reward_outputs = self.reward_model(**reward_inputs)
-    #         # 假设 reward_model.logits[:,0] 给分数
-    #         reward_scores = reward_outputs.logits[:, 0].to(self.device)  # (B,)
-
-    #         # 3) compute token-wise rewards (B, max_na)
-    #         rewards = self.compute_rewards(kl, reward_scores, new_act_mask)
-
-    #         # 4) critic values: 得到 (B, max_na) 和 mask
-    #         values, value_mask = self.critic(seqs, attn_mask, num_actions)  # values: (B, max_na), value_mask: (B, max_na)
-
-    #         # 5) advantages & returns
-    #         advantages, returns = self.get_advantages(values, rewards, new_act_mask)
-
-    #         # 6) build Experience object (batched)
-    #         exp = Experience(
-    #             seqs=seqs,
-    #             action_log_probs=new_logp,
-    #             values=values,
-    #             returns=returns,
-    #             advantages=advantages,
-    #             attention_mask=attn_mask,
-    #             action_mask=new_act_mask,
-    #             reward=reward_scores.unsqueeze(1),
-    #             num_actions=num_actions,
-    #             kl=kl
-    #         )
-
-    #         # avg_kl for logging (scalar)
-    #         denom = new_act_mask.sum().clamp_min(1).float()
-    #         avg_kl = (kl * new_act_mask.float()).sum() / denom
-
-    #     return [exp], float(avg_kl.item())
 
     def evaluate_experience(self, samples: Samples, debug=False):
         seqs = samples.seqs.to(self.device)           # (B, L)

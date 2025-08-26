@@ -29,6 +29,7 @@ from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
 from RL.PPO import PPOTrainer,Critic
+from RL.GRPO import GRPOTrainer
 from data.RL_dataset.prepare import enc_wrapper
 import tiktoken
 from transformers import AutoModelForCausalLM, AutoModel, AutoModelForSequenceClassification, AutoTokenizer
@@ -268,17 +269,6 @@ critic_model = Critic(actor_model).to(device)
 optimizer_actor = torch.optim.AdamW(actor_model.parameters(), lr=RL_learning_rate, betas=(beta1, beta2), weight_decay=weight_decay)
 optimizer_critic = torch.optim.AdamW(critic_model.parameters(), lr=RL_learning_rate, betas=(beta1, beta2), weight_decay=weight_decay)
 
-ppo_trainer = PPOTrainer(
-    actor_model=actor_model,
-    ref_model=ref_model,
-    reward_model=reward_model,
-    critic_model=critic_model,
-    actor_tokenizer=enc_wrapper,
-    reward_tokenizer=reward_tokenizer,
-    optimizer_actor=optimizer_actor,
-    optimizer_critic=optimizer_critic,
-    device=device
-)
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
 def estimate_loss():#每隔一段时间会用这个函数来估算当前模型在train和val上的loss
@@ -322,6 +312,17 @@ local_iter_num = 0 # number of iterations in the lifetime of this process
 running_mfu = -1.0
 
 if use_ppo:
+    ppo_trainer = PPOTrainer(
+    actor_model=actor_model,
+    ref_model=ref_model,
+    reward_model=reward_model,
+    critic_model=critic_model,
+    actor_tokenizer=enc_wrapper,
+    reward_tokenizer=reward_tokenizer,
+    optimizer_actor=optimizer_actor,
+    optimizer_critic=optimizer_critic,
+    device=device
+    )
     iter_num = globals().get("iter_num", 0)
     policy_loss = value_loss = 0.0
     while True:
@@ -366,7 +367,64 @@ if use_ppo:
         iter_num += 1
         if iter_num > max_iters:
             break
+if use_grpo:
+    grpo_trainer = GRPOTrainer(
+    actor_model=actor_model,
+    ref_model=ref_model,
+    reward_model=reward_model,
+    actor_tokenizer=enc_wrapper,
+    reward_tokenizer=reward_tokenizer,
+    optimizer_actor=optimizer_actor,
+    group_size=4,          # 每个 prompt 采几条，超参数
+    kl_coef=0.02,
+    normalize_adv=True,
+    length_norm="avg",
+    device=device,
+    use_amp=True,
+    )
+    iter_num = globals().get("iter_num", 0)
+    policy_loss = 0.0
+    while True:
+        # 1) sample prompts
+        input_ids, attention_mask = get_prompt_batch(batch_size, device)
 
+        # 2) actor generate 多样本 (group_size>1)
+        max_new_tokens = block_size - 256
+        samples = grpo_trainer.generate_samples(
+            (input_ids, attention_mask),
+            max_length=block_size,
+            max_new_tokens=max_new_tokens,
+            temperature=1.0,
+            top_p=0.9,
+            do_sample=True
+        )
+
+        # 3) 计算奖励 & 构造经验
+        experiences, avg_kl = grpo_trainer.evaluate_experience(samples)
+
+        # 4) 更新 actor
+        policy_loss, _ = grpo_trainer.train_on_experience(experiences[0])
+
+        # 5) 日志与保存
+        if iter_num % eval_interval == 0 and master_process:
+            print(f"iter {iter_num}: policy_loss={policy_loss:.4f}, avg_kl={avg_kl:.6f}")
+            if wandb_log:
+                wandb.log({
+                    "iter": iter_num,
+                    "train/policy_loss": policy_loss,
+                    "train/avg_kl": avg_kl,
+                })
+            checkpoint = {
+                'model': actor_model.state_dict(),
+                'optimizer_actor': optimizer_actor.state_dict(),
+                'iter_num': iter_num,
+            }
+            print(f"saving GRPO checkpoint to {out_dir}")
+            torch.save(checkpoint, os.path.join(out_dir, 'GRPO_ckpt.pt'))
+
+        iter_num += 1
+        if iter_num > max_iters:
+            break
 else:
     
     # while True:
