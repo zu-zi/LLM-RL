@@ -27,4 +27,6 @@ RL_learning_rate=1e-5
 decay_lr = False
 
 #RL
-use_ppo = True
+# use_ppo = True
+use_grpo = True
+group_size = 4

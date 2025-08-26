@@ -5,7 +5,7 @@ import random
 from typing import List
 from dataclasses import dataclass
 from torch import amp
-from common import Samples,Experience,ExperienceBuffer,normalize_for_reward
+from .common import Samples,Experience,ExperienceBuffer,normalize_for_reward
 
 class Critic(nn.Module):
     def __init__(self, base_model):
@@ -269,7 +269,8 @@ class PPOTrainer:
         )
     
         avg_kl = ((new_logp - new_ref_logp) * new_act_mask.float()).sum() / new_act_mask.sum().clamp_min(1).float()
-        return [exp], float(avg_kl.item())
+        avg_reward = reward_scores.mean().item()
+        return [exp], float(avg_kl.item()), float(avg_reward)
 
     #
     def policy_loss(self, new_log_probs, old_log_probs, advantages, action_mask, clip_eps=0.2):

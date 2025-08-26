@@ -338,7 +338,7 @@ if use_ppo:
         samples = samples_list[0]  # 批次 Samples
 
         # --- 2) evaluate samples -> experiences (and avg_kl for logging) ---
-        experiences, avg_kl = ppo_trainer.evaluate_experience(samples)
+        experiences, avg_kl, avg_reward = ppo_trainer.evaluate_experience(samples)
 
         # --- 3) 多次/多轮更新 PPO（你原本是 1-step，保持不变） ---
         for exp in experiences:
@@ -346,13 +346,14 @@ if use_ppo:
 
         # --- 4) 日志与保存 ---
         if iter_num % eval_interval == 0 and master_process:
-            print(f"iter {iter_num}: policy_loss={policy_loss:.4f}, value_loss={value_loss:.4f}, avg_kl={avg_kl:.6f}")
+            print(f"iter {iter_num}: policy_loss={policy_loss:.4f}, value_loss={value_loss:.4f}, avg_kl={avg_kl:.6f}",f"avg_reward={avg_reward:.4f}")
             if wandb_log:
                 wandb.log({
                     "iter": iter_num,
                     "train/policy_loss": policy_loss,
                     "train/value_loss": value_loss,
                     "train/avg_kl": avg_kl,
+                    "train/avg_reward": avg_reward,
                 })
             checkpoint = {
                 'model': actor_model.state_dict(),
@@ -369,51 +370,52 @@ if use_ppo:
             break
 if use_grpo:
     grpo_trainer = GRPOTrainer(
-    actor_model=actor_model,
-    ref_model=ref_model,
-    reward_model=reward_model,
-    actor_tokenizer=enc_wrapper,
-    reward_tokenizer=reward_tokenizer,
-    optimizer_actor=optimizer_actor,
-    group_size=4,          # 每个 prompt 采几条，超参数
-    kl_coef=0.02,
-    normalize_adv=True,
-    length_norm="avg",
-    device=device,
-    use_amp=True,
+        actor_model=actor_model,
+        ref_model=ref_model,
+        reward_model=reward_model,
+        actor_tokenizer=enc_wrapper,
+        reward_tokenizer=reward_tokenizer,
+        optimizer_actor=optimizer_actor,
+        group_size=4,          # 每个 prompt 采几条，超参数
+        kl_coef=0.0,           # GRPO 默认不加 KL penalty，可留接口
+        clip_reward=5.0,
+        device=device
     )
+
     iter_num = globals().get("iter_num", 0)
     policy_loss = 0.0
+
     while True:
-        # 1) sample prompts
+        # --- 1) sample prompts ---
         input_ids, attention_mask = get_prompt_batch(batch_size, device)
 
-        # 2) actor generate 多样本 (group_size>1)
+        # --- 2) actor generate 多样本 (group_size>1) ---
         max_new_tokens = block_size - 256
-        samples = grpo_trainer.generate_samples(
+        samples_list = grpo_trainer.generate_samples(
             (input_ids, attention_mask),
             max_length=block_size,
-            max_new_tokens=max_new_tokens,
-            temperature=1.0,
-            top_p=0.9,
-            do_sample=True
+            max_new_tokens=max_new_tokens
         )
+        samples = samples_list[0]  # 取批次 Samples
 
-        # 3) 计算奖励 & 构造经验
-        experiences, avg_kl = grpo_trainer.evaluate_experience(samples)
+        # --- 3) 计算奖励 & 构造经验 ---
+        experiences, avg_kl, avg_reward = grpo_trainer.evaluate_experience(samples, debug=False)
 
-        # 4) 更新 actor
-        policy_loss, _ = grpo_trainer.train_on_experience(experiences[0])
+        # --- 4) 更新 actor ---
+        # GRPO 通常一轮训练只用 1-step update
+        policy_loss= grpo_trainer.train_on_experience(experiences[0])
 
-        # 5) 日志与保存
+        # --- 5) 日志与保存 ---
         if iter_num % eval_interval == 0 and master_process:
-            print(f"iter {iter_num}: policy_loss={policy_loss:.4f}, avg_kl={avg_kl:.6f}")
+            print(f"iter {iter_num}: policy_loss={policy_loss:.4f}, avg_kl={avg_kl:.6f}, avg_reward={avg_reward:.4f}")
             if wandb_log:
                 wandb.log({
                     "iter": iter_num,
                     "train/policy_loss": policy_loss,
                     "train/avg_kl": avg_kl,
+                    "train/avg_reward": avg_reward,
                 })
+
             checkpoint = {
                 'model': actor_model.state_dict(),
                 'optimizer_actor': optimizer_actor.state_dict(),
