@@ -238,7 +238,7 @@ KL Loss = “你输出的分布要和参考模型一致”，直接作为监督�
 !apt-get update
 !apt-get install -y git
 !git clone https://github.com/zu-zi/LLM-RL.git
-!pip install torch numpy transformers datasets tiktoken 
+!pip install torch numpy transformers datasets tiktoken sglang
 %cd LLM-RL
 ```
 

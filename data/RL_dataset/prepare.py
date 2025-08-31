@@ -1,83 +1,101 @@
+# prepare.py
 import os
 import torch
+import hashlib
 from datasets import load_dataset
 import tiktoken
-import random
 
-DATASET_NAME = "Anthropic/hh-rlhf"   # 替换为实际数据集
-BLOCK_SIZE = 1024      # 原策略模型的 block_size
-MAX_PROMPT_TOKENS = 256
-OUTPUT_FILE = os.path.join(os.path.dirname(__file__), "prompt.bin")
+# config
+DATASET_NAME = "Anthropic/hh-rlhf"
+FIXED_SIZE = 1024           # 固定只训练这 1024 条
+GLOBAL_SEED = 1337      
+MAX_PROMPT_TOKENS = 256     # 用 gpt2 分词器裁剪的上限（只裁剪 prompt）
+MIN_PROMPT_TOKENS = 8
 
-# 现在的分词逻辑还是有问题，再想想
-# 需要测试无损转换
-class TokenizerWrapper:
-    def __init__(self, enc, max_length):
-        self.enc = enc
-        self.max_length = max_length
-        self.pad_token_id = 0
-        self.eos_token_id = enc.encode("<|endoftext|>", allowed_special={"<|endoftext|>"})[0]
+SAVE_DIR = os.path.join(os.path.dirname(__file__), "data", "RL_dataset")
+os.makedirs(SAVE_DIR, exist_ok=True)
+OUTPUT_FILE = os.path.join(SAVE_DIR, "prompt.bin")
 
-    def decode(self, token_ids):
-        if isinstance(token_ids, torch.Tensor):
-            token_ids = token_ids.tolist()
-        return self.enc.decode(token_ids)
-
-    def batch_decode(self, batch_tokens):
-        return [self.decode(tokens) for tokens in batch_tokens]
-
-    def __call__(self, texts):
-        input_ids = []
-        attention_mask = []
-        for text in texts:
-            ids = self.enc.encode(text, allowed_special="all")
-            ids = ids[:MAX_PROMPT_TOKENS]  # 严格截断
-            mask = [1] * len(ids)
-            pad_len = self.max_length - len(ids)
-            ids = ids + [self.pad_token_id] * pad_len
-            mask = mask + [0] * pad_len
-            input_ids.append(ids)
-            attention_mask.append(mask)
-        return {
-            "input_ids": torch.tensor(input_ids, dtype=torch.long),
-            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
-        }
-
+# actor 侧（nanoGPT）使用的分词器
 enc = tiktoken.get_encoding("gpt2")
-enc_wrapper = TokenizerWrapper(enc, max_length=BLOCK_SIZE)
+EOS_ID = enc.encode("<|endoftext|>", allowed_special={"<|endoftext|>"} )[0]
+
+def stable_hash(s: str, seed: int) -> int:
+    # 用 seed 注入的 sha1 哈希做稳定子集抽样
+    h = hashlib.sha1((str(seed) + "§" + s).encode("utf-8")).hexdigest()
+    return int(h, 16)
 
 def load_rl_dataset(split="train"):
-    dataset = load_dataset(DATASET_NAME, split=split)
-    if "text" not in dataset.column_names:
-        for col in dataset.column_names:
-            if dataset.features[col].dtype == "string":
-                dataset = dataset.rename_column(col, "text")
-                break
-    return dataset
+    ds = load_dataset(DATASET_NAME, split=split)
+    # 统一到 "text" 列
+    if "text" not in ds.column_names:
+        for c in ds.column_names:
+            try:
+                if ds.features[c].dtype == "string":
+                    ds = ds.rename_column(c, "text")
+                    break
+            except Exception:
+                pass
+    return ds
 
-def collect_prompts(dataset, max_prompt_tokens=MAX_PROMPT_TOKENS, min_prompt_tokens=5):
-    prompts = []
-    for sample in dataset["text"]:
-        tokens = enc.encode(sample, allowed_special="all")
-        if len(tokens) < min_prompt_tokens:
+def normalize_text(s: str) -> str:
+    return (s or "").strip()
+
+def collect_fixed_prompts(ds, fixed_size=FIXED_SIZE, seed=GLOBAL_SEED):
+    pool = []
+    seen_keys = set()
+
+    for s in ds["text"]:
+        if not isinstance(s, str):
             continue
-        tokens = tokens[:max_prompt_tokens]  # 强制截断
-        prompts.append(enc.decode(tokens))
-    return prompts
+        s = normalize_text(s)
+        if not s:
+            continue
 
+        # 用 gpt2 分词以便做长度过滤与后续 actor 侧直接使用
+        ids = enc.encode(s, allowed_special="all")
+        if len(ids) < MIN_PROMPT_TOKENS:
+            continue
+
+        # 只裁到 prompt 上限，保证训练时 response 还能放得下
+        ids = ids[:MAX_PROMPT_TOKENS]
+        if not ids:
+            continue
+
+        # 文本去重（按 MD5）
+        k = hashlib.md5(s.encode("utf-8")).hexdigest()
+        if k in seen_keys:
+            continue
+        seen_keys.add(k)
+
+        pool.append((stable_hash(s, seed), s, ids))
+
+    # 稳定排序后取前 fixed_size
+    pool.sort(key=lambda x: x[0])
+    pool = pool[:fixed_size]
+
+    prompts = [p[1] for p in pool]      # list[str]
+    token_ids = [p[2] for p in pool]    # list[list[int]]（未 pad）
+    lengths = [len(p[2]) for p in pool]
+    return prompts, token_ids, lengths
+
+# ------------ main ------------
 if __name__ == "__main__":
     print("Loading dataset...")
-    dataset = load_rl_dataset(split="train")
-    print(f"Dataset size: {len(dataset)}")
+    ds = load_rl_dataset("train")
+    print(f"Dataset size: {len(ds)}")
 
-    print("Collecting prompts...")
-    prompts = collect_prompts(dataset, BLOCK_SIZE)
+    print(f"Selecting fixed {FIXED_SIZE} prompts (seed={GLOBAL_SEED}) ...")
+    prompts, gpt2_token_ids, lengths = collect_fixed_prompts(ds)
 
-    print("Tokenizing...")
-    tokenizer = TokenizerWrapper(enc, max_length=BLOCK_SIZE)
-    tokenized = tokenizer(prompts)
-
-    print(f"Saving to {OUTPUT_FILE} ...")
-    torch.save(tokenized, OUTPUT_FILE)
-
-    print(f"Saved {len(prompts)} prompts. Done.")
+    obj = {
+        "prompts": prompts,                 # list[str]  —— 训练时用于拼接 reward 文本
+        "gpt2_token_ids": gpt2_token_ids,   # list[list[int]] —— actor 侧直接用（不 pad）
+        "lengths": lengths,                 # list[int]
+        "eos_id": EOS_ID,
+        "max_prompt_tokens": MAX_PROMPT_TOKENS,
+        "seed": GLOBAL_SEED,
+        "dataset_name": DATASET_NAME,
+    }
+    torch.save(obj, OUTPUT_FILE)
+    print(f"Saved {len(prompts)} prompts to {OUTPUT_FILE}")
