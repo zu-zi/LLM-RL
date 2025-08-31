@@ -10,7 +10,7 @@ from .common import (
     build_samples_from_generations,
     compute_actor_ref_logprobs,
     model_all_logits, token_logprobs_from_logits,
-    masked_mean, clip_by_global_norm
+    masked_mean, clip_by_global_norm,
 )
 
 class GRPOTrainer:
@@ -29,7 +29,7 @@ class GRPOTrainer:
         reward_tokenizer,
         optimizer_actor,
         group_size: int = 4,
-        kl_coef: float = 0.0,          # GRPO 常用 0；保留接口以便实验
+        kl_coef: float = 0.0,          # 常用 0；保留接口以便实验
         clip_reward: float = 5.0,
         mb_size_logits: int = 0,       # actor/ref logits 的 micro-batch（0 表示不切）
         device: str = "cuda",
@@ -49,15 +49,20 @@ class GRPOTrainer:
 
         self.device = torch.device(device)
         self.use_amp = (self.device.type == 'cuda')
-        self.scaler_actor = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        self.scaler_actor = amp.GradScaler(enabled=self.use_amp)
 
-        # 兜底 pad/eos（自写 GPT2Tok 没有 batch_decode）
+        # 兜底 pad/eos
         self.pad_token_id = getattr(actor_tokenizer, "pad_token_id", 0)
         self.eos_token_id = getattr(actor_tokenizer, "eos_token_id", 50256)
 
     # ------------------- 逐样本逐候选生成 -------------------
     @torch.no_grad()
-    def generate_samples(self, inputs: Tuple[torch.Tensor, torch.Tensor], max_length: int, max_new_tokens: int) -> List[Samples]:
+    def generate_samples(
+        self,
+        inputs: Tuple[torch.Tensor, torch.Tensor],
+        max_length: int,
+        max_new_tokens: int
+    ) -> List[Samples]:
         """
         inputs: (input_ids, attention_mask) 来自固定 prompts
         - 对于 batch 内每条 prompt，生成 group_size 个候选
@@ -112,10 +117,10 @@ class GRPOTrainer:
         - 奖励模型得到序列级 reward，按组归一化为优势，广播到 response 段
         - 返回 (experiences, avg_kl, avg_reward)
         """
-        seqs = samples.seqs.to(self.device)                 # [B_rep, T]
-        attn_mask = samples.attention_mask.to(self.device)  # [B_rep, T]
-        act_mask = samples.action_mask.to(self.device)      # [B_rep, T]
-        num_actions = samples.num_actions.to(self.device)   # [B_rep]
+        seqs        = samples.seqs.to(self.device)           # [B_rep, T]
+        attn_mask   = samples.attention_mask.to(self.device) # [B_rep, T]
+        act_mask    = samples.action_mask.to(self.device)    # [B_rep, T]
+        num_actions = samples.num_actions.to(self.device)    # [B_rep]
 
         B_rep, T = seqs.size()
         assert B_rep % self.group_size == 0, "B_rep must be divisible by group_size"
@@ -128,7 +133,7 @@ class GRPOTrainer:
                 values=torch.zeros((B_rep, 0), device=self.device),
                 returns=torch.zeros((B_rep, 0), device=self.device),
                 advantages=torch.zeros((B_rep, 0), device=self.device),
-                attention_mask=attn_mask[:, 1:],
+                attention_mask=attn_mask[:, :0],
                 action_mask=torch.zeros((B_rep, 0), device=self.device, dtype=torch.long),
                 reward=torch.zeros((B_rep, 1), device=self.device),
                 num_actions=num_actions,
@@ -136,24 +141,29 @@ class GRPOTrainer:
             )
             return [empty], 0.0, 0.0
 
-        # 1) actor/ref 的 logprob（target=seqs[:,1:]）
+        # 1) actor/ref 的 logprob（target=seqs[:,1:]）——显式传入 action_mask
         actor_lp, ref_lp, mask_tgt = compute_actor_ref_logprobs(
             actor=self.actor, ref=self.ref,
             seqs=seqs, action_mask=act_mask,
-            device_type=self.device.type, ptdtype=seqs.dtype,
+            device_type=self.device.type,
+            ptdtype=None,
             micro_batch_size=self.mb_size_logits,
-        )  # [B_rep, T-1]
+        )  # [B_rep, T-1] * 3
 
-        diff_lp = actor_lp - ref_lp                     # [B_rep, T-1]
-        kl_tokens = diff_lp * mask_tgt                  # per-token
-        avg_kl = masked_mean(diff_lp, mask_tgt.float()).item()
+        # 统一裁剪到最短长度 L，防止 off-by-one
+        L = min(actor_lp.size(1), ref_lp.size(1), mask_tgt.size(1))
+        actor_lp = actor_lp[:, :L]
+        ref_lp   = ref_lp[:, :L]
+        mask_tgt = mask_tgt[:, :L]
+
+        diff_lp   = actor_lp - ref_lp              # [B_rep, L]
+        kl_tokens = diff_lp * mask_tgt             # [B_rep, L]
+        avg_kl    = masked_mean(diff_lp, mask_tgt.float()).item()
 
         # 2) 奖励模型（标量）
         ids_cpu = seqs.detach().cpu().tolist()
-        if hasattr(self.actor_tokenizer, "batch_decode"):
-            texts = self.actor_tokenizer.batch_decode(ids_cpu)
-        else:
-            texts = [self.actor_tokenizer.decode(ids) for ids in ids_cpu]
+        texts = self.actor_tokenizer.batch_decode(ids_cpu) if hasattr(self.actor_tokenizer, "batch_decode") \
+                else [self.actor_tokenizer.decode(ids) for ids in ids_cpu]
         texts = [normalize_for_reward(t, reward_tokenizer=self.reward_tokenizer) for t in texts]
 
         r_inputs = self.reward_tokenizer(
@@ -165,32 +175,27 @@ class GRPOTrainer:
         reward_scores = r_out.logits[:, 0]  # [B_rep]
         avg_reward = reward_scores.mean().item()
 
-        # 3) 组内归一化优势（序列级标量） -> 广播到 response token
+        # 3) 组内归一化优势（序列级 -> token 广播）
         rs = reward_scores.view(B, self.group_size)
         rs_mean = rs.mean(dim=1, keepdim=True)
-        rs_std = rs.std(dim=1, keepdim=True).clamp_min(1e-8)
-        rs_norm = ((rs - rs_mean) / rs_std).view(B_rep)     # [B_rep]
+        rs_std  = rs.std(dim=1, keepdim=True).clamp_min(1e-8)
+        rs_norm = ((rs - rs_mean) / rs_std).view(B_rep)          # [B_rep]
 
-        advantages = rs_norm.unsqueeze(1) * mask_tgt.float()   # [B_rep, T-1]
-        # 可选：放大一点梯度，默认 1.0 足够；如需，可改为 advantages *= 5.0
-
-        # 若使用 KL 惩罚（通常 0）
+        advantages = rs_norm.unsqueeze(1) * mask_tgt.float()     # [B_rep, L]
         if self.kl_coef != 0.0:
-            # 等价于把 -kl 加到优势里；更常见做法是把 -kl 叠加到 reward 再做 PPO，
-            # 这里为简洁，直接在 token 维修正优势（不改变掩码）
             advantages = advantages - self.kl_coef * kl_tokens
 
         exp = Experience(
             seqs=seqs,                               # [B_rep, T]
-            action_log_probs=actor_lp,               # [B_rep, T-1]（旧 logp）
+            action_log_probs=actor_lp,               # [B_rep, L]（旧 logp）
             values=torch.zeros_like(actor_lp),       # 无 critic
             returns=torch.zeros_like(actor_lp),
-            advantages=advantages,                   # [B_rep, T-1]
-            attention_mask=attn_mask[:, 1:],         # [B_rep, T-1]
-            action_mask=mask_tgt,                    # [B_rep, T-1]
+            advantages=advantages,                   # [B_rep, L]
+            attention_mask=attn_mask[:, 1:][:, :L],  # [B_rep, L]
+            action_mask=mask_tgt,                    # [B_rep, L]
             reward=reward_scores.unsqueeze(1),       # [B_rep, 1]
             num_actions=num_actions,                 # [B_rep]
-            kl=kl_tokens,                            # [B_rep, T-1]
+            kl=kl_tokens,                            # [B_rep, L]
         )
         return [exp], float(avg_kl), float(avg_reward)
 
@@ -208,26 +213,37 @@ class GRPOTrainer:
     def train_on_experience(self, experience: Experience, use_token_entropy: bool = False):
         self.actor.train()
 
-        with amp.autocast(device_type='cuda', enabled=self.use_amp):
+        with amp.autocast(device_type=self.device.type, enabled=self.use_amp):
             # 重新前向拿当前策略的 token logprob（target=seqs[:,1:]）
             logits_all = model_all_logits(
                 model=self.actor, seqs=experience.seqs,
-                device_type=self.device.type, ptdtype=experience.seqs.dtype,
+                device_type=self.device.type,
+                ptdtype=None,
                 micro_batch_size=self.mb_size_logits
             )  # [B_rep, T, V]
             new_lp_all = token_logprobs_from_logits(logits_all, experience.seqs)  # [B_rep, T-1]
 
-            # ====== 熵筛选 ======
-            mask = experience.action_mask.float()
+            # 与缓存的旧量对齐到最短长度 L，彻底避免 510/509
+            L = min(
+                new_lp_all.size(1),
+                experience.action_log_probs.size(1),
+                experience.advantages.size(1),
+                experience.action_mask.size(1),
+            )
+            new_lp = new_lp_all[:, :L]
+            old_lp = experience.action_log_probs[:, :L]
+            adv    = experience.advantages[:, :L]
+            mask   = experience.action_mask[:, :L].float()
+
+            # 可选：熵筛选（在 L 范围内）
             if use_token_entropy:
                 from .common import apply_entropy_mask
-                mask = apply_entropy_mask(logits_all[:, :-1], mask, keep_ratio=0.2).float()
-            # ====================
+                mask = apply_entropy_mask(logits_all[:, :-1][:, :L], mask, keep_ratio=0.2).float()
 
             p_loss = self._policy_loss(
-                new_logp=new_lp_all,
-                old_logp=experience.action_log_probs,
-                advantages=experience.advantages,
+                new_logp=new_lp,
+                old_logp=old_lp,
+                advantages=adv,
                 mask=mask,
                 clip_eps=0.2
             )

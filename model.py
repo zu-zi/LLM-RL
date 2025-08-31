@@ -211,18 +211,6 @@ class GPT(nn.Module):
 
     #     return logits, loss
 
-    # #裁剪模型支持的最大输入长度：修改 position embedding；调整 attention bias mask
-    # def crop_block_size(self, block_size):
-    #     # model surgery to decrease the block size if necessary
-    #     # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
-    #     # but want to use a smaller block size for some smaller, simpler model
-    #     assert block_size <= self.config.block_size
-    #     self.config.block_size = block_size
-    #     self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
-    #     for block in self.transformer.h:
-    #         if hasattr(block.attn, 'bias'):
-    #             block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
-    
     # 修改后的 forward，兼容 return_all_logits 和 return_hidden
     def forward(self, idx, targets=None, return_all_logits: bool = False, return_hidden: bool = False):
         device = idx.device
@@ -258,6 +246,18 @@ class GPT(nn.Module):
             if return_hidden:
                 return logits_last, None, x
             return logits_last, None
+
+    #裁剪模型支持的最大输入长度：修改 position embedding；调整 attention bias mask
+    def crop_block_size(self, block_size):
+        # model surgery to decrease the block size if necessary
+        # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
+        # but want to use a smaller block size for some smaller, simpler model
+        assert block_size <= self.config.block_size
+        self.config.block_size = block_size
+        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+        for block in self.transformer.h:
+            if hasattr(block.attn, 'bias'):
+                block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
 
 
     #从Hugging Face的GPT2权重加载到当前nanoGPT

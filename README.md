@@ -238,7 +238,8 @@ KL Loss = “你输出的分布要和参考模型一致”，直接作为监督�
 !apt-get update
 !apt-get install -y git
 !git clone https://github.com/zu-zi/LLM-RL.git
-!pip install torch numpy transformers datasets tiktoken sglang
+!pip install torch numpy transformers datasets tiktoken
+!!pip install pybase64 sglang
 %cd LLM-RL
 ```
 
@@ -251,5 +252,5 @@ os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
 
 ```
 !python data/RL_dataset/prepare.py
-!python train_PPO_only.py config/finetune_shakespeare.py
+!python train_RL_only.py config/train_RL.py
 ```

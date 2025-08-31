@@ -12,7 +12,7 @@ init_from = 'gpt2-large'
 
 always_save_checkpoint = False
 
-batch_size = 1               # 根据显存支持来调
+batch_size = 4               # 根据显存支持来调
 gradient_accumulation_steps = 4  # RL逻辑没用这个
 max_iters = 200
 
@@ -21,9 +21,9 @@ RL_learning_rate = 1e-5      # RL用
 decay_lr = False
 
 # RL
-use_grpo = True           
+use_grpo = False          
 group_size = 4            
 block_size = 512            
-use_ppo = False
+use_ppo = True
 use_dapo = False
 use_token_entropy = False

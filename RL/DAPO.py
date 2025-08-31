@@ -1,3 +1,4 @@
+# RL/DAPO.py
 # 说明：
 # - DAPO: Direct Advantage Policy Optimization（直接把 logπ - logπ_ref 回归到 β*A）
 # - 无需 critic。优势 A 由“序列级奖励 - 基线”得到，再广播到 response token（只在 response 段做训练）。
@@ -13,9 +14,8 @@ from .common import (
     build_samples_from_generations,
     compute_actor_ref_logprobs,
     model_all_logits, token_logprobs_from_logits,
-    masked_mean, clip_by_global_norm
+    masked_mean, clip_by_global_norm,
 )
-
 
 class DAPOTrainer:
     def __init__(
@@ -51,7 +51,7 @@ class DAPOTrainer:
         self.mb_size_logits = int(mb_size_logits)
         self.device = torch.device(device)
         self.use_amp = (self.device.type == 'cuda')
-        self.scaler_actor = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        self.scaler_actor = amp.GradScaler(enabled=self.use_amp)
 
         # 兜底 pad/eos
         self.pad_token_id = getattr(actor_tokenizer, "pad_token_id", 0)
@@ -59,7 +59,12 @@ class DAPOTrainer:
 
     # ------------------- 逐样本生成（避免 pad 作为上下文） -------------------
     @torch.no_grad()
-    def generate_samples(self, inputs: Tuple[torch.Tensor, torch.Tensor], max_length: int, max_new_tokens: int) -> List[Samples]:
+    def generate_samples(
+        self,
+        inputs: Tuple[torch.Tensor, torch.Tensor],
+        max_length: int,
+        max_new_tokens: int
+    ) -> List[Samples]:
         input_ids, attention_mask = inputs
         input_ids = input_ids.to(self.device)
         attention_mask = attention_mask.to(self.device)
@@ -99,10 +104,10 @@ class DAPOTrainer:
     # ------------------- 经验评估：得到优势 A（序列级→token 级广播） -------------------
     @torch.no_grad()
     def evaluate_experience(self, samples: Samples, debug: bool = False):
-        seqs = samples.seqs.to(self.device)                 # [B, T]
-        attn_mask = samples.attention_mask.to(self.device)  # [B, T]
-        act_mask = samples.action_mask.to(self.device)      # [B, T]
-        num_actions = samples.num_actions.to(self.device)   # [B]
+        seqs        = samples.seqs.to(self.device)                 # [B, T]
+        attn_mask   = samples.attention_mask.to(self.device)       # [B, T]
+        act_mask    = samples.action_mask.to(self.device)          # [B, T]
+        num_actions = samples.num_actions.to(self.device)          # [B]
 
         B, T = seqs.size()
         if num_actions.sum().item() == 0:
@@ -112,7 +117,7 @@ class DAPOTrainer:
                 values=torch.zeros((B, 0), device=self.device),
                 returns=torch.zeros((B, 0), device=self.device),
                 advantages=torch.zeros((B, 0), device=self.device),
-                attention_mask=attn_mask[:, 1:],
+                attention_mask=attn_mask[:, :0],
                 action_mask=torch.zeros((B, 0), device=self.device, dtype=torch.long),
                 reward=torch.zeros((B, 1), device=self.device),
                 num_actions=num_actions,
@@ -120,22 +125,28 @@ class DAPOTrainer:
             )
             return [empty], 0.0, 0.0
 
-        # 1) actor/ref token logprob（target=seqs[:,1:]），只在 response 段使用
+        # 1) actor/ref token logprob（target=seqs[:,1:]）——显式传入 action_mask
         actor_lp, ref_lp, mask_tgt = compute_actor_ref_logprobs(
             actor=self.actor, ref=self.ref,
             seqs=seqs, action_mask=act_mask,
-            device_type=self.device.type, ptdtype=seqs.dtype,
+            device_type=self.device.type,
+            ptdtype=None,                                 # 内部自动选模型 dtype
             micro_batch_size=self.mb_size_logits,
-        )  # [B, T-1]
-        diff_lp = actor_lp - ref_lp                 # [B, T-1]
-        avg_kl = masked_mean(diff_lp, mask_tgt.float()).item()
+        )  # [B, T-1] * 3
 
-        # 2) 奖励模型，得到“序列级奖励”
+        # —— 强制对齐到最短长度 L，杜绝 off-by-one（510/509）——
+        L = min(actor_lp.size(1), ref_lp.size(1), mask_tgt.size(1))
+        actor_lp = actor_lp[:, :L]
+        ref_lp   = ref_lp[:, :L]
+        mask_tgt = mask_tgt[:, :L]
+
+        diff_lp  = actor_lp - ref_lp                          # [B, L]
+        avg_kl   = masked_mean(diff_lp, mask_tgt.float()).item()
+
+        # 2) 奖励模型（序列级奖励）
         ids_cpu = seqs.detach().cpu().tolist()
-        if hasattr(self.actor_tokenizer, "batch_decode"):
-            texts = self.actor_tokenizer.batch_decode(ids_cpu)
-        else:
-            texts = [self.actor_tokenizer.decode(ids) for ids in ids_cpu]
+        texts = self.actor_tokenizer.batch_decode(ids_cpu) if hasattr(self.actor_tokenizer, "batch_decode") \
+                else [self.actor_tokenizer.decode(ids) for ids in ids_cpu]
         texts = [normalize_for_reward(t, reward_tokenizer=self.reward_tokenizer) for t in texts]
 
         rinp = self.reward_tokenizer(
@@ -144,47 +155,40 @@ class DAPOTrainer:
         )
         rinp = {k: v.to(self.device) for k, v in rinp.items()}
         rout = self.reward_model(**rinp)
-        reward_scores = rout.logits[:, 0]  # [B]
+        reward_scores = rout.logits[:, 0]                     # [B]
         avg_reward = reward_scores.mean().item()
 
-        # 3) 基线与优势（序列级）
-        with torch.no_grad():
-            if self.ema_baseline is None:
-                self.ema_baseline = reward_scores.mean()
-            else:
-                self.ema_baseline = self.ema_m * self.ema_baseline + (1 - self.ema_m) * reward_scores.mean()
+        # 3) 基线与优势（序列级 -> token 广播）
+        if self.ema_baseline is None:
+            self.ema_baseline = reward_scores.mean()
+        else:
+            self.ema_baseline = self.ema_m * self.ema_baseline + (1 - self.ema_m) * reward_scores.mean()
 
-        adv_seq = reward_scores - self.ema_baseline  # [B]
-
-        # 归一化/裁剪
+        adv_seq = reward_scores - self.ema_baseline           # [B]
         if self.adv_norm == "zscore":
             mean = adv_seq.mean()
-            std = adv_seq.std().clamp_min(1e-8)
+            std  = adv_seq.std().clamp_min(1e-8)
             adv_seq = (adv_seq - mean) / std
         elif self.adv_norm == "mean0":
             adv_seq = adv_seq - adv_seq.mean()
-        # else: "none" -> 不处理
 
         if self.adv_clip is not None and self.adv_clip > 0:
             adv_seq = adv_seq.clamp(-self.adv_clip, self.adv_clip)
 
-        # 广播到 token 维（只在 response 段有效，其他位置乘 0）
-        advantages = (adv_seq.unsqueeze(1) * mask_tgt.float())  # [B, T-1]
-
-        # DAPO 的监督目标：目标对数几率差 target = β * A
-        target_delta = self.beta * advantages  # [B, T-1]
+        advantages   = adv_seq.unsqueeze(1) * mask_tgt.float()    # [B, L]
+        target_delta = self.beta * advantages                      # [B, L]
 
         exp = Experience(
             seqs=seqs,                               # [B, T]
-            action_log_probs=diff_lp,                # 旧的差分（不是必须，但保留便于日志）
+            action_log_probs=diff_lp,                # [B, L]（便于日志）
             values=torch.zeros_like(diff_lp),        # 无 critic
             returns=torch.zeros_like(diff_lp),
-            advantages=target_delta,                 # 直接存放“监督目标 βA”
-            attention_mask=attn_mask[:, 1:],         # [B, T-1]
-            action_mask=mask_tgt,                    # [B, T-1]
+            advantages=target_delta,                 # [B, L]（直接存“监督目标 βA”）
+            attention_mask=attn_mask[:, 1:][:, :L],  # [B, L]
+            action_mask=mask_tgt,                    # [B, L]
             reward=reward_scores.unsqueeze(1),       # [B, 1]
             num_actions=num_actions,                 # [B]
-            kl=diff_lp * mask_tgt,                   # [B, T-1]
+            kl=diff_lp * mask_tgt,                   # [B, L]
         )
         return [exp], float(avg_kl), float(avg_reward)
 
@@ -192,35 +196,44 @@ class DAPOTrainer:
     def train_on_experience(self, experience: Experience, use_token_entropy: bool = False):
         self.actor.train()
 
-        with amp.autocast(device_type='cuda', enabled=self.use_amp):
+        with amp.autocast(device_type=self.device.type, enabled=self.use_amp):
             # 当前策略的 token logprob（target=seqs[:,1:]）
             logits_all = model_all_logits(
                 model=self.actor, seqs=experience.seqs,
-                device_type=self.device.type, ptdtype=experience.seqs.dtype,
+                device_type=self.device.type,
+                ptdtype=None,                          # 自动匹配模型 dtype
                 micro_batch_size=self.mb_size_logits
             )  # [B, T, V]
             new_lp_all = token_logprobs_from_logits(logits_all, experience.seqs)  # [B, T-1]
 
-            # ref 也需要（可选：若想省一次前向，可在 evaluate_experience 缓存；代码简化起见再算一遍）
+            # ref 再算一次（也可以在 evaluate 阶段缓存）
             ref_logits_all = model_all_logits(
                 model=self.ref, seqs=experience.seqs,
-                device_type=self.device.type, ptdtype=experience.seqs.dtype,
+                device_type=self.device.type,
+                ptdtype=None,
                 micro_batch_size=self.mb_size_logits
             )
             ref_lp_all = token_logprobs_from_logits(ref_logits_all, experience.seqs)  # [B, T-1]
 
-            # 预测的对数几率差：δ = logπ - logπ_ref
-            delta = (new_lp_all - ref_lp_all)  # [B, T-1]
+            # 与缓存的目标（advantages / action_mask）统一到最短长度 L，避免 510/509
+            L = min(
+                new_lp_all.size(1),
+                ref_lp_all.size(1),
+                experience.advantages.size(1),
+                experience.action_mask.size(1),
+            )
+            new_lp = new_lp_all[:, :L]
+            ref_lp = ref_lp_all[:, :L]
+            delta  = new_lp - ref_lp                       # [B, L]
 
-            # ====== 熵筛选 ======
-            mask = experience.action_mask.float()
+            mask   = experience.action_mask[:, :L].float() # [B, L]
+            target = experience.advantages[:, :L]          # [B, L]
+
+            # ====== 可选：熵筛选（在 L 范围内）======
             if use_token_entropy:
                 from .common import apply_entropy_mask
-                mask = apply_entropy_mask(logits_all[:, :-1], mask, keep_ratio=0.2).float()
-            # ====================
-
-            # 监督目标：βA 已经存放在 experience.advantages
-            target = experience.advantages  # [B, T-1]
+                mask = apply_entropy_mask(logits_all[:, :-1][:, :L], mask, keep_ratio=0.2).float()
+            # =====================================
 
             # MSE 回归（只在 response 段）
             mse = (delta - target).pow(2)

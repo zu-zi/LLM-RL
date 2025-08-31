@@ -12,7 +12,7 @@ GLOBAL_SEED = 1337
 MAX_PROMPT_TOKENS = 256     # 用 gpt2 分词器裁剪的上限（只裁剪 prompt）
 MIN_PROMPT_TOKENS = 8
 
-SAVE_DIR = os.path.join(os.path.dirname(__file__), "data", "RL_dataset")
+SAVE_DIR = os.path.join(os.path.dirname(__file__))
 os.makedirs(SAVE_DIR, exist_ok=True)
 OUTPUT_FILE = os.path.join(SAVE_DIR, "prompt.bin")
 
