@@ -1,5 +1,5 @@
-bash setup_sglang.sh                # 默认：env=sgl-cu124，python=3.10，使用清华镜像加速，安装cuda-toolkit
-bash setup_sglang.sh --env-name myenv --py 3.11 --no-mirror --no-cuda-toolkit
+# bash setup_sglang.sh                # 默认：env=sgl-cu124，python=3.10，使用清华镜像加速，安装cuda-toolkit
+# bash setup_sglang.sh --env-name myenv --py 3.11 --no-mirror --no-cuda-toolkit
 
 #!/usr/bin/env bash
 # setup_sglang.sh
