@@ -1,3 +1,93 @@
+# run 
++ LLM-RL
+```
+!apt-get update
+!apt-get install -y git
+!git clone https://github.com/zu-zi/LLM-RL.git
+!pip install torch numpy transformers datasets tiktoken
+%cd LLM-RL
+```
+
+```
+import os
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+os.environ['TRANSFORMERS_OFFLINE'] = '0'
+os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
+```
+
+```
+!python data/RL_dataset/prepare.py
+!python train_RL_only.py config/train_RL.py
+```
+# sglang：2.8.0
+```
+export TORCH_CUDA_ARCH_LIST="8.9"
+
+# 推荐用 python3 -m pip，确保用的是系统环境里的 pip
+python3 -m pip install -U pip
+
+# SGLang
+python3 -m pip install "sglang[all]"
+
+# sgl-kernel
+python3 -m pip install -U sgl-kernel
+
+# FlashInfer (cu128 / torch2.8)
+python3 -m pip install --no-cache-dir --prefer-binary flashinfer \
+  --find-links https://flashinfer.ai/whl/cu128/torch2.8/flashinfer/
+
+# 常用依赖
+python3 -m pip install transformers accelerate tiktoken
+```
+```
+# 验证
+python3 - <<'PY'
+import torch, sglang, flashinfer
+print("torch:", torch.__version__, torch.version.cuda)
+print("sglang:", sglang.__version__)
+print("flashinfer OK")
+PY
+```
+```
+python3 /root/test_sglang_offline.py
+```
+# sglang：2.5.1
+```
+# 检查必须是 2.5.1 / 12.4
+python3 - <<'PY'
+import torch; print(torch.__version__, torch.version.cuda)
+PY
+
+# 可选：HF 镜像 & 架构
+export HF_ENDPOINT=https://hf-mirror.com
+export TRANSFORMERS_OFFLINE=0
+export HF_HUB_DISABLE_TELEMETRY=1
+export TORCH_CUDA_ARCH_LIST="8.9"
+
+# 安装 sglang 相关（系统 pip）
+python3 -m pip install -U pip
+python3 -m pip install "sglang[all]"
+python3 -m pip install -U sgl-kernel
+
+# FlashInfer（严格匹配 torch2.5 + cu124）
+python3 -m pip install --no-cache-dir --prefer-binary flashinfer \
+  --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer/
+
+# 常用依赖
+python3 -m pip install transformers accelerate tiktoken
+
+# 验证
+python3 - <<'PY'
+import torch, sglang, flashinfer
+print("torch:", torch.__version__, torch.version.cuda)
+print("sglang:", sglang.__version__)
+print("flashinfer OK")
+PY
+
+# 测试
+python3 /root/test_sglang_offline.py
+```
+
 ## finetue:
 + pip install torch numpy transformers datasets tiktoken wandb tqdm
 + python data/shakespeare_char/prepare.py
@@ -254,3 +344,5 @@ os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
 !python data/RL_dataset/prepare.py
 !python train_RL_only.py config/train_RL.py
 ```
+# sglang
+export TORCH_CUDA_ARCH_LIST="8.9"
