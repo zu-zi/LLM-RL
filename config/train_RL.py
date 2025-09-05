@@ -27,3 +27,9 @@ block_size = 512
 use_ppo = True
 use_dapo = False
 use_token_entropy = False
+
+# === sglang 离线 rollout 引擎 ===
+SGLANG_ON = True                    
+SGLANG_MODEL_PATH = "gpt2-large"    
+SGLANG_SYNC_DIR = "/tmp/sgl_rollout" 
+SGLANG_SYNC_EVERY = 200           

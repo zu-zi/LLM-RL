@@ -14,7 +14,11 @@ os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 os.environ['TRANSFORMERS_OFFLINE'] = '0'
 os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
 ```
+```
+!export PY=/usr/bin/python3
 
+!bash sglang_bootstrap.sh
+```
 ```
 !python data/RL_dataset/prepare.py
 !python train_RL_only.py config/train_RL.py
@@ -87,7 +91,50 @@ PY
 # 测试
 python3 /root/test_sglang_offline.py
 ```
+# final
+```
+apt-get update
+apt-get install -y git
+git clone https://github.com/zu-zi/LLM-RL.git
+cd LLM-RL
+python3 -m pip install -U pip
+python3 -m pip install torch numpy transformers datasets tiktoken bitsandbytes
+# 检查必须是 2.5.1 / 12.4
+python3 - <<'PY'
+import torch; print(torch.__version__, torch.version.cuda)
+PY
 
+# 可选：HF 镜像 & 架构
+export HF_ENDPOINT=https://hf-mirror.com
+export TRANSFORMERS_OFFLINE=0
+export HF_HUB_DISABLE_TELEMETRY=1
+export TORCH_CUDA_ARCH_LIST="8.9"
+
+# 安装 sglang 相关（系统 pip）
+python3 -m pip install -U pip
+python3 -m pip install "sglang[all]"
+python3 -m pip install -U sgl-kernel
+
+# FlashInfer（严格匹配 torch2.5 + cu124）
+python3 -m pip install --no-cache-dir --prefer-binary flashinfer \
+  --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer/
+
+# 常用依赖
+python3 -m pip install accelerate
+
+# 验证
+python3 - <<'PY'
+import torch, sglang, flashinfer
+print("torch:", torch.__version__, torch.version.cuda)
+print("sglang:", sglang.__version__)
+print("flashinfer OK")
+PY
+
+python3 data/RL_dataset/prepare.py
+python3 train_RL_only.py config/train_RL.py
+
+# python3 test_sglang.py
+```
 ## finetue:
 + pip install torch numpy transformers datasets tiktoken wandb tqdm
 + python data/shakespeare_char/prepare.py

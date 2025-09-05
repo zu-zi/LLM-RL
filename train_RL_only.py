@@ -313,20 +313,73 @@ if resume_payload is not None:
     if 'optimizer_critic' in resume_payload:
         optimizer_critic.load_state_dict(resume_payload['optimizer_critic'])
 
-# --------------------- sglang 引擎（offline模式） ---------------------
-try:
+# ===== sglang 离线 rollout 引擎：可选启用，不可用自动回退 =====
+import os, json
+engine = None
+SGLANG_ON = os.getenv("SGLANG", "0") == "1"
+MODEL_PATH = os.getenv("SGLANG_MODEL_PATH", "gpt2-large").strip()
+SYNC_DIR = os.getenv("SGLANG_SYNC_DIR", "/tmp/sgl_rollout").strip()
+SYNC_EVERY = int(os.getenv("SGLANG_SYNC_EVERY", "200"))
+
+def _write_minimal_config_json(path, n_layer, n_head, n_embd, block_size, vocab_size=50304):
+    cfg = {
+        "model_type": "gpt2",
+        "n_layer": n_layer,
+        "n_head": n_head,
+        "n_embd": n_embd,
+        "n_positions": block_size,
+        "n_ctx": block_size,
+        "vocab_size": vocab_size,
+        "bos_token_id": 50256,
+        "eos_token_id": 50256,
+        "embd_pdrop": 0.0, "attn_pdrop": 0.0, "resid_pdrop": 0.0,
+    }
+    with open(os.path.join(path, "config.json"), "w") as f:
+        json.dump(cfg, f)
+
+def _reload_engine_from_dir(dir_path):
+    global engine
     import sglang as sgl
-    engine = sgl.Engine(model=raw_actor, mode="offline")  # 离线推理引擎（不可用时自动回退）
-    print("SGLang engine loaded (offline mode).")
-except Exception as e:
-    engine = None
-    print(f"SGLang not available, fallback to raw_actor.generate. Error: {e}")
+    engine = sgl.Engine(model_path=dir_path, impl="transformers")  # 纯离线，本地加载
+    print(f"[sglang] offline engine loaded from: {dir_path}")
+
+def _maybe_init_engine_first_time():
+    # 首次：直接用 HF 名字/目录加载（离线）
+    try:
+        os.makedirs(SYNC_DIR, exist_ok=True)
+        _reload_engine_from_dir(MODEL_PATH)
+        return True
+    except Exception as e:
+        print(f"[sglang] init failed, fallback to HF generate. Error: {e}")
+        return False
+
+def _maybe_sync_engine(iter_num):
+    # 每 SYNC_EVERY 次迭代，把 actor 的最新权重写进 SYNC_DIR，并重载引擎
+    if not SGLANG_ON or engine is None:
+        return
+    if iter_num % SYNC_EVERY != 0:
+        return
+    try:
+        os.makedirs(SYNC_DIR, exist_ok=True)
+        # 1) 存权重（最小：pytorch_model.bin）
+        torch.save(raw_actor.state_dict(), os.path.join(SYNC_DIR, "pytorch_model.bin"))
+        # 2) 写 config.json（一次写好即可；这里简单覆盖，省心）
+        _write_minimal_config_json(SYNC_DIR, n_layer, n_head, n_embd, block_size, vocab_size=50304)
+        # 3) 重载引擎（离线）
+        _reload_engine_from_dir(SYNC_DIR)
+        print(f"[sglang] synced & reloaded at iter={iter_num}")
+    except Exception as e:
+        print(f"[sglang] sync failed at iter={iter_num}: {e}")
+
+# 首次尝试启用（可选）
+if SGLANG_ON:
+    _maybe_init_engine_first_time()
+else:
+    print("[sglang] SGLANG=0 (disabled); using HF generate.")
 
 def generate_with_engine(ids_t, max_new_tokens, eos_token_id):
-    if engine is not None:
-        # 注意：不同 sglang 版本接口可能不同，这里做最简封装
-        return engine.generate(ids_t, max_new_tokens=max_new_tokens, eos_token_id=eos_token_id)
-    else:
+    # 若引擎不可用，走你原本的 HF generate
+    if engine is None:
         return raw_actor.generate(
             idx=ids_t,
             max_new_tokens=max_new_tokens,
@@ -334,6 +387,23 @@ def generate_with_engine(ids_t, max_new_tokens, eos_token_id):
             top_k=None,
             eos_token_id=eos_token_id
         )
+    # sglang：文本接口 → 生成 → 再编码回 token
+    prompt_text = gpt2tok.decode(ids_t[0])
+    outs = engine.generate(
+        [prompt_text],
+        {"max_new_tokens": int(max_new_tokens),
+         "eos_token_id": int(eos_token_id),
+         "stop_token_ids": [int(eos_token_id)]}
+    )
+    # 兼容不同返回
+    out0 = outs[0]
+    text = out0 if isinstance(out0, str) else (out0.get("text") or out0.get("output_text") or str(out0))
+    resp_text = text[len(prompt_text):] if text.startswith(prompt_text) else text
+    resp_ids = gpt2tok.encode(resp_text)[:max_new_tokens]
+    if not resp_ids or resp_ids[-1] != eos_token_id:
+        resp_ids += [eos_token_id]
+    full_ids = torch.tensor(ids_t[0].tolist() + resp_ids, dtype=torch.long, device=ids_t.device)
+    return [full_ids]
 
 # --------------------- 奖励模型（HF） ---------------------
 reward_model_name = "Skywork/Skywork-Reward-V2-Qwen3-0.6B"
@@ -518,6 +588,7 @@ while trainer is not None:
         torch.save(ckpt, path)
 
     iter_num += 1
+    _maybe_sync_engine(iter_num)   # ← 每隔 SYNC_EVERY 次，把最新 actor 权重同步到离线引擎
     if iter_num > max_iters:
         break
 

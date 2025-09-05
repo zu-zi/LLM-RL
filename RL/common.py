@@ -3,7 +3,7 @@
 # - 面向所有 RL 算法（PPO/GRPO/DAPO/Token-Entropy）可复用的工具。
 # - 关注显存：提供 batch 维 micro-batch 前向、只对 response 段建掩码计算指标、可选按 8 对齐 padding。
 # - 与 train.py / model.py 对齐：model.forward 支持 return_all_logits / return_hidden。
-# - 注意：这里不直接依赖具体的 Trainer，实现尽量通用。
+# - 注意：为兼容既有 Trainer，新增参数均提供默认值，不破坏旧调用。
 
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Iterable, Union
@@ -115,12 +115,14 @@ def build_samples_from_generations(
     block_size: int,
     pad_to_multiple_of: int = 8,
     device: Optional[Union[str, torch.device]] = None,
+    pad_id: int = 0,
 ) -> Samples:
     """
     把 list[{"prompt_ids":Tensor[Ti], "full_ids":Tensor[Ti+Tj], "response_ids":Tensor[Tj]}]
     转成对齐后的 Samples（BxT）。
     - 右 pad；T 为本 batch 的最大实际长度（截断不超过 block_size）
     - action_mask 只标记 response token（后续通常会用 action_mask[:,1:] 与 target 维对齐）
+    - pad_id 默认 0（兼容 GPT-2），可外部传入 tokenizer.pad_token_id
     """
     assert len(gens) > 0, "gens 为空"
     if device is None:
@@ -136,7 +138,6 @@ def build_samples_from_generations(
         T_max = min(_pad_to_multiple(T_max, pad_to_multiple_of), block_size)
 
     # 承载张量
-    pad_id = 0  # GPT-2 无 pad_token_id；此处用 0 作为 padding，不参与 loss
     dtype_ids = gens[0]["full_ids"].dtype
     seqs = torch.full((B, T_max), pad_id, dtype=dtype_ids, device=device)
     attention_mask = torch.zeros((B, T_max), dtype=torch.long, device=device)
@@ -290,11 +291,14 @@ def forward_values_via_actor(
     device_type: str,
     ptdtype: Optional[torch.dtype] = None,
     micro_batch_size: int = 0,
+    detach_hidden: bool = False,
 ) -> torch.Tensor:
     """
     为了拿 critic 的值，在前向时让 actor 返回 hidden，然后过 critic。
     按 batch 维做 micro-batch，节省显存。
     返回 [B, T] 的 values。
+    - detach_hidden=True 时，会在将 hidden 送入 critic 前 .detach()，
+      防止 critic 的反向链路穿透回 actor（适用于 value 更新阶段）。
     """
     if ptdtype is None:
         ptdtype = next(model.parameters()).dtype
@@ -305,6 +309,8 @@ def forward_values_via_actor(
         ctx = amp.autocast(device_type=device_type, dtype=ptdtype) if device_type != 'cpu' else nullcontext()
         with ctx:
             _, _, h = model(seqs[s:e], return_hidden=True)  # (b, T, C)
+        if detach_hidden:
+            h = h.detach()
         v = critic(h)                                      # (b, T) or (b, T, 1)
         if v.dim() == 3 and v.size(-1) == 1:
             v = v.squeeze(-1)
@@ -413,14 +419,56 @@ def compute_values_on_response(
     device_type: str,
     ptdtype: Optional[torch.dtype] = None,
     micro_batch_size: int = 0,
+    detach_hidden: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     计算 values，并返回（values, mask_time），两者均为 [B, T]。
     实际训练时通常只在 response 段（mask_time=1）使用。
+    - detach_hidden=True 同 forward_values_via_actor
     """
-    values = forward_values_via_actor(model, critic, seqs, device_type, ptdtype=ptdtype, micro_batch_size=micro_batch_size)
+    values = forward_values_via_actor(
+        model, critic, seqs, device_type, ptdtype=ptdtype,
+        micro_batch_size=micro_batch_size, detach_hidden=detach_hidden
+    )
     mask_time = action_mask.clone()
     return values, mask_time
+
+
+# =========================
+# 便捷奖励注入/索引工具（可选）
+# =========================
+
+def last_indices_from_mask(mask_time: torch.Tensor) -> torch.Tensor:
+    """
+    给定时间掩码 [B, T] 或 [B, L]（1=有效），返回每条样本最后一个有效位置索引 [B]。
+    若整条样本都为 0，则返回 0。
+    """
+    B, T = mask_time.shape
+    ar = torch.arange(T, device=mask_time.device).view(1, T)
+    return (mask_time * ar).amax(dim=1)
+
+
+def scatter_last_token_rewards(
+    r_seq: torch.Tensor,               # [B] 序列级奖励（可已中心化/裁剪）
+    mask_time: torch.Tensor,           # [B, T] 有效时间步掩码（通常=action_mask[:,1:]）
+    beta_kl: Optional[Tuple[torch.Tensor, float]] = None,
+) -> torch.Tensor:
+    """
+    把序列级奖励聚合注入到每条样本的最后一个有效 token 上。
+    可选地同时减去 KL 总和（逐 token 已乘 mask 后求和），并乘以系数 beta。
+    - beta_kl: (kl_t, beta)，其中 kl_t 为 [B, T] 的逐 token KL（已 masked）。
+    返回 per-token 奖励张量 [B, T]（其他位置为 0）。
+    """
+    B, T = mask_time.shape
+    rewards_t = torch.zeros((B, T), dtype=r_seq.dtype, device=mask_time.device)
+    last_idx = last_indices_from_mask(mask_time)  # [B]
+    shaped = r_seq.clone()
+    if beta_kl is not None:
+        kl_t, beta = beta_kl
+        kl_sum = (kl_t * mask_time).sum(dim=1)  # [B]
+        shaped = shaped - beta * kl_sum
+    rewards_t.scatter_(1, last_idx.view(B, 1), shaped.unsqueeze(1))
+    return rewards_t
 
 
 # =========================
@@ -510,4 +558,6 @@ __all__ = [
     "normalize_for_reward",
     "contains_chinese",
     "apply_entropy_mask",
+    "last_indices_from_mask",
+    "scatter_last_token_rewards",
 ]

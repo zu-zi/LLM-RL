@@ -43,7 +43,7 @@ class PPOTrainer:
         optimizer_actor,
         optimizer_critic,
         kl_ctl: float = 0.02,         # KL 系数
-        clip_reward: float = 5.0,     # 奖励裁剪
+        clip_reward: float = 5.0,     # 奖励裁剪（对序列级奖励裁剪）
         gamma: float = 1.0,           # RLHF 常用 1.0
         lambd: float = 0.95,          # GAE 参数
         mb_size_logits: int = 0,      # actor/ref logits 前向的 micro-batch（0=不切）
@@ -136,7 +136,7 @@ class PPOTrainer:
     def evaluate_experience(self, samples: Samples, debug: bool = False):
         """
         - 计算 actor/ref 的 token logprob（target=seqs[:,1:]）
-        - 奖励模型得到样本标量奖励，均匀分配到 response token
+        - 奖励模型得到样本标量奖励（序列级），聚合到 response 的最后一个 token
         - 用 critic 计算 values，并以 GAE 得到 returns/advantages
         """
         seqs        = samples.seqs.to(self.device)           # [B, T]
@@ -161,7 +161,6 @@ class PPOTrainer:
             return [empty], 0.0, 0.0
 
         # ---- 1) actor/ref token logprob（target=seqs[:,1:]）----
-        # 显式传入 action_mask，返回 mask_tgt = action_mask[:, 1:]
         actor_lp, ref_lp, mask_tgt = compute_actor_ref_logprobs(
             actor=self.actor, ref=self.ref,
             seqs=seqs, action_mask=act_mask,
@@ -174,12 +173,17 @@ class PPOTrainer:
         L = min(actor_lp.size(1), ref_lp.size(1), mask_tgt.size(1))
         actor_lp = actor_lp[:, :L]
         ref_lp   = ref_lp[:, :L]
-        mask_tgt = mask_tgt[:, :L]
+        mask_tgt = mask_tgt[:, :L]  # 这是 response 段在 target 对齐维度上的掩码（B, L）
 
-        # ---- 2) 奖励模型（标量），均匀分配到 response 段 ----
-        ids_cpu = seqs.detach().cpu().tolist()
-        texts = self.actor_tokenizer.batch_decode(ids_cpu) if hasattr(self.actor_tokenizer, "batch_decode") \
-                else [self.actor_tokenizer.decode(ids) for ids in ids_cpu]
+        # ---- 2) 奖励模型（标量），只用有效 token（去除右侧 pad）----
+        valid_lens = attn_mask.sum(dim=1).tolist()  # [B]
+        texts = []
+        for i in range(B):
+            Li = int(valid_lens[i])
+            toks = seqs[i, :Li].detach().cpu().tolist()
+            # 这里不跳过 special tokens，保持与 RM 训练时的一致性
+            texts.append(self.actor_tokenizer.decode(toks, skip_special_tokens=False))
+
         texts = [normalize_for_reward(t, reward_tokenizer=self.reward_tokenizer) for t in texts]
 
         r_inputs = self.reward_tokenizer(
@@ -188,50 +192,62 @@ class PPOTrainer:
         )
         r_inputs = {k: v.to(self.device) for k, v in r_inputs.items()}
         r_out = self.reward_model(**r_inputs)
-        reward_scores = r_out.logits[:, 0]  # [B]
+        reward_scores = r_out.logits[:, 0]  # [B]  序列级奖励（未中心化）
 
-        # NEW: 先对序列级奖励做去均值，再均匀分配到 response token
-        resp_len  = mask_tgt.sum(dim=1).clamp_min(1)  # [B]
-        r_center  = reward_scores - reward_scores.mean()
-        per_token = (r_center.clamp(-self.clip_reward, self.clip_reward) / resp_len).unsqueeze(1) * mask_tgt
-        rewards_t = -self.kl_ctl * (actor_lp - ref_lp) * mask_tgt + per_token
+        # ---- 2.1) 将序列级奖励聚合到 response 最后一个 token；KL 也聚合 ----
+        # 中心化 + 裁剪，避免数据分布漂移/长尾
+        r_center = (reward_scores - reward_scores.mean()).clamp(-self.clip_reward, self.clip_reward)  # [B]
+
+        # 逐 token KL
+        kl_t = (actor_lp - ref_lp) * mask_tgt            # [B, L]
+        kl_sum = kl_t.sum(dim=1)                         # [B]
+
+        # 构造 shaped per-token 奖励：仅在每条样本的最后一个 response token 处注入 (r_center - beta * KL_sum)
+        rewards_t = torch.zeros_like(actor_lp)           # [B, L]
+        if L > 0:
+            arange_L = torch.arange(L, device=self.device).view(1, -1)  # [1, L]
+            last_idx = (mask_tgt * arange_L).amax(dim=1)                # [B]
+            # scatter 到最后一个有效位置
+            rewards_t.scatter_(1, last_idx.unsqueeze(1), r_center - self.kl_ctl * kl_sum)
 
         # ---- 3) critic values & GAE（只在 response 段）----
         from .common import forward_values_via_actor
-        values_full = forward_values_via_actor(
-            model=self.actor, critic=self.critic,
-            seqs=seqs, device_type=self.device.type, ptdtype=None,
-            micro_batch_size=self.mb_size_values,
-        )  # [B, T]
-        values_t = values_full[:, 1:][:, :L]  # [B, L]
+
+        # 重要：critic 更新与评估阶段都不应让梯度穿过 actor（这里先评估，用 no_grad）
+        with torch.no_grad():
+            values_full = forward_values_via_actor(
+                model=self.actor, critic=self.critic,
+                seqs=seqs, device_type=self.device.type, ptdtype=None,
+                micro_batch_size=self.mb_size_values,
+            )  # [B, T]
+        values_t = values_full[:, 1:][:, :L]  # [B, L] 与 target 维对齐
 
         returns_t, adv_t = gae_compute(
             values=values_t, rewards=rewards_t, mask_time=mask_tgt,
             gamma=self.gamma, lam=self.lambd, use_last_as_terminal=True
         )
-        # NEW: 仅对 response 段做优势标准化（数值更稳）
+        # 仅对 response 段做优势标准化
         denom = mask_tgt.sum().clamp_min(1)
         mean  = (adv_t * mask_tgt).sum() / denom
         var   = ((adv_t - mean)**2 * mask_tgt).sum() / denom
         adv_t = (adv_t - mean) / torch.sqrt(var + 1e-8)
 
         avg_kl     = masked_mean(actor_lp - ref_lp, mask_tgt.float()).item()
-        avg_reward = reward_scores.mean().item()
+        avg_reward = reward_scores.mean().item()  # 记录 raw RM reward 的平均值
 
         exp = Experience(
             seqs=seqs,                              # [B, T]
-            action_log_probs=actor_lp,              # [B, L]
+            action_log_probs=actor_lp,              # [B, L]（old logp）
             values=values_t,                        # [B, L]
             returns=returns_t,                      # [B, L]
             advantages=adv_t,                       # [B, L]
             attention_mask=attn_mask[:, 1:][:, :L], # [B, L]
             action_mask=mask_tgt,                   # [B, L]
-            reward=reward_scores.unsqueeze(1),      # [B, 1]
+            reward=reward_scores.unsqueeze(1),      # [B, 1]（便于日志）
             num_actions=num_actions,                # [B]
-            kl=(actor_lp - ref_lp) * mask_tgt,      # [B, L]
+            kl=kl_t,                                # [B, L]
         )
         return [exp], float(avg_kl), float(avg_reward)
-
 
     # ------------------- Loss -------------------
     @staticmethod
@@ -303,12 +319,14 @@ class PPOTrainer:
 
         # ------- Critic update -------
         with amp.autocast(device_type=self.device.type, enabled=self.use_amp):
+            # 关键：阻断 actor 的梯度，避免 critic 反向穿透到 actor
             from .common import forward_values_via_actor
-            values_full = forward_values_via_actor(
-                model=self.actor, critic=self.critic,
-                seqs=experience.seqs, device_type=self.device.type, ptdtype=None,
-                micro_batch_size=self.mb_size_values,
-            )  # [B, T]
+            with torch.no_grad():
+                values_full = forward_values_via_actor(
+                    model=self.actor, critic=self.critic,
+                    seqs=experience.seqs, device_type=self.device.type, ptdtype=None,
+                    micro_batch_size=self.mb_size_values,
+                )  # [B, T]
             values_t_all = values_full[:, 1:]  # [B, T-1]
 
             # 与 returns/old_values/action_mask 对齐长度
