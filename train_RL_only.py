@@ -343,29 +343,37 @@ def _reload_engine_from_dir(dir_path):
     engine = sgl.Engine(model_path=dir_path, impl="transformers")  # 纯离线，本地加载
     print(f"[sglang] offline engine loaded from: {dir_path}")
 
+def _ensure_tokenizer(dir_path, src_model_path):
+    # 如果 dir_path 下没有 tokenizer，就从 src_model_path 保存一份
+    needed = ["tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt", "special_tokens_map.json"]
+    if not all(os.path.exists(os.path.join(dir_path, n)) for n in needed):
+        try:
+            tok = AutoTokenizer.from_pretrained(src_model_path)
+            tok.save_pretrained(dir_path)
+            print(f"[sglang] tokenizer saved to: {dir_path}")
+        except Exception as e:
+            print(f"[sglang] tokenizer save failed: {e}")
+
 def _maybe_init_engine_first_time():
-    # 首次：直接用 HF 名字/目录加载（离线）
     try:
         os.makedirs(SYNC_DIR, exist_ok=True)
-        _reload_engine_from_dir(MODEL_PATH)
+        _ensure_tokenizer(SYNC_DIR, MODEL_PATH)    # ★ 先把 tokenizer 放到 SYNC_DIR
+        _reload_engine_from_dir(MODEL_PATH)        # 首次用原模型路径加载（离线）
         return True
     except Exception as e:
         print(f"[sglang] init failed, fallback to HF generate. Error: {e}")
         return False
 
 def _maybe_sync_engine(iter_num):
-    # 每 SYNC_EVERY 次迭代，把 actor 的最新权重写进 SYNC_DIR，并重载引擎
     if not SGLANG_ON or engine is None:
         return
     if iter_num % SYNC_EVERY != 0:
         return
     try:
         os.makedirs(SYNC_DIR, exist_ok=True)
-        # 1) 存权重（最小：pytorch_model.bin）
         torch.save(raw_actor.state_dict(), os.path.join(SYNC_DIR, "pytorch_model.bin"))
-        # 2) 写 config.json（一次写好即可；这里简单覆盖，省心）
         _write_minimal_config_json(SYNC_DIR, n_layer, n_head, n_embd, block_size, vocab_size=50304)
-        # 3) 重载引擎（离线）
+        # tokenizer 已经在 SYNC_DIR，不需要反复写
         _reload_engine_from_dir(SYNC_DIR)
         print(f"[sglang] synced & reloaded at iter={iter_num}")
     except Exception as e:
