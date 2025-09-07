@@ -6,12 +6,13 @@ from torch import amp
 from typing import List, Tuple
 
 from .common import (
-    Samples, Experience, ExperienceBuffer,
+    Samples, Experience,
     normalize_for_reward,
     build_samples_from_generations,
     model_all_logits, token_logprobs_from_logits,
-    compute_actor_ref_logprobs, compute_values_on_response,
+    compute_actor_ref_logprobs,
     gae_compute, masked_mean, clip_by_global_norm,
+    forward_values_via_actor,
 )
 
 # -------------------------- Critic --------------------------
@@ -52,7 +53,8 @@ class PPOTrainer:
     ):
         self.actor = actor_model.to(device)
         self.ref = ref_model.to(device)
-        self.reward_model = reward_model.to(device)
+        # 关键：奖励模型保持 CPU，避免与 r_inputs（CPU）不一致
+        self.reward_model = reward_model
         self.critic = critic_model.to(device)
 
         self.actor_tokenizer = actor_tokenizer
@@ -74,9 +76,41 @@ class PPOTrainer:
         self.scaler_actor  = amp.GradScaler(enabled=self.use_amp)
         self.scaler_critic = amp.GradScaler(enabled=self.use_amp)
 
-        # pad/eos
+        # pad/eos（兼容自定义 GPT2Tok 与 HF tokenizer）
         self.pad_token_id = getattr(actor_tokenizer, "pad_token_id", 0)
-        self.eos_token_id = getattr(actor_tokenizer, "eos_token_id", 50256)  # gpt2 eos
+        self.eos_token_id = getattr(actor_tokenizer, "eos_token_id",
+                             getattr(actor_tokenizer, "eos_id", 50256))
+
+    # --------- 小工具：安全解码（兼容自定义/HF tokenizer） ---------
+    @staticmethod
+    def _safe_decode(tok, ids_tensor) -> str:
+        ids = ids_tensor.detach().cpu().tolist()
+        # 优先 decode(skip_special_tokens=False)
+        if hasattr(tok, "decode"):
+            try:
+                return tok.decode(ids, skip_special_tokens=False)
+            except TypeError:
+                try:
+                    return tok.decode(ids)
+                except Exception:
+                    pass
+        # 退路 batch_decode
+        if hasattr(tok, "batch_decode"):
+            try:
+                return tok.batch_decode([ids], skip_special_tokens=False)[0]
+            except TypeError:
+                try:
+                    return tok.batch_decode([ids])[0]
+                except Exception:
+                    pass
+        # 退路 tokens->join
+        if hasattr(tok, "convert_ids_to_tokens"):
+            try:
+                return " ".join(tok.convert_ids_to_tokens(ids))
+            except Exception:
+                pass
+        # 最后兜底：id 串
+        return " ".join(str(x) for x in ids)
 
     # ------------------- 逐样本生成（避免 pad 干扰） -------------------
     @torch.no_grad()
@@ -180,9 +214,8 @@ class PPOTrainer:
         texts = []
         for i in range(B):
             Li = int(valid_lens[i])
-            toks = seqs[i, :Li].detach().cpu().tolist()
-            # 这里不跳过 special tokens，保持与 RM 训练时的一致性
-            texts.append(self.actor_tokenizer.decode(toks, skip_special_tokens=False))
+            toks = seqs[i, :Li]
+            texts.append(self._safe_decode(self.actor_tokenizer, toks))
 
         texts = [normalize_for_reward(t, reward_tokenizer=self.reward_tokenizer) for t in texts]
 
@@ -190,35 +223,37 @@ class PPOTrainer:
             texts, return_tensors="pt", padding=True, truncation=True,
             max_length=getattr(self.reward_tokenizer, "model_max_length", 2048)
         )
-        r_inputs = {k: v.to(self.device) for k, v in r_inputs.items()}
+        # 奖励模型保持在 CPU，前向也在 CPU；只把结果搬回 GPU
         r_out = self.reward_model(**r_inputs)
-        reward_scores = r_out.logits[:, 0]  # [B]  序列级奖励（未中心化）
+        reward_scores = r_out.logits[:, 0].to(self.device)  # [B]
 
         # ---- 2.1) 将序列级奖励聚合到 response 最后一个 token；KL 也聚合 ----
-        # 中心化 + 裁剪，避免数据分布漂移/长尾
         r_center = (reward_scores - reward_scores.mean()).clamp(-self.clip_reward, self.clip_reward)  # [B]
 
-        # 逐 token KL
-        kl_t = (actor_lp - ref_lp) * mask_tgt            # [B, L]
-        kl_sum = kl_t.sum(dim=1)                         # [B]
+        # 用“平均 KL”而不是“总和 KL”，并把 KL 作为正数直觉
+        kl_t    = (actor_lp - ref_lp) * mask_tgt                       # [B, L]
+        na      = mask_tgt.sum(dim=1).clamp_min(1)                     # [B] 有效 token 数
+        # 先得到负的均值（logπ-logpref 的掩码均值），再取相反数变成正的 KL
+        kl_mean = -(kl_t.sum(dim=1) / na)                              # [B] 正的 KL 平均
+        # kl_mean = kl_mean.clamp(0.0, 2.0)                              # 夹紧防爆
+        shaped  = (r_center - self.kl_ctl * kl_mean).clamp(-self.clip_reward, self.clip_reward)  # [B]
 
-        # 构造 shaped per-token 奖励：仅在每条样本的最后一个 response token 处注入 (r_center - beta * KL_sum)
-        rewards_t = torch.zeros_like(actor_lp)           # [B, L]
+        rewards_t = torch.zeros_like(actor_lp)                          # [B, L]
         if L > 0:
-            arange_L = torch.arange(L, device=self.device).view(1, -1)  # [1, L]
-            last_idx = (mask_tgt * arange_L).amax(dim=1)                # [B]
-            # scatter 到最后一个有效位置
-            rewards_t.scatter_(1, last_idx.unsqueeze(1), r_center - self.kl_ctl * kl_sum)
+            has_act = (na > 0)
+            if has_act.any():
+                arange_L = torch.arange(L, device=self.device).view(1, -1)
+                last_idx = (mask_tgt * arange_L).amax(dim=1)            # [B]
+                rows = torch.nonzero(has_act, as_tuple=False).squeeze(-1)
+                rewards_t[rows, last_idx[rows]] = shaped[rows]
 
         # ---- 3) critic values & GAE（只在 response 段）----
-        from .common import forward_values_via_actor
-
-        # 重要：critic 更新与评估阶段都不应让梯度穿过 actor（这里先评估，用 no_grad）
         with torch.no_grad():
             values_full = forward_values_via_actor(
                 model=self.actor, critic=self.critic,
                 seqs=seqs, device_type=self.device.type, ptdtype=None,
                 micro_batch_size=self.mb_size_values,
+                detach_hidden=True,
             )  # [B, T]
         values_t = values_full[:, 1:][:, :L]  # [B, L] 与 target 维对齐
 
@@ -232,7 +267,8 @@ class PPOTrainer:
         var   = ((adv_t - mean)**2 * mask_tgt).sum() / denom
         adv_t = (adv_t - mean) / torch.sqrt(var + 1e-8)
 
-        avg_kl     = masked_mean(actor_lp - ref_lp, mask_tgt.float()).item()
+        # 返回“正的 KL”用于日志直观判断
+        avg_kl = float(kl_mean.mean().item())
         avg_reward = reward_scores.mean().item()  # 记录 raw RM reward 的平均值
 
         exp = Experience(
@@ -245,7 +281,7 @@ class PPOTrainer:
             action_mask=mask_tgt,                   # [B, L]
             reward=reward_scores.unsqueeze(1),      # [B, 1]（便于日志）
             num_actions=num_actions,                # [B]
-            kl=kl_t,                                # [B, L]
+            kl=kl_t,                                # [B, L]（未取负，保留原始差值方便调试）
         )
         return [exp], float(avg_kl), float(avg_reward)
 
@@ -319,14 +355,13 @@ class PPOTrainer:
 
         # ------- Critic update -------
         with amp.autocast(device_type=self.device.type, enabled=self.use_amp):
-            # 关键：阻断 actor 的梯度，避免 critic 反向穿透到 actor
-            from .common import forward_values_via_actor
-            with torch.no_grad():
-                values_full = forward_values_via_actor(
-                    model=self.actor, critic=self.critic,
-                    seqs=experience.seqs, device_type=self.device.type, ptdtype=None,
-                    micro_batch_size=self.mb_size_values,
-                )  # [B, T]
+            # 关键：不要用 no_grad 掐掉 critic 的梯度；只 detach actor 的隐藏态
+            values_full = forward_values_via_actor(
+                model=self.actor, critic=self.critic,
+                seqs=experience.seqs, device_type=self.device.type, ptdtype=None,
+                micro_batch_size=self.mb_size_values,
+                detach_hidden=True,   # 阻断 critic→actor 的反传，critic 自身仍可学习
+            )  # [B, T]
             values_t_all = values_full[:, 1:]  # [B, T-1]
 
             # 与 returns/old_values/action_mask 对齐长度

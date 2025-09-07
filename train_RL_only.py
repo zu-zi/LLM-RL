@@ -1,605 +1,321 @@
-"""
-训练脚本：支持单卡/多卡（DDP）
-- 当前启用 RL 分支：PPO / GRPO / DAPO / Token Entropy
-- 只在固定 prompts 子集（prepare.py 生成）上训练，便于观测 RL 效果
-- 节约显存：block_size=512（prompt≤256，response≤255 含EOS）
-"""
-
-import os
-import time
-import math
-import pickle
-import random
-from contextlib import nullcontext
-
+# train_RL_only.py
+import os, sys, time, random, pickle, json, subprocess, shlex
 import numpy as np
-import torch
-from torch.nn.parallel import DistributedDataParallel as DDP
+import torch, tiktoken
+from contextlib import nullcontext
 from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
 
-from model import GPTConfig, GPT
 from RL.PPO import PPOTrainer, Critic
 from RL.GRPO import GRPOTrainer
 from RL.DAPO import DAPOTrainer
-from RL.common import Samples  # dataclass
+from RL.common import Samples
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
-import tiktoken
 
-# --------------------- RL 开关（可被 configurator.py 覆盖） ---------------------
-use_ppo = False
-use_grpo = False
-use_dapo = True         # 示例：默认 DAPO
-use_token_entropy = False  # 熵掩码（2/8 规则）在各 Trainer 的 train_on_experience 中启用
+from utils.rollout_pool import dequeue_items, estimate_size, ensure_dir
 
-# --------------------- 基础超参（可被 configurator.py 覆盖） ---------------------
-out_dir = 'out'
-eval_interval = 2000
-log_interval = 1
-eval_iters = 200
-eval_only = False
-always_save_checkpoint = True
-init_from = 'scratch'    # 'scratch' | 'resume' | 'gpt2*' 例如 'gpt2', 'gpt2-medium', ...
+# ========= 基本环境 =========
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("NANOGPT_SILENT_INIT", "1")
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")  # 降噪
 
-# wandb（如需）
-wandb_log = False
-wandb_project = 'owt'
-wandb_run_name = 'gpt2'
+# ========= 默认配置（可被外部 config 覆盖）=========
+use_ppo = True; use_grpo=False; use_dapo=False; use_token_entropy=False
+out_dir = "Results"
+eval_interval = 20
+max_iters = 200
+batch_size = 4
+block_size = 512
+gradient_accumulation_steps = 1
 
-# data（SFT用；RL 因为用固定 prompts，不依赖）
-dataset = 'openwebtext'
-gradient_accumulation_steps = 5 * 8
-batch_size = 12                      # RL：每步使用的 prompt 条数
-block_size = 512                     # 直接缩小到 512（prepare.py 已裁剪 prompt≤256）
+init_from = "gpt2-large"
+dropout = 0.0; bias=False
+n_layer=12; n_head=12; n_embd=768
+RL_learning_rate=1e-5; weight_decay=1e-1; beta1=0.9; beta2=0.95
+backend="nccl"; device="cuda"; compile=False
+kl_ctl = 0.10  # 默认，可被 config 覆盖
 
-# model
-n_layer = 12
-n_head = 12
-n_embd = 768
-dropout = 0.0
-bias = False
+dataset="openwebtext"
+wandb_log=False; wandb_project="rl"; wandb_run_name="run"
 
-# AdamW（SFT学习率；RL 有单独 LR）
-learning_rate = 6e-4
-RL_learning_rate = 1e-5
-max_iters = 600000
-weight_decay = 1e-1
-beta1 = 0.9
-beta2 = 0.95
-grad_clip = 1.0
+# sglang 离线池（默认值，可被 config 覆盖）
+SGLANG_ON=True
+SGLANG_OFFLINE=True
+SGLANG_MODEL_PATH="gpt2-large"
+SGLANG_SYNC_DIR="./sgl_pool"  # 建议在 config 中指向大盘
+SGLANG_ROLLOUT_TARGET=1024
+SGLANG_REFILL_BATCH=256
+SGLANG_MAX_NEW=192  # 稍降长度，吞吐更稳
 
-# 学习率衰减（SFT用，占位）
-decay_lr = True
-warmup_iters = 2000
-lr_decay_iters = 600000
-min_lr = 6e-5
+# ====== CLI 覆盖 ======
+def _apply_cli_config_once():
+    is_main = (os.environ.get("RANK","-1") == "-1") or (os.environ.get("LOCAL_RANK") in (None,"0"))
+    if is_main and len(sys.argv)>=2 and sys.argv[1].endswith(".py"):
+        cfg=sys.argv[1]
+        print(f"Overriding config with {cfg}:")
+        print(open(cfg,"r").read())
+        exec(open(cfg,"r").read(), globals(), globals())
 
-# DDP
-backend = 'nccl'
-
-# 系统/精度
-device = 'cuda'
-dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
-compile = False
-
-# --------------------- 允许外部配置覆盖 ---------------------
-config_keys = [k for k, v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
-if os.path.exists('configurator.py'):
-    exec(open('configurator.py').read())
-config = {k: globals()[k] for k in config_keys}
-
-# --------------------- GPT2 分词器（actor 侧） ---------------------
+# ========= 简单 GPT-2 分词器 =========
 class GPT2Tok:
     def __init__(self):
-        self.enc = tiktoken.get_encoding("gpt2")
-        self.eos_id = self.enc.encode("<|endoftext|>", allowed_special={"<|endoftext|>"})[0]
-    def encode(self, s: str):
-        return self.enc.encode(s, allowed_special="all")
-    def decode(self, ids):
-        if torch.is_tensor(ids):
-            ids = ids.tolist()
+        enc=tiktoken.get_encoding("gpt2")
+        self.enc=enc
+        self.eos_token="<|endoftext|>"
+        self.eos_id=enc.encode(self.eos_token, allowed_special={self.eos_token})[0]
+        self.pad_token_id = 0
+        self.eos_token_id = self.eos_id
+    def encode(self,s): return self.enc.encode(s, allowed_special="all")
+    def decode(self,ids):
+        if torch.is_tensor(ids): ids=ids.tolist()
         return self.enc.decode(ids)
 
-gpt2tok = GPT2Tok()
+# ========= 奖励模型 CPU 包装器（自动把输入搬到 CPU）=========
+class RewardOnCPU(torch.nn.Module):
+    def __init__(self, hf_model):
+        super().__init__()
+        self.model = hf_model.eval()
+        self._device = torch.device("cpu")
+        self.model.to(self._device)
+    @property
+    def device(self):
+        return self._device
+    def forward(self, **kwargs):
+        moved = {k: (v.to(self._device) if torch.is_tensor(v) else v) for k, v in kwargs.items()}
+        with torch.no_grad():
+            return self.model(**moved)
+    def parameters(self, *args, **kwargs):
+        return self.model.parameters(*args, **kwargs)
+    def eval(self):
+        self.model.eval(); return self
 
-# --------------------- 固定 prompts ---------------------
-PROMPT_FILE = os.path.join(os.path.dirname(__file__), "data/RL_dataset/prompt.bin")
-print(f"Loading fixed prompts from {PROMPT_FILE} ...")
-blob = torch.load(PROMPT_FILE)
-PROMPTS_TEXT = blob["prompts"]            # list[str]（供奖励模型分词）
-PROMPT_TOKEN_IDS = blob["gpt2_token_ids"] # list[list[int]]（未 pad 的 GPT-2 ids）
-EOS_ID = blob["eos_id"]
-NUM_PROMPTS = len(PROMPT_TOKEN_IDS)
-print(f"Loaded {NUM_PROMPTS} fixed prompts.")
+# ========= 数据/打包 =========
+def _load_prompts():
+    pf=os.path.join(os.path.dirname(__file__),"data/RL_dataset/prompt.bin")
+    print(f"Loading fixed prompts from {pf} ...")
+    blob=torch.load(pf,map_location="cpu")
+    return blob["prompts"], blob["gpt2_token_ids"], blob["eos_id"], blob.get("seed",1337), pf
 
-class FixedPromptSampler:
-    """固定顺序循环采样，便于对比训练效果"""
-    def __init__(self, token_ids, seed=1337):
-        self.ids = token_ids
-        self.order = list(range(len(token_ids)))
-        random.Random(seed).shuffle(self.order)
-        self.i = 0
-    def sample_ids(self, batch_size: int):
-        out = []
-        for _ in range(batch_size):
-            out.append(self.ids[self.order[self.i]])
-            self.i = (self.i + 1) % len(self.order)
-        return out
+def pack_samples(gen_list, pad_id, block_size, device):
+    if not gen_list:
+        L=1; z=torch.zeros((0,L),dtype=torch.long,device=device)
+        return Samples(seqs=z, attention_mask=z, action_mask=z,
+                       num_actions=torch.zeros(0,dtype=torch.long,device=device),
+                       response_length=torch.zeros(0,dtype=torch.long,device=device),
+                       total_length=torch.zeros(0,dtype=torch.long,device=device))
+    L=min(block_size, max(len(x["full_ids"]) for x in gen_list))
+    B=len(gen_list)
+    seqs=torch.full((B,L), pad_id, dtype=torch.long, device=device)
+    attn=torch.zeros((B,L),dtype=torch.long,device=device)
+    amsk=torch.zeros((B,L),dtype=torch.long,device=device)
+    num_actions=torch.zeros(B,dtype=torch.long,device=device)
+    resp_len=torch.zeros(B,dtype=torch.long,device=device)
+    total_len=torch.zeros(B,dtype=torch.long,device=device)
+    for i,it in enumerate(gen_list):
+        full=torch.tensor(it["full_ids"][:L],dtype=torch.long,device=device)
+        p_len=min(len(it["prompt_ids"]),L)
+        t=full.numel()
+        seqs[i,:t]=full; attn[i,:t]=1; total_len[i]=t
+        if p_len<t:
+            amsk[i,p_len:t]=1
+            na=int((amsk[i]==1).sum().item())
+            num_actions[i]=na; resp_len[i]=na
+    return Samples(seqs=seqs, attention_mask=attn, action_mask=amsk,
+                   num_actions=num_actions, response_length=resp_len, total_length=total_len)
 
-sampler = FixedPromptSampler(PROMPT_TOKEN_IDS, seed=blob.get("seed", 1337))
+# ========= sglang 离线补货 =========
+def _spawn_rollout_subprocess(prompt_bin_path, count, sync_dir, max_new, rollout_log_dir, quiet=True):
+    ensure_dir(sync_dir)
+    os.makedirs(rollout_log_dir, exist_ok=True)
+    cmd = f'python -u rollout_worker.py --model "{SGLANG_MODEL_PATH}" --prompt-bin "{prompt_bin_path}" ' \
+          f'--out-dir "{sync_dir}" --count {int(count)} --max-new {int(max_new)}'
+    if quiet:
+        logf = os.path.join(rollout_log_dir, f"rollout_{int(time.time())}.log")
+        print(f"[rollout] spawn (quiet) -> {logf}")
+        with open(logf, "a") as f:
+            ret = subprocess.call(shlex.split(cmd), stdout=f, stderr=f)
+    else:
+        print(f"[rollout] spawning: {cmd}")
+        ret = subprocess.call(shlex.split(cmd))
+    if ret != 0:
+        raise RuntimeError(f"rollout_worker exit with code {ret}")
 
-# --------------------- DDP 初始化 ---------------------
-ddp = int(os.environ.get('RANK', -1)) != -1
-if ddp:
-    init_process_group(backend=backend)
-    ddp_rank = int(os.environ['RANK'])
-    ddp_local_rank = int(os.environ['LOCAL_RANK'])
-    ddp_world_size = int(os.environ['WORLD_SIZE'])
-    device = f'cuda:{ddp_local_rank}'
-    torch.cuda.set_device(device)
-    master_process = ddp_rank == 0
-    seed_offset = ddp_rank
-    assert gradient_accumulation_steps % ddp_world_size == 0
-    gradient_accumulation_steps //= ddp_world_size
-else:
-    master_process = True
-    seed_offset = 0
-    ddp_world_size = 1
+def _is_master(ddp):
+    return (not ddp) or (os.environ.get("RANK","0") == "0")
 
-tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
-print(f"tokens per iteration will be: {tokens_per_iter:,}")
+# ========= 主流程 =========
+def main():
+    _apply_cli_config_once()
 
-if master_process:
-    os.makedirs(out_dir, exist_ok=True)
-torch.manual_seed(1337 + seed_offset)
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-device_type = 'cuda' if 'cuda' in device else 'cpu'
-ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
-ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+    # 这些依赖外部 config 的量，必须在 exec(config) 之后再确定
+    EVAL_LOG_EVERY = eval_interval
+    DEBUG_SAMPLE_EVERY = eval_interval
+    METRICS_CSV = os.path.join(out_dir, "metrics.csv")
+    LOW_WATERMARK = max(batch_size * 8, SGLANG_REFILL_BATCH // 2)
+    REFILL_COUNT  = max(SGLANG_REFILL_BATCH, batch_size * 8)
+    ROLLOUT_LOG_DIR = os.path.join(out_dir, "rollout_logs")
+    ROLLOUT_QUIET = True
 
-# --------------------- 尝试从数据派生 vocab_size（若存在 meta.pkl，SFT 习惯） ---------------------
-data_dir = os.path.join('data', dataset)
-meta_path = os.path.join(data_dir, 'meta.pkl')
-meta_vocab_size = None
-if os.path.exists(meta_path):
-    with open(meta_path, 'rb') as f:
-        meta = pickle.load(f)
-    meta_vocab_size = meta.get('vocab_size', None)
-    print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
+    # 固定 prompts / tokenizer
+    tok = GPT2Tok()
+    PROMPTS_TEXT, PROMPT_TOKEN_IDS, EOS_ID, seed, PROMPT_BIN_PATH = _load_prompts()
+    pad_id = 0
 
-# ======================================================================
-# ========== 模型初始化 & 断点续训（支持 scratch / gpt2* / resume） ==========
-# ======================================================================
-model_args = dict(
-    n_layer=n_layer, n_head=n_head, n_embd=n_embd,
-    block_size=block_size, bias=bias, vocab_size=None, dropout=dropout
-)
+    # DDP
+    ddp = int(os.environ.get('RANK', -1)) != -1
+    if ddp:
+        init_process_group(backend=backend)
+        rank=int(os.environ['RANK']); local=int(os.environ['LOCAL_RANK']); world=int(os.environ['WORLD_SIZE'])
+        dev=f'cuda:{local}'; torch.cuda.set_device(dev); master=(rank==0)
+        assert gradient_accumulation_steps % world == 0
+    else:
+        dev=device; master=True
 
-def _build_fresh_gpt(args):
-    cfg = GPTConfig(**args)
-    m = GPT(cfg)
-    return m
+    if master: os.makedirs(out_dir, exist_ok=True)
+    torch.backends.cuda.matmul.allow_tf32=True
+    torch.backends.cudnn.allow_tf32=True
+    torch.manual_seed(1337 + (int(os.environ.get("RANK","0")) if ddp else 0))
 
-# 算法标签（用于优先选择 RL ckpt 文件名）
-algo_tag = "PPO" if use_ppo else ("GRPO" if use_grpo else ("DAPO" if use_dapo else "RL"))
-rl_ckpt_name_candidates = [
-    f"{algo_tag}_ckpt.pt",  # 新：按算法区分
-    "RL_ckpt.pt",           # 旧：通用名
-]
-rl_ckpt_path = None
-for name in rl_ckpt_name_candidates:
-    p = os.path.join(out_dir, name)
-    if os.path.exists(p):
-        rl_ckpt_path = p
-        break
-
-sft_ckpt_path = os.path.join(out_dir, "ckpt.pt")  # NanoGPT 原 SFT ckpt
-base_state = None
-resume_payload = None
-iter_num = 0
-
-if init_from == "resume" and rl_ckpt_path is not None:
-    # ---------- 恢复 RL 训练 ----------
-    print(f"[resume] loading RL checkpoint: {rl_ckpt_path}")
-    resume_payload = torch.load(rl_ckpt_path, map_location=device)
-    model_args['vocab_size'] = resume_payload.get('vocab_size', 50304)
-    base_model = _build_fresh_gpt(model_args).to(device)
-    base_model.load_state_dict(resume_payload['model'])
-    base_state = base_model.state_dict()
-    iter_num = resume_payload.get('iter_num', 0)
-
-elif init_from == "resume" and os.path.exists(sft_ckpt_path):
-    # ---------- 没有 RL ckpt，回退 SFT ckpt ----------
-    print(f"[resume] RL ckpt not found, fallback to SFT checkpoint: {sft_ckpt_path}")
-    sft_ckpt = torch.load(sft_ckpt_path, map_location=device)
-    ckpt_model_args = sft_ckpt['model_args']
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = ckpt_model_args[k]
-    # 强制裁剪到当前 block_size（512）
-    if block_size < model_args['block_size']:
-        model_args['block_size'] = block_size
-    base_model = _build_fresh_gpt(model_args).to(device)
-    state_dict = sft_ckpt['model']
-    unwanted_prefix = '_orig_mod.'
-    for k, v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    base_model.load_state_dict(state_dict)
-    base_state = base_model.state_dict()
-    iter_num = sft_ckpt.get('iter_num', 0)
-
-else:
-    # ---------- 新开训练 ----------
-    if isinstance(init_from, str) and init_from.startswith("gpt2"):
+    # ========== 在 CPU 构建 base_state（只一次） ==========
+    from model import GPT, GPTConfig
+    model_args=dict(n_layer=n_layer,n_head=n_head,n_embd=n_embd,block_size=block_size,bias=bias,dropout=dropout,vocab_size=None)
+    if isinstance(init_from,str) and init_from.startswith("gpt2"):
         print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
-        override_args = dict(dropout=dropout)
-        base_model = GPT.from_pretrained(init_from, override_args)
-        for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-            model_args[k] = getattr(base_model.config, k)
+        m=GPT.from_pretrained(init_from, dict(dropout=dropout))  # 默认在 CPU
+        for k in ['n_layer','n_head','n_embd','block_size','bias','vocab_size']: model_args[k]=getattr(m.config,k)
         if block_size < model_args['block_size']:
-            base_model.crop_block_size(block_size)
-            model_args['block_size'] = block_size
-        base_model = base_model.to(device)
-        base_state = base_model.state_dict()
+            m.crop_block_size(block_size); model_args['block_size']=block_size
+        base_state=m.state_dict(); del m
     else:
         print("Initializing a new model from scratch")
-        model_args['vocab_size'] = 50304 if meta_vocab_size is None else meta_vocab_size
-        base_model = _build_fresh_gpt(model_args).to(device)
-        base_state = base_model.state_dict()
+        model_args['vocab_size']=50304
+        m=GPT(GPTConfig(**model_args)); base_state=m.state_dict(); del m
 
-# --------------------- ref / actor 的构建 ---------------------
-gptconf_ref = GPTConfig(**model_args)
-ref_model = GPT(gptconf_ref).to(device)
+    # ========== 构建 ref/actor/critic ==========
+    ref=GPT(GPTConfig(**model_args)).to(dev); ref.load_state_dict(base_state)
+    for p in ref.parameters(): p.requires_grad=False
+    ref.eval()
+    ref_dtype=torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
+    ref.to(dtype=ref_dtype)
 
-if resume_payload is not None and 'ref' in resume_payload:
-    print("[resume] loading ref model from RL checkpoint")
-    ref_model.load_state_dict(resume_payload['ref'])
-else:
-    ref_model.load_state_dict(base_state)
+    actor=GPT(GPTConfig(**model_args)).to(dev); actor.load_state_dict(base_state)
+    if compile: actor=torch.compile(actor)
+    if ddp: actor=DDP(actor, device_ids=[int(dev.split(':')[-1])])
+    raw_actor=actor.module if ddp else actor
 
-# 冻结（先冻结，dtype 转换前后都没关系）
-for p in ref_model.parameters():
-    p.requires_grad = False
-ref_model.eval()
+    critic=Critic(raw_actor).to(dev)
 
-# actor（训练用，保持原始训练精度，由 autocast 控制）
-gptconf_actor = GPTConfig(**model_args)
-actor_model = GPT(gptconf_actor).to(device)
-if resume_payload is not None:
-    print("[resume] loading actor model from RL checkpoint")
-    actor_model.load_state_dict(resume_payload['model'])
-else:
-    actor_model.load_state_dict(base_state)
+    # 优化器（8bit）
+    from bitsandbytes.optim import AdamW8bit
+    opt_a=AdamW8bit(raw_actor.parameters(), lr=RL_learning_rate, betas=(beta1,beta2), weight_decay=weight_decay)
+    opt_c=AdamW8bit(critic.parameters(),    lr=RL_learning_rate, betas=(beta1,beta2), weight_decay=weight_decay)
 
-# ---- 到这里 ref/actor 都已经从 base_state 加载完了，才可以安全释放 ----
-try:
-    del base_model
-except NameError:
-    pass
-try:
-    del base_state
-except NameError:
-    pass
-if isinstance(device, str) and device.startswith("cuda"):
-    torch.cuda.empty_cache()
+    # 奖励模型（强制 CPU + 包装器）
+    rw_name="Skywork/Skywork-Reward-V2-Qwen3-0.6B"
+    reward_hf = AutoModelForSequenceClassification.from_pretrained(
+        rw_name, device_map="cpu", torch_dtype=torch.float32
+    ).eval()
+    reward_model = RewardOnCPU(reward_hf)
+    reward_tokenizer=AutoTokenizer.from_pretrained(rw_name)
 
-# 把 ref 转成半精度（只用于前向对照，半精度足够 & 省显存）
-ref_dtype = torch.bfloat16 if (isinstance(device, str) and device.startswith("cuda") and torch.cuda.is_bf16_supported()) else torch.float16
-ref_model = ref_model.to(dtype=ref_dtype)
+    # 训练器
+    if use_ppo:
+        trainer=PPOTrainer(actor_model=raw_actor, ref_model=ref, reward_model=reward_model,
+                           critic_model=critic, actor_tokenizer=tok, reward_tokenizer=reward_tokenizer,
+                           optimizer_actor=opt_a, optimizer_critic=opt_c,
+                           device=dev, mb_size_logits=1, mb_size_values=1, kl_ctl=kl_ctl)
+    elif use_grpo:
+        trainer=GRPOTrainer(actor_model=raw_actor, ref_model=ref, reward_model=reward_model,
+                            actor_tokenizer=tok, reward_tokenizer=reward_tokenizer,
+                            optimizer_actor=opt_a, group_size=4, kl_coef=0.0, clip_reward=5.0,
+                            device=dev, mb_size_logits=2)
+    else:
+        trainer=DAPOTrainer(actor_model=raw_actor, ref_model=ref, reward_model=reward_model,
+                            actor_tokenizer=tok, reward_tokenizer=reward_tokenizer,
+                            optimizer_actor=opt_a, beta=1.0, adv_norm="zscore", adv_clip=5.0, kl_coef=0.01,
+                            device=dev, mb_size_logits=2)
 
+    # ========== 训练循环 ==========
+    if master and SGLANG_ON and SGLANG_OFFLINE:
+        print(f"[sglang] offline pool enabled: dir={SGLANG_SYNC_DIR}, target={SGLANG_ROLLOUT_TARGET}, batch={SGLANG_REFILL_BATCH}")
+    ensure_dir(SGLANG_SYNC_DIR)
+    os.makedirs(ROLLOUT_LOG_DIR, exist_ok=True)
 
-# 编译 & DDP
-if compile:
-    print("compiling the actor model... (takes ~1 minute)")
-    actor_model = torch.compile(actor_model)
-if ddp:
-    actor_model = DDP(actor_model, device_ids=[int(device.split(':')[-1])])
-raw_actor = actor_model.module if ddp else actor_model
+    for iter_num in range(0, max_iters+1):
+        # 1) 低水位触发，批量补货（子进程生成完退出释放显存）
+        if SGLANG_ON and SGLANG_OFFLINE:
+            pool_est = estimate_size(SGLANG_SYNC_DIR, SGLANG_REFILL_BATCH)
+            if pool_est < LOW_WATERMARK:
+                _spawn_rollout_subprocess(PROMPT_BIN_PATH, REFILL_COUNT, SGLANG_SYNC_DIR, SGLANG_MAX_NEW, ROLLOUT_LOG_DIR, quiet=True)
 
-# critic：PPO/DAPO 需要；从 RL ckpt 恢复（如有）
-critic_model = Critic(raw_actor).to(device)
-if resume_payload is not None and 'critic' in resume_payload:
-    print("[resume] loading critic model from RL checkpoint")
-    critic_model.load_state_dict(resume_payload['critic'])
+        # 2) 从池里取一批（不足则用 actor 现场补齐）
+        batch = dequeue_items(SGLANG_SYNC_DIR, batch_size)
+        if len(batch) < batch_size:
+            for _ in range(batch_size - len(batch)):
+                ids = random.choice(PROMPT_TOKEN_IDS)
+                ids_t=torch.tensor(ids,dtype=torch.long,device=dev).unsqueeze(0)
+                prompt_len=ids_t.size(1)
+                room = block_size - prompt_len - 1
+                if room <= 0: continue
+                out = raw_actor.generate(idx=ids_t, max_new_tokens=max(1,room),
+                                         temperature=1.0, top_k=None, eos_token_id=tok.eos_id)
+                batch.append({"prompt_ids": ids, "full_ids": out[0].tolist()})
 
-# 优化器：从 RL ckpt 恢复（如有）
-from bitsandbytes.optim import AdamW8bit
-optimizer_actor  = AdamW8bit(raw_actor.parameters(), lr=RL_learning_rate, betas=(beta1,beta2), weight_decay=weight_decay)
-optimizer_critic = AdamW8bit(critic_model.parameters(), lr=RL_learning_rate, betas=(beta1,beta2), weight_decay=weight_decay)
+        # 3) 打包 Samples
+        samples = pack_samples(batch, pad_id=0, block_size=block_size, device=torch.device(dev))
 
-if resume_payload is not None:
-    if 'optimizer_actor' in resume_payload:
-        optimizer_actor.load_state_dict(resume_payload['optimizer_actor'])
-    if 'optimizer_critic' in resume_payload:
-        optimizer_critic.load_state_dict(resume_payload['optimizer_critic'])
+        # 4) 评估经验 & 5) 参数更新
+        experiences, avg_kl, avg_reward = trainer.evaluate_experience(samples)
 
-# ===== sglang 离线 rollout 引擎：可选启用，不可用自动回退 =====
-import os, json
-engine = None
-SGLANG_ON = os.getenv("SGLANG", "0") == "1"
-MODEL_PATH = os.getenv("SGLANG_MODEL_PATH", "gpt2-large").strip()
-SYNC_DIR = os.getenv("SGLANG_SYNC_DIR", "/tmp/sgl_rollout").strip()
-SYNC_EVERY = int(os.getenv("SGLANG_SYNC_EVERY", "200"))
+        # --- 自适应 KL 系数：目标 0.02，偏离就动态调 ---
+        kl_target = 0.02
+        if avg_kl > 0:
+            err = avg_kl / kl_target - 1.0
+            trainer.kl_ctl *= float(np.exp(np.clip(err, -0.2, 0.2)))  # 每步最多 ±22% 调整
 
-def _write_minimal_config_json(path, n_layer, n_head, n_embd, block_size, vocab_size=50304):
-    cfg = {
-        "model_type": "gpt2",
-        "n_layer": n_layer,
-        "n_head": n_head,
-        "n_embd": n_embd,
-        "n_positions": block_size,
-        "n_ctx": block_size,
-        "vocab_size": vocab_size,
-        "bos_token_id": 50256,
-        "eos_token_id": 50256,
-        "embd_pdrop": 0.0, "attn_pdrop": 0.0, "resid_pdrop": 0.0,
-    }
-    with open(os.path.join(path, "config.json"), "w") as f:
-        json.dump(cfg, f)
+        pl, vl = [], []
+        for exp in experiences:
+            out = trainer.train_on_experience(exp, use_token_entropy=use_token_entropy)
+            if isinstance(out, tuple):
+                p,v = out; pl.append(float(p.detach().item())); vl.append(float(v.detach().item()))
+            else:
+                pl.append(float(out.detach().item()))
+        mean_p = float(np.mean(pl)) if pl else 0.0
+        mean_v = float(np.mean(vl)) if vl else None
 
-def _reload_engine_from_dir(dir_path):
-    global engine
-    import sglang as sgl
-    engine = sgl.Engine(model_path=dir_path, impl="transformers")  # 纯离线，本地加载
-    print(f"[sglang] offline engine loaded from: {dir_path}")
-
-def _ensure_tokenizer(dir_path, src_model_path):
-    # 如果 dir_path 下没有 tokenizer，就从 src_model_path 保存一份
-    needed = ["tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt", "special_tokens_map.json"]
-    if not all(os.path.exists(os.path.join(dir_path, n)) for n in needed):
-        try:
-            tok = AutoTokenizer.from_pretrained(src_model_path)
-            tok.save_pretrained(dir_path)
-            print(f"[sglang] tokenizer saved to: {dir_path}")
-        except Exception as e:
-            print(f"[sglang] tokenizer save failed: {e}")
-
-def _maybe_init_engine_first_time():
-    try:
-        os.makedirs(SYNC_DIR, exist_ok=True)
-        _ensure_tokenizer(SYNC_DIR, MODEL_PATH)    # ★ 先把 tokenizer 放到 SYNC_DIR
-        _reload_engine_from_dir(MODEL_PATH)        # 首次用原模型路径加载（离线）
-        return True
-    except Exception as e:
-        print(f"[sglang] init failed, fallback to HF generate. Error: {e}")
-        return False
-
-def _maybe_sync_engine(iter_num):
-    if not SGLANG_ON or engine is None:
-        return
-    if iter_num % SYNC_EVERY != 0:
-        return
-    try:
-        os.makedirs(SYNC_DIR, exist_ok=True)
-        torch.save(raw_actor.state_dict(), os.path.join(SYNC_DIR, "pytorch_model.bin"))
-        _write_minimal_config_json(SYNC_DIR, n_layer, n_head, n_embd, block_size, vocab_size=50304)
-        # tokenizer 已经在 SYNC_DIR，不需要反复写
-        _reload_engine_from_dir(SYNC_DIR)
-        print(f"[sglang] synced & reloaded at iter={iter_num}")
-    except Exception as e:
-        print(f"[sglang] sync failed at iter={iter_num}: {e}")
-
-# 首次尝试启用（可选）
-if SGLANG_ON:
-    _maybe_init_engine_first_time()
-else:
-    print("[sglang] SGLANG=0 (disabled); using HF generate.")
-
-def generate_with_engine(ids_t, max_new_tokens, eos_token_id):
-    # 若引擎不可用，走你原本的 HF generate
-    if engine is None:
-        return raw_actor.generate(
-            idx=ids_t,
-            max_new_tokens=max_new_tokens,
-            temperature=1.0,
-            top_k=None,
-            eos_token_id=eos_token_id
-        )
-    # sglang：文本接口 → 生成 → 再编码回 token
-    prompt_text = gpt2tok.decode(ids_t[0])
-    outs = engine.generate(
-        [prompt_text],
-        {"max_new_tokens": int(max_new_tokens),
-         "eos_token_id": int(eos_token_id),
-         "stop_token_ids": [int(eos_token_id)]}
-    )
-    # 兼容不同返回
-    out0 = outs[0]
-    text = out0 if isinstance(out0, str) else (out0.get("text") or out0.get("output_text") or str(out0))
-    resp_text = text[len(prompt_text):] if text.startswith(prompt_text) else text
-    resp_ids = gpt2tok.encode(resp_text)[:max_new_tokens]
-    if not resp_ids or resp_ids[-1] != eos_token_id:
-        resp_ids += [eos_token_id]
-    full_ids = torch.tensor(ids_t[0].tolist() + resp_ids, dtype=torch.long, device=ids_t.device)
-    return [full_ids]
-
-# --------------------- 奖励模型（HF） ---------------------
-reward_model_name = "Skywork/Skywork-Reward-V2-Qwen3-0.6B"
-reward_model = AutoModelForSequenceClassification.from_pretrained(reward_model_name).to(device).eval()
-reward_tokenizer = AutoTokenizer.from_pretrained(reward_model_name)
-
-# --------------------- wandb ---------------------
-if wandb_log and master_process:
-    import wandb
-    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
-
-# --------------------- Trainer 构造 ---------------------
-trainer = None
-if use_ppo:
-    trainer = PPOTrainer(
-        actor_model=raw_actor, ref_model=ref_model, reward_model=reward_model,
-        critic_model=critic_model, actor_tokenizer=gpt2tok, reward_tokenizer=reward_tokenizer,
-        optimizer_actor=optimizer_actor, optimizer_critic=optimizer_critic,
-        device=device, mb_size_logits=2, mb_size_values=2,kl_ctl=0.05
-    )
-elif use_grpo:
-    trainer = GRPOTrainer(
-        actor_model=raw_actor, ref_model=ref_model, reward_model=reward_model,
-        actor_tokenizer=gpt2tok, reward_tokenizer=reward_tokenizer,
-        optimizer_actor=optimizer_actor,
-        group_size=4, kl_coef=0.0, clip_reward=5.0,
-        device=device, mb_size_logits=2
-    )
-elif use_dapo:
-    trainer = DAPOTrainer(
-        actor_model=raw_actor, ref_model=ref_model, reward_model=reward_model,
-        actor_tokenizer=gpt2tok, reward_tokenizer=reward_tokenizer,
-        optimizer_actor=optimizer_actor,
-        beta=1.0, adv_norm="zscore", adv_clip=5.0, kl_coef=0.01,
-        device=device, mb_size_logits=2
-    )
-
-# --------------------- 工具：把 list[dict] → Samples 批次 ---------------------
-def build_samples_from_generations_dicts(gen_list, pad_token_id: int, eos_id: int, block_size: int, device: torch.device):
-    """
-    将 list[dict{prompt_ids, full_ids, response_ids}] 打包成一个 Samples 批次。
-    - 右侧 pad 到同一长度（不超过 block_size）
-    - 生成 attention_mask / action_mask / num_actions / total_length / response_length
-    - 注意：这里返回的 action_mask 是 **B x T（全长）**；
-            对齐到 target=seqs[:,1:] 的工作由 compute_actor_ref_logprobs 内部完成（mask_tgt = action_mask[:,1:]）。
-    """
-    if len(gen_list) == 0:
-        L = 1
-        B = 0
-        z = torch.zeros((0, L), dtype=torch.long, device=device)
-        return Samples(seqs=z, attention_mask=z, action_mask=z, num_actions=torch.zeros(0, dtype=torch.long, device=device),
-                       response_length=torch.zeros(0, dtype=torch.long, device=device), total_length=torch.zeros(0, dtype=torch.long, device=device))
-
-    full_list, prompt_len_list = [], []
-    for item in gen_list:
-        full_ids = item["full_ids"]           # 1D tensor (on device)
-        prompt_ids = item["prompt_ids"]       # 1D tensor (on device)
-        full_list.append(full_ids)
-        prompt_len_list.append(int(prompt_ids.numel()))
-
-    L = min(block_size, max(x.numel() for x in full_list))
-    B = len(full_list)
-
-    seqs = torch.full((B, L), pad_token_id, dtype=torch.long, device=device)
-    attention_mask = torch.zeros((B, L), dtype=torch.long, device=device)
-    action_mask_full = torch.zeros((B, L), dtype=torch.long, device=device)
-    num_actions = torch.zeros((B,), dtype=torch.long, device=device)
-    response_length = torch.zeros((B,), dtype=torch.long, device=device)
-    total_length = torch.zeros((B,), dtype=torch.long, device=device)
-
-    for i, (full_ids, p_len) in enumerate(zip(full_list, prompt_len_list)):
-        cur = full_ids[:L]
-        t = cur.numel()
-        seqs[i, :t] = cur
-        attention_mask[i, :t] = 1
-        total_length[i] = t
-
-        start = min(p_len, L)
-        if start < t:
-            action_mask_full[i, start:t] = 1
-            na = int((action_mask_full[i] == 1).sum().item())
-            num_actions[i] = na
-            response_length[i] = na
-        else:
-            num_actions[i] = 0
-            response_length[i] = 0
-
-    # 与 new_logp 对齐（对应 target=seqs[:,1:]）
-    action_mask = action_mask_full
-
-    return Samples(
-        seqs=seqs,
-        attention_mask=attention_mask,
-        action_mask=action_mask,
-        num_actions=num_actions,
-        response_length=response_length,
-        total_length=total_length,
-    )
-
-# --------------------- 训练主循环（只跑 RL） ---------------------
-t0 = time.time()
-local_iter_num = 0
-running_mfu = -1.0
-
-while trainer is not None:
-    # 1) 采样 batch 条 prompts
-    batch_ids = sampler.sample_ids(batch_size)
-
-    # 2) 逐条生成（动态限制 response，保证总长 ≤ block_size）
-    generations = []  # list[dict]: {"prompt_ids": Tensor, "full_ids": Tensor, "response_ids": Tensor}
-    for ids in batch_ids:
-        ids_t = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)  # [1, T_prompt]
-        prompt_len = ids_t.size(1)
-        room = block_size - prompt_len - 1  # 预留 EOS
-        if room <= 0:
-            continue
-        max_new_tokens = max(1, room)
-
-        out = generate_with_engine(ids_t, max_new_tokens=max_new_tokens, eos_token_id=EOS_ID)
-        full = out[0]                   # [T_prompt + T_resp]
-        resp = full[prompt_len:]        # response 段（含/不含 EOS）
-        generations.append({"prompt_ids": ids_t.squeeze(0), "full_ids": full, "response_ids": resp})
-
-    # 3) list[dict] -> Samples（避免 evaluate_experience 期望 Samples 时抛错）
-    samples_batch = build_samples_from_generations_dicts(
-        gen_list=generations,
-        pad_token_id=0,                 # GPT-2无pad，项目统一用0占位即可
-        eos_id=EOS_ID,
-        block_size=block_size,
-        device=torch.device(device),
-    )
-
-    # 4) 评估经验（不同算法内部会基于 Samples 计算 Experience）
-    experiences, avg_kl, avg_reward = trainer.evaluate_experience(samples_batch)
-
-    # 5) 更新（PPO 通常多 step；GRPO/DAPO 一般 1 step）——收集并均值化 loss
-    ploss_list, vloss_list = [], []
-    for exp in experiences:
-        out = trainer.train_on_experience(exp, use_token_entropy=use_token_entropy)
-        if isinstance(out, tuple):
-            p_loss, v_loss = out
-            ploss_list.append(float(p_loss.detach().item()))
-            vloss_list.append(float(v_loss.detach().item()))
-        else:
-            ploss_list.append(float(out.detach().item()))
-
-    mean_p = float(np.mean(ploss_list)) if ploss_list else 0.0
-    mean_v = float(np.mean(vloss_list)) if vloss_list else None
-
-    # 6) 日志 & 保存（增加 loss 打印/记录）
-    if iter_num % eval_interval == 0 and master_process:
-        if mean_v is not None:
-            print(f"iter {iter_num}: p_loss={mean_p:.4f}, v_loss={mean_v:.4f}, avg_kl={avg_kl:.6f}, avg_reward={avg_reward:.4f}")
-        else:
-            print(f"iter {iter_num}: loss={mean_p:.4f}, avg_kl={avg_kl:.6f}, avg_reward={avg_reward:.4f}")
-
-        if wandb_log:
-            import wandb
-            log_dict = {
-                "iter": iter_num,
-                "train/avg_kl": float(avg_kl),
-                "train/avg_reward": float(avg_reward),
-                "train/p_loss": mean_p,
-            }
+        # 6) 日志 & ckpt（精简一行 + CSV 记录 + 抽查样本）
+        if (iter_num % EVAL_LOG_EVERY == 0) and _is_master(ddp):
+            pool_now = estimate_size(SGLANG_SYNC_DIR, SGLANG_REFILL_BATCH) if (SGLANG_ON and SGLANG_OFFLINE) else -1
             if mean_v is not None:
-                log_dict["train/v_loss"] = mean_v
-            wandb.log(log_dict)
+                print(f"[iter {iter_num:4d}] p={mean_p:.4f} v={mean_v:.4f} kl={avg_kl:.6f} r={avg_reward:.4f} pool={pool_now}", flush=True)
+            else:
+                print(f"[iter {iter_num:4d}] loss={mean_p:.4f} kl={avg_kl:.6f} r={avg_reward:.4f} pool={pool_now}", flush=True)
 
-        # 保存 RL ckpt（包含 actor/critic/optimizer/ref）
-        ckpt_name = f"{algo_tag}_ckpt.pt"
-        ckpt = {
-            'model': raw_actor.state_dict(),
-            'critic': critic_model.state_dict(),
-            'ref': ref_model.state_dict(),
-            'optimizer_actor': optimizer_actor.state_dict(),
-            'optimizer_critic': optimizer_critic.state_dict(),
-            'vocab_size': model_args.get('vocab_size', 50304),
-            'iter_num': iter_num,
-        }
-        path = os.path.join(out_dir, ckpt_name)
-        print(f"saving RL checkpoint to {path}")
-        torch.save(ckpt, path)
+            # CSV
+            hdr = not os.path.exists(METRICS_CSV)
+            with open(METRICS_CSV, "a") as f:
+                if hdr: f.write("iter,p_loss,v_loss,avg_kl,avg_reward,pool_est\n")
+                f.write(f"{iter_num},{mean_p},{'' if mean_v is None else mean_v},{avg_kl},{avg_reward},{pool_now}\n")
 
-    iter_num += 1
-    _maybe_sync_engine(iter_num)   # ← 每隔 SYNC_EVERY 次，把最新 actor 权重同步到离线引擎
-    if iter_num > max_iters:
-        break
+            # 抽查一条
+            if DEBUG_SAMPLE_EVERY and (iter_num % DEBUG_SAMPLE_EVERY == 0) and samples.seqs.size(0) > 0:
+                i0 = int(torch.randint(0, samples.seqs.size(0), (1,)).item())
+                L0 = int(samples.attention_mask[i0].sum().item())
+                txt0 = tok.decode(samples.seqs[i0, :L0])
+                r0 = experiences[0].reward[i0].item() if isinstance(experiences, list) and len(experiences)>0 else float("nan")
+                print(f"[sample] reward={r0:.4f} text={txt0[:200].replace(chr(10),' ')}", flush=True)
 
-# --------------------- DDP 清理 ---------------------
-if ddp:
-    destroy_process_group()
+            # ckpt
+            algo = "PPO" if use_ppo else ("GRPO" if use_grpo else "DAPO")
+            ckpt = {
+                'model': raw_actor.state_dict(), 'critic': critic.state_dict(), 'ref': ref.state_dict(),
+                'optimizer_actor': opt_a.state_dict(), 'optimizer_critic': opt_c.state_dict(),
+                'vocab_size': model_args.get('vocab_size', 50304), 'iter_num': iter_num,
+            }
+            torch.save(ckpt, os.path.join(out_dir, f"{algo}_ckpt.pt"))
+
+    if ddp: destroy_process_group()
+
+if __name__ == "__main__":
+    main()
