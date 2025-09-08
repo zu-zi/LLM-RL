@@ -139,142 +139,26 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUDA_LAUNCH_BLOCKING=0
 
 python3 data/RL_dataset/prepare.py
-python3 train_RL_only.py config/train_RL.py
+
+# 先预热pool
+rm -rf /root/autodl-tmp/sgl_pool/*
+python -u rollout_worker.py \
+  --model "gpt2-large" \
+  --prompt-bin "/root/LLM-RL/data/RL_dataset/prompt.bin" \
+  --out-dir "/root/autodl-tmp/sgl_pool" \
+  --count 32 \
+  --max-new 128 \
+  --mb 4 \
+  --block-size 384\
+  --use-only-train
+
+python3 train_RL_only.py config/train_RL_PPO.py
 
 # python3 test_sglang.py
 ```
+每次开机重新执行
+export HF_ENDPOINT=https://hf-mirror.com
 
-## 补充：
-```
-set -euxo pipefail
-
-# ===== 0) 基础依赖 & 工程代码 =====
-apt-get update
-apt-get install -y git rsync
-git clone https://github.com/zu-zi/LLM-RL.git
-cd LLM-RL
-
-# ===== 1) Python 依赖 =====
-python3 -m pip install -U pip
-python3 -m pip install torch numpy transformers datasets tiktoken bitsandbytes accelerate
-
-# 验证 torch 版本（仅打印，不强制安装具体版本）
-python3 - <<'PY'
-import torch; print("torch:", torch.__version__, "cuda:", torch.version.cuda)
-PY
-
-# （可选）HF 国内镜像与禁遥测
-export HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
-export TRANSFORMERS_OFFLINE=0
-export HF_HUB_DISABLE_TELEMETRY=1
-export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.9}"
-
-# ===== 2) sglang & flashinfer（匹配 torch2.5/cu124 时使用）=====
-python3 -m pip install -U "sglang[all]" sgl-kernel
-python3 -m pip install --no-cache-dir --prefer-binary flashinfer \
-  --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer/ || true
-
-python3 - <<'PY'
-import torch, sglang
-print("torch:", torch.__version__, torch.version.cuda)
-print("sglang:", sglang.__version__)
-print("flashinfer import:", end=" ")
-try:
-    import flashinfer  # noqa
-    print("OK")
-except Exception as e:
-    print("FAIL ->", e)
-PY
-
-# ===== 3) 大盘目录规范化 =====
-# 统一把“重货”落在 /root/autodl-tmp：HF 缓存 / 样本池 / 训练结果
-mkdir -p /root/autodl-tmp/{hf,sgl_pool,Results}
-
-# 3.1 HuggingFace 缓存 → 大盘（保留已下载模型）
-rsync -a ~/.cache/huggingface/ /root/autodl-tmp/hf/ 2>/dev/null || true
-rm -rf ~/.cache/huggingface
-ln -s /root/autodl-tmp/hf ~/.cache/huggingface
-
-# 同步写入 ~/.bashrc，确保重启/重登后仍用大盘
-grep -q 'HF_HOME=' ~/.bashrc || echo 'export HF_HOME=/root/autodl-tmp/hf' >> ~/.bashrc
-grep -q 'TRANSFORMERS_CACHE=' ~/.bashrc || echo 'export TRANSFORMERS_CACHE=/root/autodl-tmp/hf' >> ~/.bashrc
-
-# 3.2 sglang 样本池 / 训练结果 → 大盘（软链或直接路径）
-[ -L ./sgl_pool ] || rsync -a ./sgl_pool/ /root/autodl-tmp/sgl_pool/ 2>/dev/null || true
-rm -rf ./sgl_pool
-ln -s /root/autodl-tmp/sgl_pool ./sgl_pool
-
-[ -L ./Results ] || rsync -a ./Results/ /root/autodl-tmp/Results/ 2>/dev/null || true
-rm -rf ./Results
-ln -s /root/autodl-tmp/Results ./Results
-
-# ===== 4) 写环境变量（训练/rollout稳定 & 显存友好）=====
-# 下次登录自动生效
-{
-  echo 'export SGLANG=1'
-  echo 'export SGLANG_MODEL_PATH=gpt2-large'
-  echo 'export SGLANG_SYNC_DIR=/root/autodl-tmp/sgl_pool'
-  echo 'export SGLANG_SYNC_EVERY=200'
-  echo 'export SGLANG_ATTENTION_BACKEND=torch'
-  echo 'export SGLANG_GPU_MEM_FRACTION=0.35'
-  echo 'export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True'
-  echo 'export HF_HOME=/root/autodl-tmp/hf'
-  echo 'export TRANSFORMERS_CACHE=/root/autodl-tmp/hf'
-} >> ~/.bashrc
-
-# 当前会话也生效
-export SGLANG=1
-export SGLANG_MODEL_PATH=gpt2-large
-export SGLANG_SYNC_DIR=/root/autodl-tmp/sgl_pool
-export SGLANG_SYNC_EVERY=200
-export SGLANG_ATTENTION_BACKEND=torch
-export SGLANG_GPU_MEM_FRACTION=0.35
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export HF_HOME=/root/autodl-tmp/hf
-export TRANSFORMERS_CACHE=/root/autodl-tmp/hf
-
-# ===== 5) 一次性把项目配置改为“落盘在大盘” & 初训更稳的默认 =====
-# 仅修改 config/train_RL.py 中这几行（若不存在则追加）
-python3 - <<'PY'
-import io, re, os, sys
-p = "config/train_RL.py"
-txt = open(p, "r", encoding="utf-8").read()
-
-def upsert(k, v):
-    global txt
-    pat = re.compile(rf'^{k}\s*=.*$', re.M)
-    line = f'{k} = {v}'
-    if pat.search(txt): txt = pat.sub(line, txt)
-    else: txt += "\n" + line + "\n"
-
-upsert("SGLANG_SYNC_DIR", '"/root/autodl-tmp/sgl_pool"')
-upsert("out_dir", '"/root/autodl-tmp/Results"')
-upsert("SGLANG_ROLLOUT_TARGET", "128")
-upsert("SGLANG_REFILL_BATCH", "64")
-upsert("SGLANG_MAX_NEW", "96")
-upsert("eval_interval", "1")
-# 其余保持你原来的，训练器里会读取 kl_ctl（如使用）
-open(p, "w", encoding="utf-8").write(txt)
-print("Patched", p)
-PY
-
-# ===== 6) 预处理数据 & 首训前清理旧产物（模拟第一次训练）=====
-python3 data/RL_dataset/prepare.py || true
-rm -f ./sgl_pool/*.jsonl
-rm -f Results/*.pt
-rm -rf Results/rollout_logs
-mkdir -p Results/rollout_logs
-
-# ===== 7) （可选）后台滚动清理器，防爆盘（保留最近 N 个文件）=====
-# 样本池：只保留最近 8 个
-nohup bash -c 'while true; do ls -1t /root/autodl-tmp/sgl_pool/*.jsonl 2>/dev/null | tail -n +9 | xargs -r rm -f; sleep 30; done' >/dev/null 2>&1 &
-# rollout 日志：只保留最近 6 个
-nohup bash -c 'while true; do ls -1t /root/autodl-tmp/Results/rollout_logs/*.log 2>/dev/null | tail -n +7 | xargs -r rm -f; sleep 30; done' >/dev/null 2>&1 &
-
-# ===== 8) 开训（PPO）=====
-python3 train_RL_only.py config/train_RL.py
-
-```
 ## finetue:
 + pip install torch numpy transformers datasets tiktoken wandb tqdm
 + python data/shakespeare_char/prepare.py
