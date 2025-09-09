@@ -3,15 +3,52 @@ import os
 import json
 import uuid
 import glob
+import time
+import random
 import hashlib
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 ROLL_GLOB = "roll_*.jsonl"
 TMP_SUFFIX = ".tmp"
 
-# ---------------------------
+# =========================
+# 环境变量 & 策略默认值
+# =========================
+
+def _get_env_int(name: str, default: int) -> int:
+    try:
+        v = int(os.getenv(name, "").strip())
+        return v
+    except Exception:
+        return default
+
+def _get_env_float(name: str, default: float) -> float:
+    try:
+        v = float(os.getenv(name, "").strip())
+        return v
+    except Exception:
+        return default
+
+def _get_env_bool(name: str, default: bool) -> bool:
+    s = os.getenv(name, "").strip().lower()
+    if s in ("1", "true", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "no", "n", "off"):
+        return False
+    return default
+
+ROLL_MAX_AGE_SEC          = _get_env_int("ROLL_MAX_AGE_SEC", 6 * 3600)  # 样本最大年龄（秒），默认 6h
+ROLL_MIN_RESP_TOKENS      = _get_env_int("ROLL_MIN_RESP_TOKENS", 8)     # 回复最少 token 数（过滤太短回复）
+ROLL_DEDUP_PROMPT_IN_BATCH= _get_env_bool("ROLL_DEDUP_PROMPT_IN_BATCH", True)  # 批内按 prompt 去重
+ROLL_VERBOSE              = _get_env_bool("ROLL_VERBOSE", False)         # 关键日志
+ROLL_FILE_ORDER           = os.getenv("ROLL_FILE_ORDER", "mtime_desc")   # mtime_desc|random|name_asc
+ROLL_SCAN_CAP_FILES       = _get_env_int("ROLL_SCAN_CAP_FILES", 100)     # 估算时最多扫描多少文件
+ROLL_APPROX_PER_FILE      = _get_env_int("ROLL_APPROX_PER_FILE", 256)    # 扫描失败时的兜底行数估计
+
+
+# =========================
 # 基础 IO
-# ---------------------------
+# =========================
 
 def ensure_dir(d: str) -> None:
     os.makedirs(d, exist_ok=True)
@@ -22,7 +59,7 @@ def _atomic_write(path: str, text: str) -> None:
         f.write(text)
         f.flush()
         os.fsync(f.fileno())
-    os.replace(tmp, path)  # 原子改名
+    os.replace(tmp, path)
 
 def _read_lines(fp: str) -> List[str]:
     with open(fp, "r", encoding="utf-8") as f:
@@ -39,7 +76,6 @@ def _safe_parse(line: str) -> Optional[dict]:
 
 def _atomic_rewrite(fp: str, lines: List[str]) -> None:
     if not lines:
-        # 没有剩余，直接删
         try:
             os.remove(fp)
         except FileNotFoundError:
@@ -50,36 +86,36 @@ def _atomic_rewrite(fp: str, lines: List[str]) -> None:
     _atomic_write(fp, "".join(lines))
 
 def _clean_tmp_leftovers(dirpath: str) -> None:
-    """清理异常残留的 .tmp 文件，避免估算/遍历干扰。"""
     for fp in glob.glob(os.path.join(dirpath, f"*{TMP_SUFFIX}")):
         try:
             os.remove(fp)
         except Exception:
-            # 忽略清理失败
             pass
 
-# ---------------------------
-# 校验与去重
-# ---------------------------
+def _now_ts() -> float:
+    return time.time()
+
+
+# =========================
+# 校验与哈希
+# =========================
 
 def _is_int_list(x) -> bool:
     if not isinstance(x, list):
         return False
-    # 允许 int/long；保证都是整数
     return all(isinstance(t, int) for t in x)
 
 def _hash_ids(ids: List[int]) -> str:
-    # 用 sha1 对 id 列表做哈希，避免大对象占内存
     h = hashlib.sha1()
     h.update((",".join(map(str, ids))).encode("utf-8"))
     return h.hexdigest()
 
 def _sanitize_item(it: dict) -> Optional[dict]:
     """
-    过滤/修正不合格样本：
+    清洗输入样本：
     - 必须有 prompt_ids/full_ids 且为 List[int]
     - full_ids 长度 > prompt_ids（保证有 response）
-    返回清洗后的字典或 None（丢弃）
+    - 填充 ts/hid/pid 等元数据
     """
     if not isinstance(it, dict):
         return None
@@ -88,20 +124,40 @@ def _sanitize_item(it: dict) -> Optional[dict]:
     if (not _is_int_list(p)) or (not _is_int_list(f)):
         return None
     if len(f) <= len(p):
-        # 没有 response，丢弃
         return None
-    return {"prompt_ids": p, "full_ids": f}
 
-# ---------------------------
+    # 元信息
+    ts = it.get("ts", None)
+    if not isinstance(ts, (int, float)):
+        ts = _now_ts()
+    pid = it.get("pid") or _hash_ids(p)
+    hid = it.get("hid") or _hash_ids(f)
+
+    clean = {
+        "prompt_ids": p,
+        "full_ids": f,
+        "ts": float(ts),
+        "pid": pid,
+        "hid": hid,
+    }
+    # 兼容扩展字段透传（如果你后续添加更多字段）
+    for k in ("prompt_text", "response_text"):
+        if k in it:
+            clean[k] = it[k]
+    return clean
+
+
+# =========================
 # 写入（入队）
-# ---------------------------
+# =========================
 
 def enqueue_items(dirpath: str, items: List[Dict]) -> str:
     """
     写入一批 JSONL（原子落盘）
-    items: [{'prompt_ids': [...], 'full_ids': [...]}]
+    items: [{'prompt_ids': [...], 'full_ids': [...], ...}]
     - 仅写入通过 _sanitize_item 的样本
-    - 批内去重（按 full_ids 哈希）
+    - 批内按 hid 去重
+    - 自动写入 ts/pid/hid
     """
     ensure_dir(dirpath)
     _clean_tmp_leftovers(dirpath)
@@ -111,35 +167,77 @@ def enqueue_items(dirpath: str, items: List[Dict]) -> str:
 
     seen = set()
     buf = []
+    kept, dropped = 0, 0
+
     for it in items:
         clean = _sanitize_item(it)
         if clean is None:
+            dropped += 1
             continue
-        h = _hash_ids(clean["full_ids"])
+        h = clean["hid"]
         if h in seen:
+            dropped += 1
             continue
         seen.add(h)
         buf.append(json.dumps(clean, ensure_ascii=False))
+        kept += 1
 
     if not buf:
-        # 空批没有意义，直接返回路径占位（但不落盘）
-        return path
+        return path  # 返回占位路径，但不会落盘
 
     _atomic_write(path, "\n".join(buf) + "\n")
+
+    if ROLL_VERBOSE:
+        print(f"[rollout_pool.enqueue] file={os.path.basename(path)} kept={kept} dropped={dropped}")
+
     return path
 
-# ---------------------------
+
+# =========================
 # 读取（出队）
-# ---------------------------
+# =========================
+
+def _file_order(files: List[str]) -> List[str]:
+    if not files:
+        return files
+    mode = ROLL_FILE_ORDER
+    if mode == "random":
+        random.shuffle(files)
+        return files
+    if mode == "name_asc":
+        return sorted(files)  # 字典序
+    # 默认：按 mtime 逆序（新文件优先）
+    files_sorted = sorted(files, key=lambda fp: os.path.getmtime(fp), reverse=True)
+    return files_sorted
+
+def _is_fresh(obj: dict, now_ts: float) -> bool:
+    if ROLL_MAX_AGE_SEC <= 0:
+        return True
+    ts = obj.get("ts")
+    if not isinstance(ts, (int, float)):
+        return True  # 没有 ts 的旧数据先放过（你也可以选择丢弃）
+    age = max(0.0, now_ts - float(ts))
+    return age <= float(ROLL_MAX_AGE_SEC)
+
+def _resp_len_ok(obj: dict) -> bool:
+    p = obj.get("prompt_ids", [])
+    f = obj.get("full_ids", [])
+    if not (_is_int_list(p) and _is_int_list(f)):
+        return False
+    resp_len = len(f) - len(p)
+    return resp_len >= max(0, int(ROLL_MIN_RESP_TOKENS))
+
+def _stringify(obj: dict) -> str:
+    return json.dumps(obj, ensure_ascii=False)
 
 def dequeue_items(dirpath: str, n: int) -> List[Dict]:
     """
-    从池中“弹出”n 条样本。会在文件内就地消费：
-    - 若某文件只取走前 K 行，则余下行原子写回同名文件；
-    - 若全部取走，文件被删除。
-    - 仅返回通过 _sanitize_item 校验的样本；
-    - 出队时也做去重（跨文件/跨行重复）。
-    返回：list[dict]（长度 <= n）
+    从池中“弹出”n 条样本（优先新鲜）：
+    - 文件顺序：默认按 mtime 逆序（新 -> 旧），可用 env 调整
+    - 行过滤：TTL（max_age_sec）、最小回复长度
+    - 批内去重：按 hid；可选地按 pid（去重复 prompt）
+    - 文件内就地消费：取走行不再放回；淘汰行直接丢弃；剩余行原子回写
+    返回：list[dict]，长度 <= n
     """
     ensure_dir(dirpath)
     _clean_tmp_leftovers(dirpath)
@@ -148,65 +246,145 @@ def dequeue_items(dirpath: str, n: int) -> List[Dict]:
     if want == 0:
         return []
 
-    files = sorted(glob.glob(os.path.join(dirpath, ROLL_GLOB)))
+    files = _file_order(sorted(glob.glob(os.path.join(dirpath, ROLL_GLOB))))
     out: List[Dict] = []
-    seen = set()  # 按 full_ids 去重
+
+    seen_hid = set()
+    seen_pid = set()
+    now_ts = _now_ts()
+
+    # 统计
+    cnt_scanned = 0
+    cnt_taken = 0
+    cnt_dropped_stale = 0
+    cnt_dropped_short = 0
+    cnt_dropped_dup_hid = 0
+    cnt_dropped_dup_pid = 0
 
     for fp in files:
         if len(out) >= want:
             break
+
         try:
             lines = _read_lines(fp)
         except (FileNotFoundError, PermissionError):
             continue
 
-        keep: List[str] = []
-        for li, line in enumerate(lines):
+        keep_lines: List[str] = []
+
+        # 优先在文件内也“新鲜优先”：把行按 ts 逆序（无 ts 的排后）
+        def _ts_from_line(ln: str) -> float:
+            obj = _safe_parse(ln)
+            if isinstance(obj, dict) and isinstance(obj.get("ts"), (int, float)):
+                return float(obj["ts"])
+            return 0.0
+
+        # 在文件内部也做一次排序，有利于先消费新样本
+        # 注意：这是在内存里重排，不改变原文件顺序；我们只在回写时去掉已消费/淘汰的行
+        lines_sorted = sorted(lines, key=_ts_from_line, reverse=True)
+
+        for ln in lines_sorted:
+            obj = _safe_parse(ln)
+            cnt_scanned += 1
+
+            if obj is None:
+                # 坏行：直接不放回
+                continue
+
+            clean = _sanitize_item(obj)
+            if clean is None:
+                # 不合格：直接不放回
+                continue
+
+            # 过滤旧样本
+            if not _is_fresh(clean, now_ts):
+                cnt_dropped_stale += 1
+                continue
+
+            # 回复太短过滤
+            if not _resp_len_ok(clean):
+                cnt_dropped_short += 1
+                continue
+
+            # 批内去重（hid）
+            hid = clean["hid"]
+            if hid in seen_hid:
+                cnt_dropped_dup_hid += 1
+                continue
+
+            # 批内按 prompt 去重（可选）
+            if ROLL_DEDUP_PROMPT_IN_BATCH:
+                pid = clean["pid"]
+                if pid in seen_pid:
+                    cnt_dropped_dup_pid += 1
+                    continue
+
+            # 选中：加入 out
+            out.append(clean)
+            seen_hid.add(hid)
+            if ROLL_DEDUP_PROMPT_IN_BATCH:
+                seen_pid.add(clean["pid"])
+            cnt_taken += 1
+
             if len(out) >= want:
-                # 后续行全部保留
-                keep.extend(lines[li:])
+                # 剩余行全部保留（但要过滤坏行/过期行）
                 break
 
-            obj = _safe_parse(line)
-            clean = _sanitize_item(obj) if obj is not None else None
+        # 文件回写：仅保留“未被选中且仍然合格的行”
+        # 重新从原 lines 过滤（保证未排序的原始顺序被保留给后续消费）
+        for ln in lines:
+            obj = _safe_parse(ln)
+            if obj is None:
+                continue
+            clean = _sanitize_item(obj)
             if clean is None:
-                # 坏行丢弃，不放回
                 continue
-
-            h = _hash_ids(clean["full_ids"])
-            if h in seen:
-                # 去重命中：不放回、不纳入 out
+            if not _is_fresh(clean, now_ts):
                 continue
+            if not _resp_len_ok(clean):
+                continue
+            # 若该行已被本次取走（按 hid 判断），则不保留
+            if clean["hid"] in seen_hid:
+                continue
+            # 若批内按 prompt 去重已命中，但未来批次仍可消费，所以保留
+            keep_lines.append(_stringify(clean) + "\n")
 
-            seen.add(h)
-            out.append(clean)
-
-        # 原子回写剩余（或删除）
         try:
-            _atomic_rewrite(fp, keep)
+            _atomic_rewrite(fp, keep_lines)
         except Exception:
-            # 若写回失败，尽量不阻塞主流程：尝试删除，失败则忽略
+            # 写回失败，尽量不阻塞主流程：尝试删除
             try:
                 os.remove(fp)
             except Exception:
                 pass
 
-        if len(out) >= want:
-            break
+    if ROLL_VERBOSE:
+        # 简要观测日志
+        print(
+            "[rollout_pool.dequeue] "
+            f"want={want} got={len(out)} "
+            f"scanned={cnt_scanned} taken={cnt_taken} "
+            f"drop(stale)={cnt_dropped_stale} "
+            f"drop(short)={cnt_dropped_short} "
+            f"drop(dup_hid)={cnt_dropped_dup_hid} "
+            f"drop(dup_pid)={cnt_dropped_dup_pid} "
+            f"ttl={ROLL_MAX_AGE_SEC}s min_resp={ROLL_MIN_RESP_TOKENS}"
+        )
 
     return out
 
-# ---------------------------
-# 估算
-# ---------------------------
 
-def estimate_size(dirpath: str, approx_per_file: int = 256, scan_cap_files: int = 100) -> int:
+# =========================
+# 估算 & 统计
+# =========================
+
+def estimate_size(dirpath: str, approx_per_file: int = None, scan_cap_files: int = None) -> int:
     """
-    估算池中可用样本数量：
-    - 优先按“行数”统计，最多扫描 scan_cap_files 个文件；
-    - 用已扫描的平均行数 * 剩余文件数 做外推；
-    - 若遇到 IO/权限问题则兜底为：文件数 * approx_per_file。
-    - 仅对“可能合格”的行做保守估算（粗略过滤空行）。
+    估算池中“可能可用”的样本数量（粗略）：
+    - 优先扫描一定数量的文件（默认 ROLL_SCAN_CAP_FILES）并数非空行
+    - 忽略明显坏行；对有 ts 的样本，**超过 TTL 的不计入**
+    - 扫描集得到平均行数 -> 外推剩余文件
+    - 兜底：文件数 * approx_per_file
     """
     try:
         _clean_tmp_leftovers(dirpath)
@@ -214,27 +392,121 @@ def estimate_size(dirpath: str, approx_per_file: int = 256, scan_cap_files: int 
         if not files_all:
             return 0
 
-        files_scan = files_all[:max(int(scan_cap_files), 1)]
-        total_lines = 0
+        cap = scan_cap_files if isinstance(scan_cap_files, int) and scan_cap_files > 0 else ROLL_SCAN_CAP_FILES
+        approx = approx_per_file if isinstance(approx_per_file, int) and approx_per_file > 0 else ROLL_APPROX_PER_FILE
+
+        files_scan = files_all[:max(int(cap), 1)]
+        total_kept = 0
+        now_ts = _now_ts()
+
         for fp in files_scan:
             try:
                 with open(fp, "r", encoding="utf-8") as f:
                     for ln in f:
-                        if ln.strip():
-                            total_lines += 1
+                        ln = ln.strip()
+                        if not ln:
+                            continue
+                        obj = _safe_parse(ln)
+                        if not isinstance(obj, dict):
+                            continue
+                        # 过滤过期/短回复行
+                        clean = _sanitize_item(obj)
+                        if clean is None:
+                            continue
+                        if not _is_fresh(clean, now_ts):
+                            continue
+                        if not _resp_len_ok(clean):
+                            continue
+                        total_kept += 1
             except Exception:
-                # 出错就忽略该文件
                 continue
 
         scanned = len(files_scan)
         if scanned == 0:
-            # 扫描不到，回退
-            return len(files_all) * max(int(approx_per_file), 1)
+            return len(files_all) * max(int(approx), 1)
 
-        avg = total_lines / scanned
+        avg = total_kept / scanned
         rest_files = max(len(files_all) - scanned, 0)
-        # 外推 + 已扫描
-        return int(total_lines + avg * rest_files)
+        return int(total_kept + avg * rest_files)
+
     except Exception:
-        # 兜底
-        return len(glob.glob(os.path.join(dirpath, ROLL_GLOB))) * max(int(approx_per_file), 1)
+        return len(glob.glob(os.path.join(dirpath, ROLL_GLOB))) * (
+            approx_per_file if approx_per_file else ROLL_APPROX_PER_FILE
+        )
+
+def get_pool_stats(dirpath: str) -> Dict:
+    """
+    返回更详细的池统计（用于日志/监控）：
+    {
+        'files': N,
+        'candidates': 行计数（含坏行/过期前）,
+        'usable': 可用行（不过期 & 回复长度足够）,
+        'avg_age_sec': 平均年龄（可用行）,
+        'p50_age_sec': 中位数年龄（可用行）,
+        'p90_age_sec': 90 分位年龄（可用行）
+    }
+    """
+    import statistics as _st
+
+    stats = {
+        "files": 0,
+        "candidates": 0,
+        "usable": 0,
+        "avg_age_sec": None,
+        "p50_age_sec": None,
+        "p90_age_sec": None,
+    }
+    try:
+        _clean_tmp_leftovers(dirpath)
+        files = glob.glob(os.path.join(dirpath, ROLL_GLOB))
+        stats["files"] = len(files)
+        if not files:
+            return stats
+
+        now_ts = _now_ts()
+        ages = []
+
+        for fp in files:
+            try:
+                with open(fp, "r", encoding="utf-8") as f:
+                    for ln in f:
+                        ln = ln.strip()
+                        if not ln:
+                            continue
+                        stats["candidates"] += 1
+                        obj = _safe_parse(ln)
+                        if not isinstance(obj, dict):
+                            continue
+                        clean = _sanitize_item(obj)
+                        if clean is None:
+                            continue
+                        if not _is_fresh(clean, now_ts):
+                            continue
+                        if not _resp_len_ok(clean):
+                            continue
+                        stats["usable"] += 1
+                        ts = clean.get("ts")
+                        if isinstance(ts, (int, float)):
+                            ages.append(max(0.0, now_ts - float(ts)))
+            except Exception:
+                continue
+
+        if ages:
+            ages_sorted = sorted(ages)
+            stats["avg_age_sec"] = float(sum(ages_sorted) / len(ages_sorted))
+            stats["p50_age_sec"] = float(ages_sorted[len(ages_sorted)//2])
+            p90_idx = int(len(ages_sorted) * 0.9) - 1
+            p90_idx = min(max(p90_idx, 0), len(ages_sorted) - 1)
+            stats["p90_age_sec"] = float(ages_sorted[p90_idx])
+
+        if ROLL_VERBOSE:
+            print(
+                "[rollout_pool.stats] "
+                f"files={stats['files']} candidates={stats['candidates']} usable={stats['usable']} "
+                f"avg_age={stats['avg_age_sec']}s p50={stats['p50_age_sec']}s p90={stats['p90_age_sec']}s "
+                f"ttl={ROLL_MAX_AGE_SEC}s min_resp={ROLL_MIN_RESP_TOKENS}"
+            )
+
+        return stats
+    except Exception:
+        return stats

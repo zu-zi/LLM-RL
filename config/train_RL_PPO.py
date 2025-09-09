@@ -5,7 +5,7 @@ SGLANG_MODEL_PATH = "gpt2-large"                 # 也可换更快的推理模�
 SGLANG_SYNC_DIR = "/root/autodl-tmp/sgl_pool"    # JSONL 样本池（放大盘）
 SGLANG_ROLLOUT_TARGET = 128                     # 目标池容量
 SGLANG_REFILL_BATCH = 64                        # 每次补货生成条数
-SGLANG_MAX_NEW = 128                             # 每条最大新 token（response）
+SGLANG_MAX_NEW = 80                             # 每条最大新 token（response）
 
 # ===== 补货调度阈值（避免与训练争显存）=====
 # 低水位阈值：只有池子低到这么少才补货（越小越不容易重叠）
@@ -22,8 +22,10 @@ init_from = "gpt2-large"                         # actor/ref 初始化
 block_size = 384
 batch_size = 4
 gradient_accumulation_steps = 4
-RL_learning_rate = 7e-6  # 8e-6
-kl_ctl = 0.35                    # 0.3                # 初始 KL 系数（训练中会自适应微调）
+RL_learning_rate = 1e-6  # 8e-6
+kl_ctl = 0.4                    # 0.3                # 初始 KL 系数（训练中会自适应微调）
+ppo_clip = 0.12  #0.15
+entropy_coef = 0.0    
 use_ppo = True
 use_grpo = False
 use_dapo  = False

@@ -236,7 +236,9 @@ class GPT(nn.Module):
         # 监督学习/常规模式
         if targets is not None:
             logits = self.lm_head(x)  # (B, T, V)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            # 改过
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)),
+                                   targets.reshape(-1), ignore_index=-1)
             if return_hidden:
                 return logits, loss, x
             return logits, loss
@@ -403,8 +405,8 @@ class GPT(nn.Module):
 
         for _ in range(max_new_tokens):
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-            logits, _ = self(idx_cond, return_all_logits=True)  # (B, T, V)
-            logits = logits[:, -1, :] / temperature
+            logits_last, _ = self(idx_cond)  # (B, 1, V)，只算最后1步
+            logits = (logits_last[:, -1, :] / temperature)
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')

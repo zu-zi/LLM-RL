@@ -66,9 +66,9 @@ def load_prompts(pb_path: str):
     blob = torch.load(pb_path, map_location="cpu")
     # 可能包含 train_indices / eval_indices（由新版 prepare.py 提供）
     return (
-        blob["prompts"],
-        blob["gpt2_token_ids"],
-        blob["eos_id"],
+        blob["prompts"],          # 仅用于解码检查/回显（可选）
+        blob["gpt2_token_ids"],   # List[List[int]]: prompt 的 token ids
+        blob["eos_id"],           # int: <|endoftext|>
         blob.get("train_indices", None),
         blob.get("eval_indices", None),
     )
@@ -93,8 +93,10 @@ def main():
     ap.add_argument("--model", required=True)
     ap.add_argument("--prompt-bin", required=True)
     ap.add_argument("--out-dir", required=True)
-    ap.add_argument("--count", type=int, default=256)       # 生成总条数（合格样本）
-    ap.add_argument("--max-new", type=int, default=128)     # 每条最大新 token（更稳）
+    ap.add_argument("--count", type=int, default=256)       # 生成“合格样本”总数
+    ap.add_argument("--max-new", type=int, default=128)     # 每条最大新 token
+    ap.add_argument("--min-resp", type=int, default=8,      # 与池默认一致：最少回复 tokens
+                    help="最短回复 token 数，过短则丢弃（默认 8）")
     ap.add_argument("--mb", type=int, default=8)            # 每批并发条数
     ap.add_argument("--seed", type=int, default=1337)
     ap.add_argument("--block-size", type=int, default=512)  # 训练侧 block_size 对齐
@@ -116,6 +118,7 @@ def main():
     args = ap.parse_args()
 
     random.seed(args.seed)
+    torch.manual_seed(args.seed)
     ensure_dir(args.out_dir)
     _clean_tmp_leftovers(args.out_dir)
 
@@ -201,6 +204,7 @@ def main():
         if not resp_txt.endswith(eos_token):
             resp_txt = resp_txt + eos_token
 
+        # 拼接 & 编码
         full_txt = prompt_txt + resp_txt
         full_ids = tok.encode(full_txt, allowed_special="all")
 
@@ -214,12 +218,37 @@ def main():
         if len(full_ids) <= len(prompt_ids):
             return None
 
+        # 最短回复 token 过滤
+        if (len(full_ids) - len(prompt_ids)) < max(int(args.min_resp), 0):
+            return None
+
         key = ",".join(map(str, full_ids))
         if key in seen:
             return None
         seen.add(key)
 
-        return {"prompt_ids": prompt_ids, "full_ids": full_ids}
+        # 与“新鲜池”保持字段对齐：ts/pid/hid
+        ts = time.time()
+        pid = _hash_ids(prompt_ids)
+        hid = _hash_ids(full_ids)
+
+        return {
+            "prompt_ids": prompt_ids,
+            "full_ids": full_ids,
+            "ts": ts,
+            "pid": pid,
+            "hid": hid,
+            # 可选透传（便于离线排错/抽检）——体积考虑默认不放文本
+            # "prompt_text": prompt_txt,
+            # "response_text": resp_txt,
+        }
+
+    # 小工具：为 _make_sample 计算哈希
+    import hashlib
+    def _hash_ids(ids: List[int]) -> str:
+        h = hashlib.sha1()
+        h.update((",".join(map(str, ids))).encode("utf-8"))
+        return h.hexdigest()
 
     while total_ok < args.count:
         take = min(args.mb, args.count - total_ok)  # 基于“成功样本”配额来取 batch
@@ -231,7 +260,8 @@ def main():
             # 训练索引太少就循环覆盖
             idxs = [train_indices[(total_ok + i) % len(train_indices)] for i in range(take)]
 
-        batch_prompts_txt = [tok.decode(prompt_token_ids[i]) for i in idxs]
+        batch_prompts_ids  = [prompt_token_ids[i] for i in idxs]
+        batch_prompts_txt  = [tok.decode(prompt_token_ids[i]) for i in idxs]
 
         params = {
             "max_new_tokens": int(args.max_new),
@@ -270,13 +300,13 @@ def main():
             # 若返回已包含 prompt，则切出 resp；否则认为 text 就是 resp
             resp = text[len(prompt_txt):] if text.startswith(prompt_txt) else text
 
-            # 简单质量过滤：太短的回复不要
-            if len(tok.encode(resp, allowed_special="all")) < 4:
+            # 简单质量过滤（字符级）：过短直接跳
+            if len(resp.strip()) == 0:
                 continue
 
-            sample = _make_sample(prompt_token_ids[idxs[k]], prompt_txt, resp)
+            sample = _make_sample(batch_prompts_ids[k], prompt_txt, resp)
             if sample is None:
-                # 该条无效（空 resp/重复/过短），跳过
+                # 该条无效（空/重复/过短/被截断为空），跳过
                 continue
 
             stash.append(sample)
@@ -295,7 +325,8 @@ def main():
     # 收尾：还有缓冲则落最后一份
     _flush_incremental(args.out_dir, stash)
 
-    print(f"[worker] generated_ok={total_ok} tried={total_try} model={args.model}", flush=True)
+    acc = (total_ok / max(1, total_try)) * 100.0
+    print(f"[worker] generated_ok={total_ok} tried={total_try} acc={acc:.1f}% model={args.model}", flush=True)
     # 始终 0 退出，避免主进程崩
     sys.exit(0)
 
