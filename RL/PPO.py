@@ -1,6 +1,7 @@
 # RL/PPO.py
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
+import os, math
 
 import torch
 import torch.nn as nn
@@ -10,14 +11,37 @@ from .common import (
     Samples, Experience,
     model_all_logits, token_logprobs_from_logits,
     compute_actor_ref_logprobs, compute_values_on_response,
-    approx_kl_from_logprobs, gae_compute, masked_mean,
+    gae_compute, masked_mean,
     entropy_from_logits, apply_entropy_mask,
-    scatter_last_token_rewards,
     clip_by_global_norm,
     normalize_for_reward,
     forward_values_via_actor,
     scatter_uniform_rewards
 )
+
+# -------------------------
+# helpers: env config
+# -------------------------
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except Exception:
+        return default
+
+def _env_tuple_float2(name_min: str, name_max: str, dmin: float, dmax: float):
+    return _env_float(name_min, dmin), _env_float(name_max, dmax)
+
+# -------------------------
+# helpers: numeric stability
+# -------------------------
+def _clean_logp(x: torch.Tensor, fallback: torch.Tensor = None):
+    """
+    Replace non-finite entries in x with corresponding entries from fallback (if given),
+    otherwise with zeros.
+    """
+    if fallback is not None and fallback.shape == x.shape:
+        return torch.where(torch.isfinite(x), x, fallback)
+    return torch.where(torch.isfinite(x), x, torch.zeros_like(x))
 
 # =========================
 # Critic：接收 actor 的 hidden_states（通过 forward_values_via_actor 计算）
@@ -98,8 +122,33 @@ class PPOTrainer:
         self.gae_gamma = float(gae_gamma)
         self.gae_lambda = float(gae_lambda)
 
+        # ===== 安全保险丝（可被环境变量覆盖）=====
+        # IS 比值硬限（在对数域夹紧；<=0 表示关闭）
+        rmin, rmax = _env_tuple_float2("PPO_RATIO_MIN", "PPO_RATIO_MAX", 0.10, 10.0)
+        self.ratio_min = max(0.0, rmin)
+        self.ratio_max = max(0.0, rmax)
+        if 0.0 < self.ratio_max < 1.0:
+            self.ratio_max = 10.0  # 容错
+
+        # log-ratio 上限（对 Δlogp 夹紧）；<=0 关闭
+        self.kl_token_cap = _env_float("PPO_KL_TOKEN_CAP", 1.5)
+
+        # k3 上限（对 e^Δ-1-Δ 再次夹紧）；<=0 关闭
+        self.k3_cap = _env_float("PPO_K3_CAP", 10.0)
+
+        # token 熵子采样 keep 比例
+        self.ent_mask_keep = _env_float("PPO_ENT_MASK_KEEP", 0.20)
+        self.ent_mask_keep = float(min(max(self.ent_mask_keep, 0.0), 1.0))
+
         # 统计
         self.last_stats = {}
+        self.last_stats.update({
+            "safety_ratio_min": float(self.ratio_min),
+            "safety_ratio_max": float(self.ratio_max),
+            "safety_logratio_cap": float(self.kl_token_cap),
+            "safety_k3_cap": float(self.k3_cap),
+            "safety_ent_keep": float(self.ent_mask_keep),
+        })
 
     # -------------------------
     # helper: decode -> 奖励
@@ -151,19 +200,33 @@ class PPOTrainer:
         attn = samples.attention_mask.to(self.device)
         amsk = samples.action_mask.to(self.device)
 
-        # 1) actor/ref token-logprobs（对齐 response 时间轴；强制 float32 更稳）
+        # 1) actor/ref token-logprobs（对齐 response 时间轴；float32 更稳）
         lp_actor_full, lp_ref_full, mask_target = compute_actor_ref_logprobs(
             self.actor, self.ref, seqs, amsk, self.device_type,
             ptdtype=torch.float32, micro_batch_size=self.mb_logits
         )  # [B, T-1], [B, T-1], [B, T-1]
 
-        # 2) KL per-token：k3 = exp(Δlogp) - 1 - Δlogp（非负，稳定）
-        log_ratio = (lp_actor_full - lp_ref_full) * mask_target
-        k3 = log_ratio.exp() - 1.0 - log_ratio
-        report_kl = float(masked_mean(k3, mask_target.float()).detach().item())
+        # 清洗非有限值，避免后续 exp 爆炸
+        lp_actor_full = _clean_logp(lp_actor_full, fallback=lp_ref_full)
+        lp_ref_full   = _clean_logp(lp_ref_full,   fallback=lp_actor_full)
+
+        # 2) 计算“报告用”的 KL（温和夹紧防止日志溢出）
+        log_ratio_rep = (lp_actor_full - lp_ref_full).clamp_(-8.0, 8.0)
+        k3_report = torch.expm1(log_ratio_rep) - log_ratio_rep  # k3=exp(Δ)-1-Δ ≥ 0
+        report_kl = float(masked_mean(k3_report * mask_target, mask_target.float()).detach().item())
+
+        # 2') 训练/塑形用 KL：Δlogp 先夹紧，再用 expm1 计算 k3，并对 k3 可再夹顶
+        if self.kl_token_cap > 0.0:
+            log_ratio = (lp_actor_full - lp_ref_full).clamp(-self.kl_token_cap, self.kl_token_cap)
+        else:
+            log_ratio = (lp_actor_full - lp_ref_full)
+        k3 = torch.expm1(log_ratio) - log_ratio
+        if self.k3_cap > 0.0:
+            k3 = torch.clamp(k3, 0.0, self.k3_cap)
+        k3 = k3 * mask_target  # 仅 action 轴
 
         # 3) critic 值函数（完整时间轴，随后按 action 轴裁切）
-        values_full, mask_time = compute_values_on_response(
+        values_full, _ = compute_values_on_response(
             self.actor, self.critic, seqs, amsk, self.device_type,
             ptdtype=torch.float32, micro_batch_size=self.mb_values, detach_hidden=False
         )
@@ -174,14 +237,14 @@ class PPOTrainer:
         r_seq = self._decode_texts_and_score(seqs, attn)   # [B]
         r_raw_mean = float(r_seq.mean().detach().item())
 
-        # 5) 均匀摊 + KL 形状惩罚（更稳）
+        # 5) 均匀摊 + KL 形状惩罚（使用已夹紧的 k3）
         rewards_t = scatter_uniform_rewards(
             r_seq, action_mask, beta_kl=(k3, self.kl_ctl)
         )
 
-        # shaped/centered 统计
+        # shaped/centered 统计（报告仍用 report_kl 的 k3）
         denom = action_mask.sum(dim=1).clamp_min(1e-8).float()
-        kl_mean_per_seq = (k3 * action_mask).sum(dim=1) / denom
+        kl_mean_per_seq = (k3_report * action_mask).sum(dim=1) / denom
         r_shaped_seq = r_seq - self.kl_ctl * kl_mean_per_seq
         r_shaped_mean = float(r_shaped_seq.mean().detach().item())
         r_centered_mean = float((r_seq - r_seq.mean()).mean().detach().item())
@@ -203,12 +266,12 @@ class PPOTrainer:
             action_mask=action_mask,
             reward=r_seq.detach(),
             num_actions=action_mask.sum(dim=1).to(torch.long),
-            kl=k3.detach(),
+            kl=k3_report.detach(),  # 报告用 KL
         )]
 
         # ====== 额外统计（与主脚本日志字段对齐）======
         with torch.no_grad():
-            approx_kl_pi = float(masked_mean(k3, action_mask.float()).detach().item())
+            approx_kl_pi = float(masked_mean(k3_report * action_mask, action_mask.float()).detach().item())
 
             logits_actor = model_all_logits(
                 self.actor, seqs, self.device_type, ptdtype=torch.float32, micro_batch_size=self.mb_logits
@@ -259,6 +322,7 @@ class PPOTrainer:
             var_adv  = (((adv - mean_adv)**2) * exp.action_mask).sum() / denom
             std_adv  = var_adv.sqrt().clamp_min(1e-6)
         adv = (adv - mean_adv) / std_adv
+        adv = adv.clamp_(-5.0, 5.0)
 
         # ===== Actor update =====
         self.actor.train()
@@ -268,6 +332,8 @@ class PPOTrainer:
             self.actor, seqs, self.device_type, ptdtype=torch.float32, micro_batch_size=self.mb_logits
         )  # [B, T, V]
         logp_all = token_logprobs_from_logits(logits, seqs)  # [B, T-1]
+        logp_all = _clean_logp(logp_all)  # 清洗非有限值
+
         L = old_logp.size(1)
         logp = logp_all[:, :L]
         action_mask = action_mask[:, :L]
@@ -275,12 +341,20 @@ class PPOTrainer:
 
         # token-entropy 子采样（只改 loss 掩码）
         if use_token_entropy:
-            sel_mask = apply_entropy_mask(logits[:, 1:, :].detach(), action_mask, keep_ratio=0.25)
+            keep = self.ent_mask_keep if (0.0 < self.ent_mask_keep <= 1.0) else 0.25
+            sel_mask = apply_entropy_mask(logits[:, 1:, :].detach(), action_mask, keep_ratio=keep)
         else:
             sel_mask = action_mask
 
-        # 重要性采样比值
-        ratio = torch.exp(logp - old_logp)  # [B, T-1]
+        # 重要性采样比值：在对数域夹紧更稳
+        raw_delta = logp - old_logp
+        if self.ratio_min > 0.0 and self.ratio_max > 0.0 and self.ratio_max > self.ratio_min:
+            lo = math.log(self.ratio_min)
+            hi = math.log(self.ratio_max)
+            delta = torch.clamp(raw_delta, lo, hi)
+            ratio = torch.exp(delta)
+        else:
+            ratio = torch.exp(raw_delta)
 
         # —— 统计：ratio 分位数 / 优势规模 / 选中 token 数 —— 
         with torch.no_grad():
@@ -316,21 +390,28 @@ class PPOTrainer:
 
         policy_loss = policy_loss_tok.sum() / sel_mask.sum().clamp_min(1e-8)
 
-        # KL shaping（与 evaluate_experience 的口径一致，用 k3）
+        # KL shaping：对 Δlogp 夹紧，k3 用 expm1 计算并可再夹紧
         with torch.no_grad():
             logits_ref = model_all_logits(
                 self.ref, seqs, self.device_type, ptdtype=torch.float32, micro_batch_size=self.mb_logits
             )
             lp_ref_full = token_logprobs_from_logits(logits_ref, seqs)
+            lp_ref_full = _clean_logp(lp_ref_full, fallback=logp_all)
 
         L = min(logp.size(1), lp_ref_full.size(1))
         lp_ref = lp_ref_full[:, :L]
         logp_cut = logp[:, :L]
         sel = sel_mask[:, :L].float()
 
-        log_ratio = (logp_cut - lp_ref)
-        k3 = (log_ratio.exp() - 1.0 - log_ratio) * sel
-        kl_mean = k3.sum() / sel.sum().clamp_min(1e-8)
+        log_ratio_raw = (logp_cut - lp_ref)
+        if self.kl_token_cap > 0.0:
+            log_ratio = torch.clamp(log_ratio_raw, -self.kl_token_cap, self.kl_token_cap)
+        else:
+            log_ratio = log_ratio_raw
+        k3 = torch.expm1(log_ratio) - log_ratio
+        if self.k3_cap > 0.0:
+            k3 = torch.clamp(k3, 0.0, self.k3_cap)
+        kl_mean = (k3 * sel).sum() / sel.sum().clamp_min(1e-8)
         policy_loss = policy_loss + self.kl_ctl * kl_mean
 
         policy_loss.backward()
@@ -364,7 +445,8 @@ class PPOTrainer:
             vloss2 = (values_clipped - returns) ** 2
             v_loss_tok = torch.max(vloss1, vloss2)
         else:
-            v_loss_tok = (values_new - returns) ** 2
+            # Huber 更稳
+            v_loss_tok = F.smooth_l1_loss(values_new, returns, beta=1.0, reduction="none")
 
         v_loss = (v_loss_tok * action_mask).sum() / action_mask.sum().clamp_min(1e-8)
         v_loss.backward()

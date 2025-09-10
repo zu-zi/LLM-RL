@@ -152,7 +152,7 @@ python -u rollout_worker.py \
   --block-size 384\
   --use-only-train
 
-python3 train_RL_only.py config/train_RL_PPO.py
+python3 train_RL_only.py config/train_RL_PPO_0.py
 
 # python3 test_sglang.py
 ```
