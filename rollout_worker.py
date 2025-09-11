@@ -87,6 +87,16 @@ def _retry_sleep(backoff_s: float) -> float:
     time.sleep(backoff_s)
     return min(backoff_s * 2.0, 8.0)
 
+def _is_garbage(resp: str) -> bool:
+    s = resp.strip()
+    if len(s) < 8:
+        return True
+    rep = s.count("\ufffd")
+    digits = sum(ch.isdigit() for ch in s)
+    puncts = sum(ch in "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~" for ch in s)
+    ratio = (rep + digits + puncts) / max(len(s), 1)
+    return (rep > 0) or (ratio > 0.40)
+
 # ---------------- main ----------------
 def main():
     ap = argparse.ArgumentParser()
@@ -103,9 +113,10 @@ def main():
     ap.add_argument("--flush-interval", type=float, default=2.0)  # 秒
     ap.add_argument("--flush-batch", type=int, default=256)       # 累计到这么多就落一文件
     # sglang 采样参数（更稳的默认）
-    ap.add_argument("--temperature", type=float, default=0.8)
+    ap.add_argument("--temperature", type=float, default=0.75)
     ap.add_argument("--top-p", type=float, default=0.9)
-    ap.add_argument("--top-k", type=int, default=0)  # 0 表示不限
+    ap.add_argument("--top-k", type=int, default=40)  # 0 表示不限
+    ap.add_argument("--repetition-penalty", type=float, default=1.2)
 
     # ===== 新增：只用训练集 / 索引来源 =====
     ap.add_argument("--use-only-train", action="store_true",
@@ -197,7 +208,9 @@ def main():
     last_flush = time.time()
 
     # 去重（本次进程内，按 full_ids 文本去重）
-    seen = set()
+    # seen = set()
+    seen_hid = set()
+    seen_pid_resp = set()  # (pid, resp_md5) 级别去重，缓和模式坍塌
 
     def _make_sample(prompt_ids: List[int], prompt_txt: str, resp_txt: str) -> Optional[dict]:
         # 结尾保证 eos
@@ -213,6 +226,9 @@ def main():
             # 能保留的 response 长度
             room = max(args.block_size - len(prompt_ids), 1)
             full_ids = prompt_ids + full_ids[len(prompt_ids):len(prompt_ids)+room]
+        # 若确实有 response，则无论是否被截断，强制以 EOS 结尾
+        if len(full_ids) > len(prompt_ids):
+            full_ids[-1] = eos_id
 
         # 严格要求有 response
         if len(full_ids) <= len(prompt_ids):
@@ -222,10 +238,19 @@ def main():
         if (len(full_ids) - len(prompt_ids)) < max(int(args.min_resp), 0):
             return None
 
-        key = ",".join(map(str, full_ids))
-        if key in seen:
+        # key = ",".join(map(str, full_ids))
+        # if key in seen:
+        #     return None
+        # seen.add(key)
+        key_hid = ",".join(map(str, full_ids))
+        resp_md5 = hashlib.md5(resp_txt.encode("utf-8")).hexdigest()
+        pid = _hash_ids(prompt_ids)
+        if key_hid in seen_hid:
             return None
-        seen.add(key)
+        if (pid, resp_md5) in seen_pid_resp:
+            return None
+        seen_hid.add(key_hid)
+        seen_pid_resp.add((pid, resp_md5))
 
         # 与“新鲜池”保持字段对齐：ts/pid/hid
         ts = time.time()
@@ -270,7 +295,7 @@ def main():
             "temperature": float(args.temperature),
             "top_p": float(args.top_p),
             # 明确的字符串停词：遇到下一轮 Human 或重复 Assistant 时停
-            "stop": ["\nHuman:", "\n\nHuman:", "\nAssistant:"],
+            "stop": ["\nHuman:", "\n\nHuman:"],
         }
         if args.top_k and args.top_k > 0:
             params["top_k"] = int(args.top_k)
@@ -279,6 +304,7 @@ def main():
         backoff = 0.5
         for attempt in range(4):
             try:
+                params["repetition_penalty"] = float(args.repetition_penalty)
                 outs = eng.generate(batch_prompts_txt, params)
                 break
             except Exception as e:
@@ -299,6 +325,30 @@ def main():
             prompt_txt = batch_prompts_txt[k]
             # 若返回已包含 prompt，则切出 resp；否则认为 text 就是 resp
             resp = text[len(prompt_txt):] if text.startswith(prompt_txt) else text
+            if _is_garbage(resp):
+                continue
+            BAD_MARKERS = (
+                "Advertisements", "rawdownloadcloneembedreport", "\ufffd",
+                "Recognize the homophones of the following word"
+            )
+            if any(m in resp for m in BAD_MARKERS):
+                continue
+                
+            # 额外后处理：只保留第一轮 Assistant 内容
+            cut_markers = ["\n\nHuman:", "\nHuman:", "\n\nAssistant:", "\nAssistant:"]
+            cut_pos = min([resp.find(m) for m in cut_markers if m in resp] + [len(resp)])
+            resp = resp[:cut_pos]
+            
+            # 去掉开头可能的空格/重复标签
+            resp = resp.lstrip()
+            if resp.startswith("Assistant:"):
+                # 有些模型会把标签又打一遍，去掉它
+                resp = resp[len("Assistant:"):].lstrip()
+            
+            # 进一步的弱垃圾规则（可选）
+            bad_fragments = ["Advertisements", "rawdownloadcloneembedreportprint"]
+            if any(b in resp for b in bad_fragments):
+                continue
 
             # 简单质量过滤（字符级）：过短直接跳
             if len(resp.strip()) == 0:

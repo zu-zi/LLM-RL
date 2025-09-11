@@ -150,7 +150,8 @@ python -u rollout_worker.py \
   --max-new 128 \
   --mb 4 \
   --block-size 384\
-  --use-only-train
+  --use-only-train\
+  --min-resp 12
 
 python3 train_RL_only.py config/train_RL_PPO_0.py
 

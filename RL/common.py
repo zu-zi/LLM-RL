@@ -82,6 +82,7 @@ def normalize_for_reward(text: str, reward_tokenizer=None) -> str:
         text = text.replace("，", ",").replace("。", ".")
     # 去掉不可打印字符
     text = "".join(c for c in text if c.isprintable())
+    text = text.replace("\ufffd", "")
     # 去除多余空白（避免奖励侧不必要差异）
     return text.strip()
 

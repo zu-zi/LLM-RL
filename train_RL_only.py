@@ -1,11 +1,13 @@
 # train_RL_only.py
 
 import os, sys, time, random, json, subprocess, glob
-os.environ["PPO_RATIO_MIN"] = "0.6"   # 重要性采样下限更紧
-os.environ["PPO_RATIO_MAX"] = "1.4"    # 上限更紧，防止爆比值
-os.environ["PPO_KL_TOKEN_CAP"] = "0.3" # 夹紧 Δlogp 幅度（配合 PPO.K3_CAP）
+os.environ["PPO_RATIO_MIN"] = "0.75"   # 重要性采样下限更紧
+os.environ["PPO_RATIO_MAX"] = "1.25"   # 上限更紧，防止爆比值
+os.environ["PPO_KL_TOKEN_CAP"] = "0.5" # 夹紧 Δlogp 幅度（配合 PPO.K3_CAP）
 os.environ["PPO_K3_CAP"] = "1.5"       # 对 k3 再上限，削尖峰
 os.environ["PPO_ENT_MASK_KEEP"] = "0.1"  # 熵正则子采样更保守
+os.environ["ROLL_MIN_RESP_TOKENS"]="16"
+MIN_RESP_TOK = int(os.getenv("ROLL_MIN_RESP_TOKENS", "16"))
 import numpy as np
 import torch, tiktoken
 from torch.distributed import init_process_group, destroy_process_group
@@ -35,7 +37,7 @@ os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")  # 降噪
 use_ppo = True
 use_grpo = False
 use_dapo  = False
-use_token_entropy = True        # 开：逐 token 熵正则
+use_token_entropy = False        # 开：逐 token 熵正则
 
 # ================== IO / runtime ==================
 out_dir = "/root/autodl-tmp/Results"
@@ -91,10 +93,16 @@ ROLL_REFILL_COUNT = 24      # 从 12 → 24，补货更积极一些
 ROLL_COOLDOWN_SEC = 18
 ROLL_MIN_FREE_MB  = 7000
 
-# 每个迭代保证“新鲜样本占比”（在线贪心条数）
+# 每个迭代保证“新鲜样本占比”（在线条数）
 FRESH_RATIO = 0.50
 POOL_STALE_WARN_SEC = 900  # >15min 打“(!stale)”提示
 
+# ===== 统一采样口径（与 rollout_worker.py 对齐）=====
+SAMPLE_TEMPERATURE = 0.8
+SAMPLE_TOP_P = 0.9
+SAMPLE_TOP_K = 0
+SAMPLE_REP_PENALTY = 1.1
+SAMPLE_STOPS = ["\nHuman:", "\n\nHuman:"]
 
 # ====== CLI 覆盖 ======
 def _apply_cli_config_once():
@@ -104,8 +112,6 @@ def _apply_cli_config_once():
         print(f"Overriding config with {cfg}:")
         print(open(cfg,"r").read())
         exec(open(cfg,"r").read(), globals(), globals())
-
-
 
 # ========= 简单 GPT-2 分词器 =========
 class GPT2Tok:
@@ -181,27 +187,137 @@ def pack_samples(gen_list, pad_id, block_size, device):
     return Samples(seqs=seqs, attention_mask=attn, action_mask=amsk,
                    num_actions=num_actions, response_length=resp_len, total_length=total_len)
 
-# ========= 纯贪心解码 =========
+# ========= 贪心解码（保留以兼容旧评测）=========
+# @torch.no_grad()
+# def _greedy_decode_argmax(actor_model, idx, max_new_tokens, eos_id, block_size):
+#     device = idx.device
+#     was_train = actor_model.training
+#     actor_model.eval()
+#     try:
+#         out = idx
+#         for _ in range(int(max_new_tokens)):
+#             idx_cond = out[:, -int(block_size):]
+#             logits = actor_model(idx_cond)
+#             if isinstance(logits, tuple):  # 兼容 (logits, ...)
+#                 logits = logits[0]
+#             next_token_logits = logits[:, -1, :]
+#             next_id = torch.argmax(next_token_logits, dim=-1).view(1,1).to(device)
+#             out = torch.cat((out, next_id), dim=1)
+#             if eos_id is not None and int(next_id.item()) == int(eos_id):
+#                 break
+#         return out
+#     finally:
+#         if was_train: actor_model.train()
+
+# ========= 采样解码（与 rollout 完全对齐）=========
 @torch.no_grad()
-def _greedy_decode_argmax(actor_model, idx, max_new_tokens, eos_id, block_size):
+def _sample_next_token(logits, top_p=0.9, temperature=0.75, top_k=0, repetition_penalty=1.1, prev=None):
+    if repetition_penalty and prev is not None and prev.numel() > 0:
+        uniq = torch.unique(prev)
+        logits[:, uniq] = logits[:, uniq] / float(repetition_penalty)
+    logits = logits / max(float(temperature), 1e-6)
+    if top_k and top_k > 0:
+        kth = torch.topk(logits, k=min(int(top_k), logits.size(-1)), dim=-1).values[..., -1:]
+        logits = torch.where(logits < kth, torch.full_like(logits, -1e10), logits)
+    probs = torch.softmax(logits, dim=-1)
+    sorted_probs, sorted_idx = torch.sort(probs, descending=True, dim=-1)
+    cumsum = torch.cumsum(sorted_probs, dim=-1)
+    cutoff = (cumsum > float(top_p)).float().argmax(dim=-1, keepdim=True)
+    mask = torch.arange(probs.size(-1), device=probs.device).view(1, -1) <= cutoff
+    kept = torch.where(mask, sorted_probs, torch.zeros_like(sorted_probs))
+    kept = kept / kept.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    next_sorted = torch.multinomial(kept, num_samples=1)
+    next_id = sorted_idx.gather(1, next_sorted)  # [1,1]
+    return next_id
+
+# @torch.no_grad()
+# def _decode_with_sampling(model, idx, max_new_tokens, eos_id, block_size,
+#                           temperature=0.75, top_p=0.9, top_k=0, repetition_penalty=1.1,
+#                           stop_strs=None, tokenizer_decode=None):
+#     device = idx.device
+#     was_train = model.training
+#     model.eval()
+#     try:
+#         out = idx
+#         for _ in range(int(max_new_tokens)):
+#             idx_cond = out[:, -int(block_size):]
+#             logits = model(idx_cond)
+#             if isinstance(logits, tuple):
+#                 logits = logits[0]
+#             last = logits[:, -1, :]
+#             next_id = _sample_next_token(
+#                 last, top_p=top_p, temperature=temperature, top_k=top_k,
+#                 repetition_penalty=repetition_penalty, prev=out
+#             )
+#             out = torch.cat((out, next_id.to(device)), dim=1)
+#             # eos 停
+#             if eos_id is not None and int(next_id.item()) == int(eos_id):
+#                 break
+#             # 明确字符串停词
+#             if stop_strs and tokenizer_decode is not None:
+#                 tail = tokenizer_decode(out[0][-min(out.size(1), block_size):].tolist())
+#                 if any(s in tail for s in stop_strs):
+#                     break
+#         return out
+#     finally:
+#         if was_train: model.train()
+
+@torch.no_grad()
+def _decode_with_sampling(model, idx, max_new_tokens, eos_id, block_size,
+                          temperature=0.75, top_p=0.9, top_k=0, repetition_penalty=1.1,
+                          stop_strs=None, tokenizer_decode=None, min_resp: int = 8):
     device = idx.device
-    was_train = actor_model.training
-    actor_model.eval()
+    was_train = model.training
+    model.eval()
     try:
         out = idx
+        start_len = out.size(1)
         for _ in range(int(max_new_tokens)):
             idx_cond = out[:, -int(block_size):]
-            logits = actor_model(idx_cond)
-            if isinstance(logits, tuple):  # 兼容 (logits, ...)
+            logits = model(idx_cond)
+            if isinstance(logits, tuple):
                 logits = logits[0]
-            next_token_logits = logits[:, -1, :]
-            next_id = torch.argmax(next_token_logits, dim=-1).view(1,1).to(device)
-            out = torch.cat((out, next_id), dim=1)
-            if eos_id is not None and int(next_id.item()) == int(eos_id):
-                break
+            last = logits[:, -1, :]
+
+            # 轻度去重复 + 温度/核采样
+            if repetition_penalty and out.numel() > 0:
+                uniq = torch.unique(out)
+                last[:, uniq] = last[:, uniq] / float(repetition_penalty)
+            last = last / max(float(temperature), 1e-6)
+            if top_k and top_k > 0:
+                kth = torch.topk(last, k=min(int(top_k), last.size(-1)), dim=-1).values[..., -1:]
+                last = torch.where(last < kth, torch.full_like(last, -1e10), last)
+            probs = torch.softmax(last, dim=-1)
+            sorted_probs, sorted_idx = torch.sort(probs, descending=True, dim=-1)
+            cumsum = torch.cumsum(sorted_probs, dim=-1)
+            cutoff = (cumsum > float(top_p)).float().argmax(dim=-1, keepdim=True)
+            mask = torch.arange(probs.size(-1), device=probs.device).view(1, -1) <= cutoff
+            kept = torch.where(mask, sorted_probs, torch.zeros_like(sorted_probs))
+            kept = kept / kept.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+            next_sorted = torch.multinomial(kept, num_samples=1)
+            next_id = sorted_idx.gather(1, next_sorted)  # [1,1]
+
+            # 如果还没达到最短响应长度 -> 禁止 EOS
+            if (out.size(1) - start_len) < int(min_resp) and eos_id is not None and int(next_id.item()) == int(eos_id):
+                # 直接改抽到的 id 为概率里的第二名，避免卡死；退而求其次：
+                alt = sorted_idx[:, 1:2] if sorted_idx.size(1) > 1 else next_id
+                next_id = alt
+
+            out = torch.cat((out, next_id.to(device)), dim=1)
+
+            # 仅在达到最短长度之后，才允许这些停条件生效
+            if (out.size(1) - start_len) >= int(min_resp):
+                if eos_id is not None and int(next_id.item()) == int(eos_id):
+                    break
+                if stop_strs and tokenizer_decode is not None:
+                    tail = tokenizer_decode(out[0][-min(out.size(1), block_size):].tolist())
+                    if any(s in tail for s in stop_strs):
+                        break
         return out
     finally:
-        if was_train: actor_model.train()
+        if was_train: model.train()
+
+
 
 # ========= 显存检测 =========
 def _cuda_free_mb(device_str="cuda"):
@@ -238,8 +354,9 @@ def _spawn_rollout_subprocess(prompt_bin_path, count, sync_dir, max_new, rollout
         "--count", str(int(count)),
         "--max-new", str(int(max_new)),
         "--block-size", str(int(block_size)),
-        "--mb", "1",
+        "--mb", "4",
         "--use-only-train",
+        "--min-resp","16",
     ]
     logf = os.path.join(rollout_log_dir, f"rollout_{int(time.time())}.log")
     if quiet:
@@ -259,9 +376,42 @@ def _ema_update(prev, x, alpha=0.1):
     if prev is None or np.isnan(prev): return float(x)
     return float(alpha * x + (1.0 - alpha) * prev)
 
-# ========= RM 打分 =========
+# ========= RM 打分（贪心口径，保留） =========
+# @torch.no_grad()
+# def eval_fixed_raw_reward(actor_model, gpt2_tok, eval_prompt_ids, reward_tokenizer, reward_model, block_size, max_new_eval=128):
+#     dev = next(actor_model.parameters()).device
+#     eos_id = gpt2_tok.eos_id
+#     texts = []
+#     was_training = actor_model.training
+#     actor_model.eval()
+#     try:
+#         for ids in eval_prompt_ids:
+#             ids_t = torch.tensor(ids, dtype=torch.long, device=dev).unsqueeze(0)
+#             prompt_len = ids_t.size(1)
+#             room = block_size - prompt_len - 1
+#             if room <= 0:
+#                 full_ids = ids[:block_size]
+#                 texts.append(gpt2_tok.decode(full_ids)); continue
+#             gen_len = max(8, min(int(max_new_eval), int(room)))
+#             out = _greedy_decode_argmax(actor_model, ids_t, gen_len, eos_id, block_size)
+#             full = out[0].tolist()[:block_size]
+#             texts.append(gpt2_tok.decode(full))
+#     finally:
+#         if was_training: actor_model.train()
+
+#     texts = [normalize_for_reward(t, reward_tokenizer) for t in texts]
+#     toks = reward_tokenizer(texts, padding=True, truncation=True, max_length=1024, return_tensors="pt")
+#     outs = reward_model(**toks)
+#     logits = getattr(outs, "logits", None)
+#     if logits is None: return float("nan")
+#     if logits.dim() == 2 and logits.size(-1) == 1: logits = logits.squeeze(-1)
+#     return float(np.mean([float(v) for v in logits.detach().cpu().tolist()])) if len(texts) > 0 else float("nan")
+
+# ========= 采样口径评测（与 rollout 对齐）=========
 @torch.no_grad()
-def eval_fixed_raw_reward(actor_model, gpt2_tok, eval_prompt_ids, reward_tokenizer, reward_model, block_size, max_new_eval=128):
+def eval_fixed_raw_reward_sampled(actor_model, gpt2_tok, eval_prompt_ids,
+                                  reward_tokenizer, reward_model,
+                                  block_size, max_new_eval=64):
     dev = next(actor_model.parameters()).device
     eos_id = gpt2_tok.eos_id
     texts = []
@@ -269,14 +419,20 @@ def eval_fixed_raw_reward(actor_model, gpt2_tok, eval_prompt_ids, reward_tokeniz
     actor_model.eval()
     try:
         for ids in eval_prompt_ids:
-            ids_t = torch.tensor(ids, dtype=torch.long, device=dev).unsqueeze(0)
-            prompt_len = ids_t.size(1)
-            room = block_size - prompt_len - 1
+            idx = torch.tensor(ids, dtype=torch.long, device=dev).unsqueeze(0)
+            room = block_size - idx.size(1) - 1
             if room <= 0:
                 full_ids = ids[:block_size]
                 texts.append(gpt2_tok.decode(full_ids)); continue
+
             gen_len = max(8, min(int(max_new_eval), int(room)))
-            out = _greedy_decode_argmax(actor_model, ids_t, gen_len, eos_id, block_size)
+            out = _decode_with_sampling(
+                actor_model, idx, gen_len, eos_id, block_size,
+                temperature=SAMPLE_TEMPERATURE, top_p=SAMPLE_TOP_P, top_k=SAMPLE_TOP_K,
+                repetition_penalty=SAMPLE_REP_PENALTY,
+                stop_strs=SAMPLE_STOPS, tokenizer_decode=gpt2_tok.decode,
+                min_resp=MIN_RESP_TOK 
+            )
             full = out[0].tolist()[:block_size]
             texts.append(gpt2_tok.decode(full))
     finally:
@@ -288,7 +444,7 @@ def eval_fixed_raw_reward(actor_model, gpt2_tok, eval_prompt_ids, reward_tokeniz
     logits = getattr(outs, "logits", None)
     if logits is None: return float("nan")
     if logits.dim() == 2 and logits.size(-1) == 1: logits = logits.squeeze(-1)
-    return float(np.mean([float(v) for v in logits.detach().cpu().tolist()])) if len(texts) > 0 else float("nan")
+    return float(logits.mean().item()) if len(texts) > 0 else float("nan")
 
 # ========= 主流程 =========
 def main():
@@ -307,7 +463,7 @@ def main():
         PROMPTS_TEXT, PROMPT_TOKEN_IDS, EOS_ID, seed, PROMPT_BIN_PATH,
         TRAIN_INDICES, EVAL_INDICES
     ) = _load_prompts()
-    pad_id = 0
+    pad_id = tok.eos_id
 
     # ====== 训练/评测索引严格构造 ======
     ALL_IDX = list(range(len(PROMPT_TOKEN_IDS)))
@@ -415,7 +571,6 @@ def main():
     else:
         iter_start = 0
 
-
     # 奖励模型（CPU）
     rw_name = REWARD_MODEL_NAME
     print(f"[reward] loading {rw_name} on CPU ...")
@@ -434,13 +589,13 @@ def main():
             critic_model=critic, actor_tokenizer=tok, reward_tokenizer=reward_tokenizer,
             optimizer_actor=opt_a, optimizer_critic=opt_c,
             device=dev,
-            mb_size_logits=1,              
+            mb_size_logits=1,
             mb_size_values=1,
             kl_ctl=kl_ctl,
-            ppo_clip=ppo_clip,             
-            entropy_coef=entropy_coef,     
-            max_grad_norm=1.0,           
-            vf_clip=0.2,                  
+            ppo_clip=ppo_clip,
+            entropy_coef=entropy_coef,
+            max_grad_norm=1.0,
+            vf_clip=0.2,
         )
     elif use_grpo:
         trainer=GRPOTrainer(actor_model=raw_actor, ref_model=ref, reward_model=reward_model,
@@ -463,8 +618,8 @@ def main():
     last_rollout_t = 0.0
 
     # ====== KL 迟滞（hysteresis）控制器 ======
-    KL_HALT   = 1.2     # 连续命中该阈值 → 冻结 actor
-    KL_RESUME = 0.7     # 连续低于该阈值 → 解冻 actor
+    KL_HALT   = 0.12     # 连续命中该阈值 → 冻结 actor
+    KL_RESUME = 0.08     # 连续低于该阈值 → 解冻 actor
     HALT_STREAK = 2
     RESUME_STREAK = 2
     actor_frozen = False
@@ -518,43 +673,78 @@ def main():
             want_fresh = want_fresh_base
             batch = dequeue_items(SGLANG_SYNC_DIR, batch_size - want_fresh) if (SGLANG_ON and SGLANG_OFFLINE) else []
 
-        # 在线贪心（冻结/紧急期统一短生成）
-        def _greedy_one_from_train(use_ref: bool):
+        # 在线“新鲜样本”改为采样解码（统一与 rollout）
+        # def _gen_one_from_train(use_ref: bool):
+        #     ids = random.choice(TRAIN_PROMPT_IDS)
+        #     ids_t = torch.tensor(ids, dtype=torch.long, device=dev).unsqueeze(0)
+        #     room = block_size - ids_t.size(1) - 1
+        #     if room <= 0: return None
+        #     max_new_cap = SGLANG_MAX_NEW
+        #     if use_ref or EMERG_SHORT_GEN_STEPS > 0:
+        #         max_new_cap = min(max_new_cap, 32)  # 紧急/冻结：更短生成
+        #     out = _decode_with_sampling(
+        #         ref if use_ref else raw_actor, ids_t,
+        #         max_new_tokens=max(8, min(room, max_new_cap)),
+        #         eos_id=tok.eos_id, block_size=block_size,
+        #         temperature=SAMPLE_TEMPERATURE, top_p=SAMPLE_TOP_P, top_k=SAMPLE_TOP_K,
+        #         repetition_penalty=SAMPLE_REP_PENALTY,
+        #         stop_strs=SAMPLE_STOPS, tokenizer_decode=tok.decode
+        #     )
+        #     return {"prompt_ids": ids, "full_ids": out[0].tolist()}
+
+        def _gen_one_from_train(use_ref: bool):
             ids = random.choice(TRAIN_PROMPT_IDS)
             ids_t = torch.tensor(ids, dtype=torch.long, device=dev).unsqueeze(0)
             room = block_size - ids_t.size(1) - 1
             if room <= 0: return None
             max_new_cap = SGLANG_MAX_NEW
             if use_ref or EMERG_SHORT_GEN_STEPS > 0:
-                max_new_cap = min(max_new_cap, 32)  # 紧急/冻结：更短生成
-            out = _greedy_decode_argmax(ref if use_ref else raw_actor, ids_t,
-                                        max_new_tokens=max(8, min(room, max_new_cap)),
-                                        eos_id=tok.eos_id, block_size=block_size)
-            return {"prompt_ids": ids, "full_ids": out[0].tolist()}
+                max_new_cap = min(max_new_cap, 32)
+        
+            # 允许出现下一轮 Assistant，但必须先写够最短回复
+            stop_list = ["\nHuman:", "\n\nHuman:", "\nAssistant:"]
+        
+            tries = 0
+            while tries < 6:
+                tries += 1
+                out = _decode_with_sampling(
+                    ref if use_ref else raw_actor, ids_t,
+                    max_new_tokens=max(8, min(room, max_new_cap)),
+                    eos_id=tok.eos_id, block_size=block_size,
+                    temperature=SAMPLE_TEMPERATURE, top_p=SAMPLE_TOP_P, top_k=SAMPLE_TOP_K,
+                    repetition_penalty=SAMPLE_REP_PENALTY,                       # 稍强一点，缓解复读
+                    stop_strs=stop_list, tokenizer_decode=tok.decode,
+                    min_resp=MIN_RESP_TOK                          # 关键：达到最短才可停
+                )
+                resp_len = out.size(1) - ids_t.size(1)
+                if resp_len >= MIN_RESP_TOK:
+                    return {"prompt_ids": ids, "full_ids": out[0].tolist()}
+            return None
+
 
         # 补“新鲜样本”
         fresh = []
         for _ in range(want_fresh):
-            g = _greedy_one_from_train(use_ref=actor_frozen)
+            g = _gen_one_from_train(use_ref=actor_frozen)
             if g is not None: fresh.append(g)
         batch.extend(fresh)
 
-        # 若仍不足，再补在线贪心
+        # 若仍不足，再补在线生成
         while len(batch) < batch_size:
-            g = _greedy_one_from_train(use_ref=actor_frozen)
+            g = _gen_one_from_train(use_ref=actor_frozen)
             if g is None: break
             batch.append(g)
 
         # 打包 Samples
-        samples = pack_samples(batch, pad_id=0, block_size=block_size, device=torch.device(dev))
+        samples = pack_samples(batch, pad_id=tok.eos_id, block_size=block_size, device=torch.device(dev))
 
         # 若整批没有 response，继续尝试几次；仍不行则跳过
         if int(samples.action_mask.sum().item()) == 0:
             tries = 0
             while int(samples.action_mask.sum().item()) == 0 and tries < 8:
-                g = _greedy_one_from_train(use_ref=actor_frozen)
+                g = _gen_one_from_train(use_ref=actor_frozen)
                 if g is not None: batch.append(g)
-                samples = pack_samples(batch[-batch_size:], pad_id=0, block_size=block_size, device=torch.device(dev))
+                samples = pack_samples(batch[-batch_size:], pad_id=tok.eos_id, block_size=block_size, device=torch.device(dev))
                 tries += 1
             if int(samples.action_mask.sum().item()) == 0:
                 if _is_master(ddp):
@@ -562,11 +752,11 @@ def main():
                 continue
 
         # 评估经验（不会更新参数）
-        experiences, report_kl, r_raw, r_shaped, r_ctr = trainer.evaluate_experience(samples)
+        experiences, report_kl, r_raw, r_shaped, r_ctr, safe_kl = trainer.evaluate_experience(samples)
 
         # === 硬保险丝：异常 KL → 冻结 actor + 只训 critic（不再整步 continue） ===
         critic_only_this_iter = False
-        if (not np.isfinite(report_kl)) or (report_kl > 1.7):
+        if (not np.isfinite(safe_kl)) or (safe_kl > 1.7):
             actor_frozen = True
             critic_only_this_iter = True
             FORCE_FRESH_STEPS = max(FORCE_FRESH_STEPS, 3)
@@ -579,7 +769,7 @@ def main():
         if np.isnan(clip_frac): clip_frac = 0.0
 
         # ---- Emergency KL fuse (hard stop on actor) ----
-        if np.isfinite(report_kl) and report_kl > 1.7:
+        if np.isfinite(safe_kl) and safe_kl > 1.7:
             actor_frozen = True
             FORCE_FRESH_STEPS = max(FORCE_FRESH_STEPS, 3)
             EMERG_SHORT_GEN_STEPS = max(EMERG_SHORT_GEN_STEPS, 3)
@@ -592,9 +782,9 @@ def main():
             EMERG_SHORT_GEN_STEPS -= 1
 
         # --- 自适应 KL（温和） ---
-        kl_target = 0.60
-        if np.isfinite(report_kl):
-            err = report_kl / max(kl_target, 1e-8) - 1.0
+        kl_target = 0.3
+        if np.isfinite(safe_kl):
+            err = safe_kl / max(kl_target, 1e-8) - 1.0
             up = 0.05; down = 0.03
             trainer.kl_ctl *= float(np.exp(np.clip(err, -down, up)))
             trainer.kl_ctl = float(np.clip(trainer.kl_ctl, 0.05, 2.0))
@@ -603,8 +793,8 @@ def main():
 
         # === KL 驱动的临时降学习率（只作用于 actor；不改基础超参）===
         KL_STOP = 1.5
-        if np.isfinite(report_kl):
-            err = max(0.0, report_kl / KL_STOP - 1.0)
+        if np.isfinite(safe_kl):
+            err = max(0.0, safe_kl / KL_STOP - 1.0)
             scale = 1.0 / (1.0 + 2.0 * err)
             scale = float(max(0.25, min(1.0, scale)))
         else:
@@ -613,10 +803,10 @@ def main():
             g['lr'] = BASE_LR_ACTOR * scale
 
         # ===== KL 迟滞状态机：决定是否冻结/解冻 actor =====
-        if np.isfinite(report_kl):
-            if report_kl > KL_HALT:
+        if np.isfinite(safe_kl):
+            if safe_kl > KL_HALT:
                 halt_hits += 1; resume_hits = 0
-            elif report_kl < KL_RESUME:
+            elif safe_kl < KL_RESUME:
                 resume_hits += 1; halt_hits = 0
             else:
                 halt_hits = 0; resume_hits = 0
@@ -633,7 +823,6 @@ def main():
         if actor_frozen:
             freeze_steps += 1
             if freeze_steps >= 8:  # 连续冻结过久则增强回拉
-                # trainer.kl_ctl = float(min(2.0, trainer.kl_ctl * 1.5))
                 trainer.kl_ctl = float(min(1.2, trainer.kl_ctl * 1.2))
                 for g in opt_a.param_groups:
                     g['lr'] = max(BASE_LR_ACTOR * 0.4, 6e-7)
@@ -658,7 +847,6 @@ def main():
                     ptdtype=None, micro_batch_size=getattr(trainer, "mb_values", 1), detach_hidden=True
                 )  # [B, T]
                 values_new = values_full[:, 1:]  # 对齐 action 轴
-                # Huber value loss（更稳）
                 v_loss_tok = torch.nn.functional.huber_loss(
                     values_new, exp.returns, delta=1.0, reduction='none'
                 )
@@ -674,16 +862,14 @@ def main():
             KL_EPOCH_DROP = 1.10
             LOW_EPOCH = 1
             HIGH_EPOCH = 2
-            POLICY_EPOCHS = LOW_EPOCH if (np.isfinite(report_kl) and report_kl > KL_EPOCH_DROP) else HIGH_EPOCH
+            POLICY_EPOCHS = LOW_EPOCH if (np.isfinite(safe_kl) and safe_kl > KL_EPOCH_DROP) else HIGH_EPOCH
 
-            # 低 KL + 几乎不 clip → 小幅加油
             if (not actor_frozen) and (iter_num > iter_start + 4) \
-               and np.isfinite(report_kl) and (report_kl < 0.25) and (clip_frac < 0.01):
+               and np.isfinite(safe_kl) and (safe_kl < 0.25) and (clip_frac < 0.01):
                 POLICY_EPOCHS = 3
                 for g in opt_a.param_groups:
                     g['lr'] = min(BASE_LR_ACTOR * 1.2, 5e-6)
 
-            mb_logits = getattr(trainer, "mb_logits", getattr(trainer, "mb_size_logits", 1))
             for _ in range(POLICY_EPOCHS):
                 for exp in experiences:
                     out = trainer.train_on_experience(exp, use_token_entropy=use_token_entropy)
@@ -696,17 +882,26 @@ def main():
             mean_p = float(np.mean(pl)) if pl else 0.0
             mean_v = float(np.mean(vl)) if vl else None
 
-        # 固定评测集
-        r_eval_raw = float("nan")
+        # 固定评测集：保留greedy，同时新增sampled（与rollout对齐）
+        # r_eval_raw     = float("nan")  # greedy口径（旧字段，保持原名）
+        r_eval_sampled = float("nan")  # 新增：采样口径
         if (iter_num % EVAL_LOG_EVERY == 0) and _is_master(ddp) and len(EVAL_PROMPT_IDS) > 0:
+            # try:
+            #     r_eval_raw = eval_fixed_raw_reward(
+            #         actor_model=raw_actor, gpt2_tok=tok, eval_prompt_ids=EVAL_PROMPT_IDS,
+            #         reward_tokenizer=reward_tokenizer, reward_model=reward_model,
+            #         block_size=block_size, max_new_eval=min(SGLANG_MAX_NEW, 64)
+            #     )
+            # except Exception:
+            #     r_eval_raw = float("nan")
             try:
-                r_eval_raw = eval_fixed_raw_reward(
+                r_eval_sampled = eval_fixed_raw_reward_sampled(
                     actor_model=raw_actor, gpt2_tok=tok, eval_prompt_ids=EVAL_PROMPT_IDS,
                     reward_tokenizer=reward_tokenizer, reward_model=reward_model,
-                    block_size=block_size, max_new_eval=min(SGLANG_MAX_NEW, 128)
+                    block_size=block_size, max_new_eval=min(SGLANG_MAX_NEW, 64)
                 )
             except Exception:
-                r_eval_raw = float("nan")
+                r_eval_sampled = float("nan")
 
         # 日志 & ckpt（主进程）
         if (iter_num % EVAL_LOG_EVERY == 0) and _is_master(ddp):
@@ -733,8 +928,8 @@ def main():
             core = (
                 f"[iter {iter_num:4d}] "
                 f"p={mean_p:.4f} " + (f"v={mean_v:.4f} " if mean_v is not None else "") +
-                f"kl={report_kl:.6f} r_raw={r_raw:.4f} r_raw_ema={r_raw_ema:.4f} "
-                f"r_ctr={r_ctr:.4f} r_shp={r_shaped:.4f} r_eval_raw={r_eval_raw:.4f} "
+                f"kl={report_kl:.6f} safe_kl={safe_kl:.6f} r_raw={r_raw:.4f} r_raw_ema={r_raw_ema:.4f} "
+                f"r_ctr={r_ctr:.4f} r_shp={r_shaped:.4f} r_eval_samp={r_eval_sampled:.4f} "
                 f"clip={clip_frac:.3f} akl_pi={approx_kl_pi:.4f} H={entropy_tok:.3f} "
                 f"v_mae={v_mae:.4f} ev={explained_var:.3f} pool={pool_est}"
                 f"| sel_tok={sel_tokens} adv|={adv_abs_m:.3e} "
@@ -749,12 +944,12 @@ def main():
             with open(METRICS_CSV, "a") as f:
                 if hdr:
                     f.write(
-                        "iter,p_loss,v_loss,avg_kl,r_raw,r_raw_ema,r_ctr,r_shp,r_eval_raw,"
+                        "iter,p_loss,v_loss,avg_kl,safe_kl,r_raw,r_raw_ema,r_ctr,r_shp,r_eval_samp,"
                         "clip_frac,approx_kl_pi,entropy,v_mae,explained_var,pool_est,age_med,age_p90,lr\n"
                     )
                 f.write(
                     f"{iter_num},{mean_p},{'' if mean_v is None else mean_v},"
-                    f"{report_kl},{r_raw},{r_raw_ema},{r_ctr},{r_shaped},{r_eval_raw},"
+                    f"{report_kl},{safe_kl},{r_raw},{r_raw_ema},{r_ctr},{r_shaped},{r_eval_sampled},"
                     f"{clip_frac},{approx_kl_pi},{entropy_tok},{v_mae},{explained_var},"
                     f"{pool_est},{age_med},{age_p90},{cur_lr}\n"
                 )
@@ -769,10 +964,11 @@ def main():
 
             if DEBUG_SAMPLE_EVERY and (iter_num % DEBUG_SAMPLE_EVERY == 0) and samples.seqs.size(0) > 0:
                 try:
-                    i0 = int(torch.randint(0, samples.seqs.size(0), (1,)).item())
+                    B = samples.seqs.size(0)
+                    i0 = int(torch.randint(0, B, (1,)).item())
                     L0 = int(samples.attention_mask[i0].sum().item())
-                    txt0 = tok.decode(samples.seqs[i0, :L0].detach().cpu()).replace("\n"," ")
-                    r0 = experiences[0].reward[i0].item() if isinstance(experiences, list) and len(experiences)>0 else float("nan")
+                    txt0 = tok.decode(samples.seqs[i0, :L0].detach().cpu()).replace("\n", " ")
+                    r0 = float(experiences[i0].reward[0].item())
                     print(f"[sample] reward={r0:.4f} text={txt0[:200]}", flush=True)
                 except Exception as e:
                     print(f"[sample] skip(print) due to error: {e}", flush=True)
@@ -781,4 +977,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

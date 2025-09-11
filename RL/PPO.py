@@ -153,34 +153,108 @@ class PPOTrainer:
     # -------------------------
     # helper: decode -> 奖励
     # -------------------------
+    # @torch.no_grad()
+    # def _decode_texts_and_score(self, seqs: torch.Tensor, attn: torch.Tensor) -> torch.Tensor:
+    #     """
+    #     将 batch 内每条样本按有效长度 decode，并送入 reward model。
+    #     返回 shape [B] 的句级 raw 奖励（logits）。
+    #     """
+    #     B = seqs.size(0)
+    #     texts = []
+    #     for i in range(B):
+    #         L_i = int(attn[i].sum().item())
+    #         ids = seqs[i, :L_i].detach().cpu().tolist()
+    #         if hasattr(self.actor_tok, "decode"):
+    #             raw = self.actor_tok.decode(ids)
+    #         else:
+    #             raw = self.actor_tok.batch_decode([ids])[0]
+    #         txt = normalize_for_reward(raw, reward_tokenizer=self.reward_tok)
+    #         texts.append(txt)
+
+    #     toks = self.reward_tok(
+    #         texts, padding=True, truncation=True, max_length=1024, return_tensors="pt"
+    #     )
+    #     outs = self.reward_model(**{k: v for k, v in toks.items()})
+    #     logits = getattr(outs, "logits", None)
+    #     if logits is None:
+    #         return torch.zeros(seqs.size(0), dtype=torch.float32, device=self.device)
+    #     if logits.dim() == 2 and logits.size(-1) == 1:
+    #         logits = logits.squeeze(-1)
+    #     return logits.detach().to(self.device).float()
+
+    # @torch.no_grad()
+    # def _decode_responses_and_score(self, seqs: torch.Tensor,
+    #                                 attention_mask: torch.Tensor,
+    #                                 action_mask: torch.Tensor) -> torch.Tensor:
+    #     """
+    #     仅将 response 段 decode 后送入 reward model。
+    #     返回 shape [B] 的句级 raw 奖励（logits）。
+    #     """
+    #     B, T = seqs.size()
+    #     texts = []
+    #     for i in range(B):
+    #         # 有效长度（避免读到右侧 pad）
+    #         L_i = int(attention_mask[i].sum().item())
+    #         am  = action_mask[i, :L_i]              # 只看有效区
+    #         if am.sum() == 0:
+    #             # 没有响应 token，给一个空响应占位（也可直接设为很小常数）
+    #             texts.append("")
+    #             continue
+    #         # 响应区间：从第一个 1 到最后一个 1（含）
+    #         idx = (am > 0).nonzero(as_tuple=False).squeeze(-1)
+    #         s, e = int(idx[0].item()), int(idx[-1].item())
+    #         resp_ids = seqs[i, s:e+1].detach().cpu().tolist()
+    
+    #         if hasattr(self.actor_tok, "decode"):
+    #             raw = self.actor_tok.decode(resp_ids)
+    #         else:
+    #             raw = self.actor_tok.batch_decode([resp_ids])[0]
+    
+    #         txt = normalize_for_reward(raw, reward_tokenizer=self.reward_tok)
+    #         texts.append(txt)
+    
+    #     toks = self.reward_tok(texts, padding=True, truncation=True, max_length=1024, return_tensors="pt")
+    #     outs = self.reward_model(**{k: v for k, v in toks.items()})
+    #     logits = getattr(outs, "logits", None)
+    #     if logits is None:
+    #         return torch.zeros(B, dtype=torch.float32, device=self.device)
+    #     if logits.dim() == 2 and logits.size(-1) == 1:
+    #         logits = logits.squeeze(-1)
+    #     return logits.detach().to(self.device).float()
+
     @torch.no_grad()
-    def _decode_texts_and_score(self, seqs: torch.Tensor, attn: torch.Tensor) -> torch.Tensor:
+    def _decode_dialogue_and_score(self, seqs: torch.Tensor,
+                                   attention_mask: torch.Tensor) -> torch.Tensor:
         """
-        将 batch 内每条样本按有效长度 decode，并送入 reward model。
-        返回 shape [B] 的句级 raw 奖励（logits）。
+        解码到有效长度（含 Human: ... + Assistant: + response），
+        再送入奖励模型。返回 [B] logits。
         """
-        B = seqs.size(0)
+        B, T = seqs.size()
         texts = []
         for i in range(B):
-            L_i = int(attn[i].sum().item())
+            L_i = int(attention_mask[i].sum().item())
             ids = seqs[i, :L_i].detach().cpu().tolist()
             if hasattr(self.actor_tok, "decode"):
                 raw = self.actor_tok.decode(ids)
             else:
                 raw = self.actor_tok.batch_decode([ids])[0]
+            # 规整成 RM 友好的模板，并去掉替换字符
             txt = normalize_for_reward(raw, reward_tokenizer=self.reward_tok)
+            txt = txt.replace("\ufffd", "")  # 去掉 U+FFFD
+            # 兜底：确保有 Human/Assistant 标签
+            if "Assistant:" not in txt and "Human:" in txt:
+                txt = txt.rstrip() + "\n\nAssistant:"
             texts.append(txt)
-
-        toks = self.reward_tok(
-            texts, padding=True, truncation=True, max_length=1024, return_tensors="pt"
-        )
+    
+        toks = self.reward_tok(texts, padding=True, truncation=True, max_length=1024, return_tensors="pt")
         outs = self.reward_model(**{k: v for k, v in toks.items()})
         logits = getattr(outs, "logits", None)
         if logits is None:
-            return torch.zeros(seqs.size(0), dtype=torch.float32, device=self.device)
+            return torch.zeros(B, dtype=torch.float32, device=self.device)
         if logits.dim() == 2 and logits.size(-1) == 1:
             logits = logits.squeeze(-1)
         return logits.detach().to(self.device).float()
+
 
     # -------------------------
     # Step 1: rollouts -> Experience
@@ -200,6 +274,13 @@ class PPOTrainer:
         attn = samples.attention_mask.to(self.device)
         amsk = samples.action_mask.to(self.device)
 
+        # action_mask 对齐 seqs
+        assert amsk.size(1) == seqs.size(1)
+        # KL/损失用的 mask_tgt = action_mask[:, 1:]
+        mask_tgt = amsk[:, 1:]
+        assert int(mask_tgt.sum().item()) == int(samples.num_actions.sum().item())
+
+
         # 1) actor/ref token-logprobs（对齐 response 时间轴；float32 更稳）
         lp_actor_full, lp_ref_full, mask_target = compute_actor_ref_logprobs(
             self.actor, self.ref, seqs, amsk, self.device_type,
@@ -213,6 +294,7 @@ class PPOTrainer:
         # 2) 计算“报告用”的 KL（温和夹紧防止日志溢出）
         log_ratio_rep = (lp_actor_full - lp_ref_full).clamp_(-8.0, 8.0)
         k3_report = torch.expm1(log_ratio_rep) - log_ratio_rep  # k3=exp(Δ)-1-Δ ≥ 0
+        k3_report = torch.clamp(k3_report, 0.0, 50.0)
         report_kl = float(masked_mean(k3_report * mask_target, mask_target.float()).detach().item())
 
         # 2') 训练/塑形用 KL：Δlogp 先夹紧，再用 expm1 计算 k3，并对 k3 可再夹顶
@@ -225,6 +307,11 @@ class PPOTrainer:
             k3 = torch.clamp(k3, 0.0, self.k3_cap)
         k3 = k3 * mask_target  # 仅 action 轴
 
+        # 新增：safe_kl，用训练同款的 k3 统计均值
+        denom = mask_target.sum(dim=1).clamp_min(1e-8).float()
+        safe_kl_seq = k3.sum(dim=1) / denom
+        safe_kl = float(safe_kl_seq.mean().detach().item())
+
         # 3) critic 值函数（完整时间轴，随后按 action 轴裁切）
         values_full, _ = compute_values_on_response(
             self.actor, self.critic, seqs, amsk, self.device_type,
@@ -234,7 +321,9 @@ class PPOTrainer:
         action_mask = mask_target
 
         # 4) reward model（句级 raw 奖励）
-        r_seq = self._decode_texts_and_score(seqs, attn)   # [B]
+        # r_seq = self._decode_texts_and_score(seqs, attn)   # [B]
+        # r_seq = self._decode_responses_and_score(seqs, attn, amsk)
+        r_seq = self._decode_dialogue_and_score(seqs, attn)
         r_raw_mean = float(r_seq.mean().detach().item())
 
         # 5) 均匀摊 + KL 形状惩罚（使用已夹紧的 k3）
@@ -256,18 +345,33 @@ class PPOTrainer:
         )  # [B, T-1]
 
         # 打包 Experience（单条，含整 batch）
-        experiences = [Experience(
-            seqs=seqs,
-            action_log_probs=lp_actor_full.detach(),
-            values=values.detach(),
-            returns=returns.detach(),
-            advantages=advantages.detach(),
-            attention_mask=attn,
-            action_mask=action_mask,
-            reward=r_seq.detach(),
-            num_actions=action_mask.sum(dim=1).to(torch.long),
-            kl=k3_report.detach(),  # 报告用 KL
-        )]
+        # experiences = [Experience(
+        #     seqs=seqs,
+        #     action_log_probs=lp_actor_full.detach(),
+        #     values=values.detach(),
+        #     returns=returns.detach(),
+        #     advantages=advantages.detach(),
+        #     attention_mask=attn,
+        #     action_mask=action_mask,
+        #     reward=r_seq.detach(),
+        #     num_actions=action_mask.sum(dim=1).to(torch.long),
+        #     kl=k3_report.detach(),  # 报告用 KL
+        # )]
+        experiences = []
+        B = seqs.size(0)
+        for i in range(B):
+            experiences.append(Experience(
+                seqs=seqs[i:i+1],
+                action_log_probs=lp_actor_full[i:i+1].detach(),
+                values=values[i:i+1].detach(),
+                returns=returns[i:i+1].detach(),
+                advantages=advantages[i:i+1].detach(),
+                attention_mask=attn[i:i+1],
+                action_mask=action_mask[i:i+1],
+                reward=r_seq[i:i+1].detach(),
+                num_actions=action_mask[i:i+1].sum(dim=1).to(torch.long),
+                kl=k3_report[i:i+1].detach(),
+            ))
 
         # ====== 额外统计（与主脚本日志字段对齐）======
         with torch.no_grad():
@@ -298,7 +402,7 @@ class PPOTrainer:
             "explained_var": float(explained_var),
         })
 
-        return experiences, report_kl, r_raw_mean, r_shaped_mean, r_centered_mean
+        return experiences, report_kl, r_raw_mean, r_shaped_mean, r_centered_mean, safe_kl
 
     # -------------------------
     # Step 2: train on one Experience (actor + critic)
@@ -315,14 +419,15 @@ class PPOTrainer:
         old_values = exp.values
         adv = exp.advantages
 
-        # 归一化优势（仅在 action 区间）
+        # 归一化优势（逐样本、仅 action 区间）
         with torch.no_grad():
-            denom = exp.action_mask.sum().clamp_min(1e-8)
-            mean_adv = (adv * exp.action_mask).sum() / denom
-            var_adv  = (((adv - mean_adv)**2) * exp.action_mask).sum() / denom
-            std_adv  = var_adv.sqrt().clamp_min(1e-6)
-        adv = (adv - mean_adv) / std_adv
-        adv = adv.clamp_(-5.0, 5.0)
+            m = action_mask.float()                                 # [B, T]
+            denom = m.sum(dim=1, keepdim=True).clamp_min(1e-8)      # [B, 1]
+            mean = (adv * m).sum(dim=1, keepdim=True) / denom       # [B, 1]
+            var  = (((adv - mean) ** 2) * m).sum(dim=1, keepdim=True) / denom
+            std  = var.sqrt().clamp_min(1e-6)
+            adv.copy_(((adv - mean) / std).clamp_(-5.0, 5.0))
+
 
         # ===== Actor update =====
         self.actor.train()
