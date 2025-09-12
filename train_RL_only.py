@@ -38,6 +38,7 @@ use_ppo = True
 use_grpo = False
 use_dapo  = False
 use_token_entropy = False        # 开：逐 token 熵正则
+ENT_MASK_KEEP=0.2
 
 # ================== IO / runtime ==================
 out_dir = "/root/autodl-tmp/Results"
@@ -596,17 +597,42 @@ def main():
             entropy_coef=entropy_coef,
             max_grad_norm=1.0,
             vf_clip=0.2,
+            # use_token_entropy=use_token_entropy,
+            # ent_keep_ratio=ent_keep_ratio,
         )
     elif use_grpo:
-        trainer=GRPOTrainer(actor_model=raw_actor, ref_model=ref, reward_model=reward_model,
-                            actor_tokenizer=tok, reward_tokenizer=reward_tokenizer,
-                            optimizer_actor=opt_a, group_size=4, kl_coef=0.0, clip_reward=5.0,
-                            device=dev, mb_size_logits=2)
-    else:
-        trainer=DAPOTrainer(actor_model=raw_actor, ref_model=ref, reward_model=reward_model,
-                            actor_tokenizer=tok, reward_tokenizer=reward_tokenizer,
-                            optimizer_actor=opt_a, beta=1.0, adv_norm="zscore", adv_clip=5.0, kl_coef=0.01,
-                            device=dev, mb_size_logits=2)
+        trainer = GRPOTrainer(
+            actor_model=raw_actor, ref_model=ref, reward_model=reward_model,
+            actor_tokenizer=tok, reward_tokenizer=reward_tokenizer,
+            optimizer_actor=opt_a, device=dev,
+            group_size=GRPO_GROUP_SIZE,
+            kl_coef=GRPO_KL_COEF,
+            clip_reward=GRPO_CLIP_REWARD,
+            mb_size_logits=MB_SIZE_LOGITS,
+            block_size=block_size,
+            max_new_tokens=min(SGLANG_MAX_NEW, 96),
+            # use_token_entropy=use_token_entropy,
+            # ent_keep_ratio=ent_keep_ratio,
+        )
+    elif use_dapo:
+        trainer = DAPOTrainer(
+            actor_model=raw_actor, ref_model=ref, reward_model=reward_model,
+            actor_tokenizer=tok, reward_tokenizer=reward_tokenizer,
+            optimizer_actor=opt_a,
+            device=dev,
+            group_size=group_size,
+            kl_coef=kl_coef,
+            beta=beta,
+            adv_norm=adv_norm,
+            adv_clip=adv_clip,
+            mb_size_logits=MB_SIZE_LOGITS,
+            max_new_tokens=min(DAPO_MAX_NEW, SGLANG_MAX_NEW),
+            min_resp_tokens=MIN_RESP_TOK,
+            block_size=block_size,
+            # use_token_entropy=use_token_entropy,
+            # ent_keep_ratio=ent_keep_ratio,
+        )
+
 
     # ========== 训练循环 ==========
     if _is_master(ddp) and SGLANG_ON and SGLANG_OFFLINE:

@@ -5,7 +5,7 @@ SGLANG_MODEL_PATH = "gpt2-large"
 SGLANG_SYNC_DIR = "/root/autodl-tmp/sgl_pool"
 SGLANG_ROLLOUT_TARGET = 96
 SGLANG_REFILL_BATCH = 24
-SGLANG_MAX_NEW = 64
+SGLANG_MAX_NEW = 96
 
 # ===== 补货调度阈值 =====
 ROLL_LOW_WATERMARK_FACTOR = 2
@@ -31,14 +31,13 @@ GRPO_CLIP_REWARD  = 3.0            # 组内标准化后的权重裁剪（|w|<=3�
 MB_SIZE_LOGITS    = 2              # 计算 logits 时的 micro-batch，大模型可再加大
 
 # ——PPO 专属项在 GRPO 中无效；显式设为 0 以免误读——
-ppo_clip      = 0.0                # GRPO 不用比值裁剪
-entropy_coef  = 0.0                # 默认不用熵正则（如需可开到 0.001）
 kl_ctl        = GRPO_KL_COEF       # 复用变量名，便于主循环里的自适应逻辑
 
 use_ppo  = False
 use_grpo = True
 use_dapo = False
 use_token_entropy = False
+ent_keep_ratio=0.2
 
 # ——在线新鲜样本占比——
 FRESH_RATIO = 0.5

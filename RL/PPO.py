@@ -447,7 +447,7 @@ class PPOTrainer:
         # token-entropy 子采样（只改 loss 掩码）
         if use_token_entropy:
             keep = self.ent_mask_keep if (0.0 < self.ent_mask_keep <= 1.0) else 0.25
-            sel_mask = apply_entropy_mask(logits[:, 1:, :].detach(), action_mask, keep_ratio=keep)
+            sel_mask = apply_entropy_mask(logits[:, 1:, :].detach(), action_mask, keep_ratio=ent_keep_ratio)
         else:
             sel_mask = action_mask
 
