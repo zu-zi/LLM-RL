@@ -5,27 +5,25 @@ import json
 import math
 import hashlib
 from collections import Counter
-
 import torch
 from datasets import load_dataset
 import tiktoken
 
-# ================= config =================
 # UltraFeedback：英文指令数据，适配英文 RM（如 OpenAssistant/reward-model-deberta-v3-*）
 DATASET_NAME = "openbmb/UltraFeedback"
 
-# 固定采样规模（决定 prompt.bin 的条数）
+# 固定采样规模
 FIXED_SIZE = 1024
 EVAL_SIZE  = 16
 GLOBAL_SEED = 1337
 
 # 仅裁剪“prompt”长度；与训练 block_size 要匹配
-MAX_PROMPT_TOKENS = 224
-MIN_PROMPT_TOKENS = 8
+MAX_PROMPT_TOKENS = 152
+MIN_PROMPT_TOKENS = 32
 
 # 若原始文本没有 Assistant 段，是否允许造一个空回答位（对 instruction 数据集需要）
 ALLOW_EMPTY_ASSISTANT = True
-
+   
 # 保存位置
 SAVE_DIR = os.path.dirname(__file__)
 os.makedirs(SAVE_DIR, exist_ok=True)
@@ -35,7 +33,7 @@ OUTPUT_FILE = os.path.join(SAVE_DIR, "prompt.bin")
 enc = tiktoken.get_encoding("gpt2")
 EOS_ID = enc.encode("<|endoftext|>", allowed_special={"<|endoftext|>"} )[0]
 
-# ================= helpers =================
+# 
 def _stable_hash(s: str, seed: int) -> int:
     h = hashlib.sha1((str(seed) + "§" + s).encode("utf-8")).hexdigest()
     return int(h, 16)
@@ -112,7 +110,7 @@ def _row_to_prompt(row: dict, col: str) -> str:
     else:
         return _cut_to_prompt_prefix(val)
 
-# ================= builder =================
+# 
 def collect_fixed_prompts(ds, fixed_size=FIXED_SIZE, seed=GLOBAL_SEED):
     pool = []
     seen_md5 = set()
@@ -165,7 +163,7 @@ def collect_fixed_prompts(ds, fixed_size=FIXED_SIZE, seed=GLOBAL_SEED):
 
     return prompts, token_ids, lengths
 
-# =================== main ==================
+# 
 if __name__ == "__main__":
     assert 0 < EVAL_SIZE <= FIXED_SIZE, "EVAL_SIZE must be in (0, FIXED_SIZE]"
 

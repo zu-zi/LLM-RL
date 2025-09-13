@@ -12,14 +12,14 @@ from typing import List, Dict, Optional
 import torch
 import tiktoken
 
-# sglang 可能加载较慢/偶发失败，这里按需重试
+# sglang 可能加载较慢/偶发失败，按需重试
 try:
     import sglang as sgl
 except Exception as e:
     print(f"[worker][warn] failed to import sglang: {e}", flush=True)
     sgl = None
 
-# ---------------- utils ----------------
+# utils
 TMP_SUFFIX = ".tmp"
 
 def ensure_dir(d: str):
@@ -64,7 +64,6 @@ def _load_json_list(path: Optional[str]) -> Optional[List[int]]:
 
 def load_prompts(pb_path: str):
     blob = torch.load(pb_path, map_location="cpu")
-    # 可能包含 train_indices / eval_indices（由新版 prepare.py 提供）
     return (
         blob["prompts"],          # 仅用于解码检查/回显（可选）
         blob["gpt2_token_ids"],   # List[List[int]]: prompt 的 token ids
@@ -97,7 +96,6 @@ def _is_garbage(resp: str) -> bool:
     ratio = (rep + digits + puncts) / max(len(s), 1)
     return (rep > 0) or (ratio > 0.40)
 
-# ---------------- main ----------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
@@ -105,11 +103,11 @@ def main():
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--count", type=int, default=256)       # 生成“合格样本”总数
     ap.add_argument("--max-new", type=int, default=128)     # 每条最大新 token
-    ap.add_argument("--min-resp", type=int, default=8,      # 与池默认一致：最少回复 tokens
-                    help="最短回复 token 数，过短则丢弃（默认 8）")
+    ap.add_argument("--min-resp", type=int, default=16,      # 与池默认一致：最少回复 tokens
+                    help="最短回复 token 数，过短则丢弃（默认 16）")
     ap.add_argument("--mb", type=int, default=8)            # 每批并发条数
     ap.add_argument("--seed", type=int, default=1337)
-    ap.add_argument("--block-size", type=int, default=512)  # 训练侧 block_size 对齐
+    ap.add_argument("--block-size", type=int, default=384)  # 训练侧 block_size 对齐
     ap.add_argument("--flush-interval", type=float, default=2.0)  # 秒
     ap.add_argument("--flush-batch", type=int, default=256)       # 累计到这么多就落一文件
     # sglang 采样参数（更稳的默认）
@@ -118,7 +116,7 @@ def main():
     ap.add_argument("--top-k", type=int, default=40)  # 0 表示不限
     ap.add_argument("--repetition-penalty", type=float, default=1.2)
 
-    # ===== 新增：只用训练集 / 索引来源 =====
+    # 只用训练集
     ap.add_argument("--use-only-train", action="store_true",
                     help="若给出，则仅从训练索引采样（优先使用 prompt.bin 内的 train_indices）。")
     ap.add_argument("--train-indices", type=str, default=None,
@@ -172,7 +170,7 @@ def main():
                 train_indices = sorted([i for i in all_indices if i not in eval_indices])
                 src = f"ALL - {src_eval}({len(eval_indices)})"
             else:
-                # 最后兜底：仍然使用全部（但给出警告）
+                # 兜底：仍然使用全部（但给出警告）
                 train_indices = all_indices
                 src = "ALL (fallback)"
                 print("[worker][warn] --use-only-train 给出，但没有可用的训练/评测索引；回退为用全部索引。", flush=True)
@@ -184,7 +182,7 @@ def main():
     tok = tiktoken.get_encoding("gpt2")
     eos_token = "<|endoftext|>"
 
-    # ---------- sglang 引擎：带重试 ----------
+    # sglang 引擎：带重试
     eng = None
     if sgl is None:
         print("[worker][warn] sglang not available; no generation will happen.", flush=True)

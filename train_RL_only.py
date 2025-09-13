@@ -1,5 +1,4 @@
 # train_RL_only.py
-
 import os, sys, time, random, json, subprocess, glob
 os.environ["PPO_RATIO_MIN"] = "0.75"   # 重要性采样下限更紧
 os.environ["PPO_RATIO_MAX"] = "1.25"   # 上限更紧，防止爆比值
@@ -7,6 +6,10 @@ os.environ["PPO_KL_TOKEN_CAP"] = "0.5" # 夹紧 Δlogp 幅度（配合 PPO.K3_CA
 os.environ["PPO_K3_CAP"] = "1.5"       # 对 k3 再上限，削尖峰
 os.environ["PPO_ENT_MASK_KEEP"] = "0.1"  # 熵正则子采样更保守
 os.environ["ROLL_MIN_RESP_TOKENS"]="16"
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("NANOGPT_SILENT_INIT", "1")
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")  # 降噪
 MIN_RESP_TOK = int(os.getenv("ROLL_MIN_RESP_TOKENS", "16"))
 import numpy as np
 import torch, tiktoken
@@ -26,12 +29,6 @@ from RL.common import (
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 from utils.rollout_pool import dequeue_items, estimate_size, ensure_dir
-
-# ========= 基本环境 =========
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-os.environ.setdefault("NANOGPT_SILENT_INIT", "1")
-os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")  # 降噪
 
 # ================== Core switches ==================
 use_ppo = True
@@ -86,17 +83,17 @@ SGLANG_SYNC_DIR   = "/root/autodl-tmp/sgl_pool"
 # ——保新鲜，缓解 (!stale) 与 KL 尖峰——
 SGLANG_ROLLOUT_TARGET = 96
 SGLANG_REFILL_BATCH  = 48
-SGLANG_MAX_NEW       = 48  # 从 64 → 48，先稳住 KL，后面再拉回
+SGLANG_MAX_NEW       = 48  # 先稳住 KL，后面再拉回？
 
 # 调度阈值（别让池老化）
 ROLL_LOW_WATERMARK_FACTOR = 3
 ROLL_REFILL_COUNT = 24      # 从 12 → 24，补货更积极一些
 ROLL_COOLDOWN_SEC = 18
-ROLL_MIN_FREE_MB  = 7000
+ROLL_MIN_FREE_MB  = 6000
 
 # 每个迭代保证“新鲜样本占比”（在线条数）
 FRESH_RATIO = 0.50
-POOL_STALE_WARN_SEC = 900  # >15min 打“(!stale)”提示
+POOL_STALE_WARN_SEC = 600  # 10min
 
 # ===== 统一采样口径（与 rollout_worker.py 对齐）=====
 SAMPLE_TEMPERATURE = 0.8

@@ -10,10 +10,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import amp
 
-# =========================================================
-# 数据结构
-# =========================================================
 
+# 数据结构
 @dataclass
 class Samples:
     """
@@ -64,10 +62,8 @@ class ExperienceBuffer:
     def clear(self):
         self.buffer = []
 
-# =========================================================
-# 文本归一化（奖励模型友好）
-# =========================================================
 
+# 文本归一化（奖励模型友好）
 def contains_chinese(text: str) -> bool:
     return any('\u4e00' <= c <= '\u9fff' for c in text)
 
@@ -86,10 +82,7 @@ def normalize_for_reward(text: str, reward_tokenizer=None) -> str:
     # 去除多余空白（避免奖励侧不必要差异）
     return text.strip()
 
-# =========================================================
 # Ragged → Padded（构造 Samples）
-# =========================================================
-
 def _pad_to_multiple(length: int, multiple: int) -> int:
     if multiple <= 1:
         return length
@@ -114,7 +107,7 @@ def build_samples_from_generations(
       - dict 内部直接是 Tensor：{"prompt_ids": Tensor[Ti], "full_ids": Tensor[Ti+Tj], "response_ids": Tensor[Tj]?}
       - 或 Python list[int]
 
-    右 pad 到本 batch 的最大实际长度（不超过 block_size）。
+    右 pad 到本 batch 的最大实际长度（不超过 block_size）
     仅在 response 段打 action_mask。
     """
     assert len(gens) > 0, "gens 为空"
@@ -175,10 +168,7 @@ def build_samples_from_generations(
         total_length=total_length,
     )
 
-# =========================================================
 # 显存友好：micro-batch 前向
-# =========================================================
-
 def iter_batch_indices(n_items: int, micro_batch_size: int) -> Iterable[Tuple[int, int]]:
     if micro_batch_size is None or micro_batch_size <= 0 or micro_batch_size >= n_items:
         yield 0, n_items
@@ -214,10 +204,8 @@ def model_all_logits(
         del logits_chunk
     return torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
 
-# =========================================================
-# token logprob / mask
-# =========================================================
 
+# token logprob / mask
 def token_logprobs_from_logits(
     logits: torch.Tensor,  # [B, T, V]
     seqs: torch.Tensor,    # [B, T]
@@ -231,10 +219,8 @@ def masked_mean(x: torch.Tensor, mask: torch.Tensor, eps: float = 1e-8) -> torch
     denom = mask.sum().clamp_min(eps)
     return (x * mask).sum() / denom
 
-# =========================================================
-# KL / 熵 / 值函数
-# =========================================================
 
+# KL / 熵 / 值函数
 def compute_approx_kl(
     log_probs: torch.Tensor,
     ref_log_probs: torch.Tensor,
@@ -310,10 +296,8 @@ def forward_values_via_actor(
         del h, v
     return torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
 
-# =========================================================
-# 优势/回报（GAE）
-# =========================================================
 
+# 优势/回报（GAE）
 def gae_compute(
     values: torch.Tensor,      # [B, T]
     rewards: torch.Tensor,     # [B, T] 或 [B]
@@ -368,10 +352,8 @@ def get_advantages_and_returns(
     returns, advantages = gae_compute(values, rewards, action_mask, gamma=gamma, lam=lambd)
     return advantages.detach(), returns.detach()
 
-# =========================================================
-# 便捷打包 / 奖励工具
-# =========================================================
 
+# 便捷打包 / 奖励工具
 @torch.no_grad()
 def _ref_logits(ref: nn.Module, seqs: torch.Tensor, device_type: str, micro_batch_size: int):
     return model_all_logits(ref, seqs, device_type, ptdtype=None, micro_batch_size=micro_batch_size)
@@ -465,10 +447,8 @@ def scatter_uniform_rewards(r_seq, mask_time, beta_kl=None):
     pen = beta * (k3 * m) / denom  # 与 token 级 k3 成比例分摊
     return base - pen
 
-# =========================================================
-# 诊断/统计工具（供日志打印）
-# =========================================================
 
+# 诊断/统计工具（供日志打印）
 def ratio_stats(log_ratio: torch.Tensor, mask: torch.Tensor) -> Tuple[float, float, float, float]:
     """
     给定逐 token log_ratio 和掩码，返回：
@@ -491,10 +471,8 @@ def adv_abs_mean(advantages: torch.Tensor, mask: torch.Tensor) -> float:
         denom = mask.sum().clamp_min(1.0)
         return float(a.sum().item() / denom.item())
 
-# =========================================================
-# 杂项
-# =========================================================
 
+# 杂项
 def to_device_rec(obj, device):
     if torch.is_tensor(obj):
         return obj.to(device)

@@ -19,9 +19,8 @@ from .common import (
     scatter_uniform_rewards
 )
 
-# -------------------------
+
 # helpers: env config
-# -------------------------
 def _env_float(name: str, default: float) -> float:
     try:
         return float(os.getenv(name, str(default)))
@@ -31,9 +30,8 @@ def _env_float(name: str, default: float) -> float:
 def _env_tuple_float2(name_min: str, name_max: str, dmin: float, dmax: float):
     return _env_float(name_min, dmin), _env_float(name_max, dmax)
 
-# -------------------------
+
 # helpers: numeric stability
-# -------------------------
 def _clean_logp(x: torch.Tensor, fallback: torch.Tensor = None):
     """
     Replace non-finite entries in x with corresponding entries from fallback (if given),
@@ -43,9 +41,8 @@ def _clean_logp(x: torch.Tensor, fallback: torch.Tensor = None):
         return torch.where(torch.isfinite(x), x, fallback)
     return torch.where(torch.isfinite(x), x, torch.zeros_like(x))
 
-# =========================
+
 # Critic：接收 actor 的 hidden_states（通过 forward_values_via_actor 计算）
-# =========================
 class Critic(nn.Module):
     def __init__(self, actor_like: nn.Module):
         super().__init__()
@@ -64,9 +61,8 @@ class Critic(nn.Module):
         return self.value_head(hidden_states)
 
 
-# =========================
+
 # PPO Trainer
-# =========================
 class PPOTrainer:
     def __init__(
         self,
@@ -122,7 +118,7 @@ class PPOTrainer:
         self.gae_gamma = float(gae_gamma)
         self.gae_lambda = float(gae_lambda)
 
-        # ===== 安全保险丝（可被环境变量覆盖）=====
+        # 安全保险丝（可被环境变量覆盖）
         # IS 比值硬限（在对数域夹紧；<=0 表示关闭）
         rmin, rmax = _env_tuple_float2("PPO_RATIO_MIN", "PPO_RATIO_MAX", 0.10, 10.0)
         self.ratio_min = max(0.0, rmin)
@@ -256,9 +252,7 @@ class PPOTrainer:
         return logits.detach().to(self.device).float()
 
 
-    # -------------------------
     # Step 1: rollouts -> Experience
-    # -------------------------
     @torch.no_grad()
     def evaluate_experience(self, samples: Samples):
         """
@@ -373,7 +367,7 @@ class PPOTrainer:
                 kl=k3_report[i:i+1].detach(),
             ))
 
-        # ====== 额外统计（与主脚本日志字段对齐）======
+        #额外统计（与主脚本日志字段对齐）
         with torch.no_grad():
             approx_kl_pi = float(masked_mean(k3_report * action_mask, action_mask.float()).detach().item())
 
@@ -404,9 +398,7 @@ class PPOTrainer:
 
         return experiences, report_kl, r_raw_mean, r_shaped_mean, r_centered_mean, safe_kl
 
-    # -------------------------
     # Step 2: train on one Experience (actor + critic)
-    # -------------------------
     def train_on_experience(self, exp: Experience, use_token_entropy: bool = False):
         """
         单次参数更新：返回 (policy_loss, value_loss) 两个张量（供日志打印）。
@@ -461,7 +453,7 @@ class PPOTrainer:
         else:
             ratio = torch.exp(raw_delta)
 
-        # —— 统计：ratio 分位数 / 优势规模 / 选中 token 数 —— 
+        # 统计：ratio 分位数 / 优势规模 / 选中 token 数
         with torch.no_grad():
             sel = sel_mask.float()
             rdiff = (ratio - 1.0).abs() * sel

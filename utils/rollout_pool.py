@@ -11,45 +11,13 @@ from typing import List, Dict, Optional, Tuple
 ROLL_GLOB = "roll_*.jsonl"
 TMP_SUFFIX = ".tmp"
 
-# =========================
-# 环境变量 & 策略默认值
-# =========================
+ROLL_MAX_AGE_SEC = 300          # 5 分钟 TTL
+ROLL_MIN_RESP_TOKENS = 8
+ROLL_DEDUP_PROMPT_IN_BATCH = True
+ROLL_FILE_ORDER = "mtime_desc"
+ROLL_VERBOSE = True
 
-def _get_env_int(name: str, default: int) -> int:
-    try:
-        v = int(os.getenv(name, "").strip())
-        return v
-    except Exception:
-        return default
-
-def _get_env_float(name: str, default: float) -> float:
-    try:
-        v = float(os.getenv(name, "").strip())
-        return v
-    except Exception:
-        return default
-
-def _get_env_bool(name: str, default: bool) -> bool:
-    s = os.getenv(name, "").strip().lower()
-    if s in ("1", "true", "yes", "y", "on"):
-        return True
-    if s in ("0", "false", "no", "n", "off"):
-        return False
-    return default
-
-ROLL_MAX_AGE_SEC          = _get_env_int("ROLL_MAX_AGE_SEC", 6 * 3600)  # 样本最大年龄（秒），默认 6h
-ROLL_MIN_RESP_TOKENS      = _get_env_int("ROLL_MIN_RESP_TOKENS", 8)     # 回复最少 token 数（过滤太短回复）
-ROLL_DEDUP_PROMPT_IN_BATCH= _get_env_bool("ROLL_DEDUP_PROMPT_IN_BATCH", True)  # 批内按 prompt 去重
-ROLL_VERBOSE              = _get_env_bool("ROLL_VERBOSE", False)         # 关键日志
-ROLL_FILE_ORDER           = os.getenv("ROLL_FILE_ORDER", "mtime_desc")   # mtime_desc|random|name_asc
-ROLL_SCAN_CAP_FILES       = _get_env_int("ROLL_SCAN_CAP_FILES", 100)     # 估算时最多扫描多少文件
-ROLL_APPROX_PER_FILE      = _get_env_int("ROLL_APPROX_PER_FILE", 256)    # 扫描失败时的兜底行数估计
-
-
-# =========================
 # 基础 IO
-# =========================
-
 def ensure_dir(d: str) -> None:
     os.makedirs(d, exist_ok=True)
 
@@ -96,10 +64,7 @@ def _now_ts() -> float:
     return time.time()
 
 
-# =========================
 # 校验与哈希
-# =========================
-
 def _is_int_list(x) -> bool:
     if not isinstance(x, list):
         return False
@@ -140,17 +105,14 @@ def _sanitize_item(it: dict) -> Optional[dict]:
         "pid": pid,
         "hid": hid,
     }
-    # 兼容扩展字段透传（如果你后续添加更多字段）
+    # 后续添加更多字段
     for k in ("prompt_text", "response_text"):
         if k in it:
             clean[k] = it[k]
     return clean
 
 
-# =========================
-# 写入（入队）
-# =========================
-
+# 写入
 def enqueue_items(dirpath: str, items: List[Dict]) -> str:
     """
     写入一批 JSONL（原子落盘）
@@ -193,10 +155,7 @@ def enqueue_items(dirpath: str, items: List[Dict]) -> str:
     return path
 
 
-# =========================
-# 读取（出队）
-# =========================
-
+# 读取
 def _file_order(files: List[str]) -> List[str]:
     if not files:
         return files
@@ -215,7 +174,7 @@ def _is_fresh(obj: dict, now_ts: float) -> bool:
         return True
     ts = obj.get("ts")
     if not isinstance(ts, (int, float)):
-        return True  # 没有 ts 的旧数据先放过（你也可以选择丢弃）
+        return True  # 没有 ts 的旧数据先放过/也可以选择丢弃
     age = max(0.0, now_ts - float(ts))
     return age <= float(ROLL_MAX_AGE_SEC)
 
@@ -280,7 +239,7 @@ def dequeue_items(dirpath: str, n: int) -> List[Dict]:
             return 0.0
 
         # 在文件内部也做一次排序，有利于先消费新样本
-        # 注意：这是在内存里重排，不改变原文件顺序；我们只在回写时去掉已消费/淘汰的行
+        # 是在内存里重排，不改变原文件顺序；只在回写时去掉已消费/淘汰的行
         lines_sorted = sorted(lines, key=_ts_from_line, reverse=True)
 
         for ln in lines_sorted:
@@ -359,7 +318,6 @@ def dequeue_items(dirpath: str, n: int) -> List[Dict]:
                 pass
 
     if ROLL_VERBOSE:
-        # 简要观测日志
         print(
             "[rollout_pool.dequeue] "
             f"want={want} got={len(out)} "
@@ -374,10 +332,7 @@ def dequeue_items(dirpath: str, n: int) -> List[Dict]:
     return out
 
 
-# =========================
 # 估算 & 统计
-# =========================
-
 def estimate_size(dirpath: str, approx_per_file: int = None, scan_cap_files: int = None) -> int:
     """
     估算池中“可能可用”的样本数量（粗略）：
