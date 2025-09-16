@@ -1,4 +1,4 @@
-# utils/rollout_pool.py
+# utils/rollout_pool.py  —— 可直接替换
 import os
 import json
 import uuid
@@ -11,11 +11,16 @@ from typing import List, Dict, Optional, Tuple
 ROLL_GLOB = "roll_*.jsonl"
 TMP_SUFFIX = ".tmp"
 
-ROLL_MAX_AGE_SEC = 300          # 5 分钟 TTL
-ROLL_MIN_RESP_TOKENS = 8
+# —— 池子策略（按需硬编码，别做成超参，稳定即可）——
+ROLL_MAX_AGE_SEC = 420          # 样本TTL=7分钟，保证“不陈旧”
+ROLL_MIN_RESP_TOKENS = 16       # 严一点：和训练/worker 保持一致
 ROLL_DEDUP_PROMPT_IN_BATCH = True
-ROLL_FILE_ORDER = "mtime_desc"
+ROLL_FILE_ORDER = "mtime_desc"  # 新文件优先
 ROLL_VERBOSE = True
+
+# —— 估算参数（之前代码里引用但没定义，导致异常）——
+ROLL_SCAN_CAP_FILES = 12        # 最多扫描这么多文件做估算
+ROLL_APPROX_PER_FILE = 64       # 兜底：每文件大致可用行数
 
 # 基础 IO
 def ensure_dir(d: str) -> None:
@@ -63,7 +68,6 @@ def _clean_tmp_leftovers(dirpath: str) -> None:
 def _now_ts() -> float:
     return time.time()
 
-
 # 校验与哈希
 def _is_int_list(x) -> bool:
     if not isinstance(x, list):
@@ -105,12 +109,10 @@ def _sanitize_item(it: dict) -> Optional[dict]:
         "pid": pid,
         "hid": hid,
     }
-    # 后续添加更多字段
     for k in ("prompt_text", "response_text"):
         if k in it:
             clean[k] = it[k]
     return clean
-
 
 # 写入
 def enqueue_items(dirpath: str, items: List[Dict]) -> str:
@@ -154,7 +156,6 @@ def enqueue_items(dirpath: str, items: List[Dict]) -> str:
 
     return path
 
-
 # 读取
 def _file_order(files: List[str]) -> List[str]:
     if not files:
@@ -174,7 +175,7 @@ def _is_fresh(obj: dict, now_ts: float) -> bool:
         return True
     ts = obj.get("ts")
     if not isinstance(ts, (int, float)):
-        return True  # 没有 ts 的旧数据先放过/也可以选择丢弃
+        return True
     age = max(0.0, now_ts - float(ts))
     return age <= float(ROLL_MAX_AGE_SEC)
 
@@ -192,7 +193,7 @@ def _stringify(obj: dict) -> str:
 def dequeue_items(dirpath: str, n: int) -> List[Dict]:
     """
     从池中“弹出”n 条样本（优先新鲜）：
-    - 文件顺序：默认按 mtime 逆序（新 -> 旧），可用 env 调整
+    - 文件顺序：默认按 mtime 逆序（新 -> 旧）
     - 行过滤：TTL（max_age_sec）、最小回复长度
     - 批内去重：按 hid；可选地按 pid（去重复 prompt）
     - 文件内就地消费：取走行不再放回；淘汰行直接丢弃；剩余行原子回写
@@ -231,15 +232,13 @@ def dequeue_items(dirpath: str, n: int) -> List[Dict]:
 
         keep_lines: List[str] = []
 
-        # 优先在文件内也“新鲜优先”：把行按 ts 逆序（无 ts 的排后）
+        # 文件内也“新鲜优先”：按 ts 逆序消费
         def _ts_from_line(ln: str) -> float:
             obj = _safe_parse(ln)
             if isinstance(obj, dict) and isinstance(obj.get("ts"), (int, float)):
                 return float(obj["ts"])
             return 0.0
 
-        # 在文件内部也做一次排序，有利于先消费新样本
-        # 是在内存里重排，不改变原文件顺序；只在回写时去掉已消费/淘汰的行
         lines_sorted = sorted(lines, key=_ts_from_line, reverse=True)
 
         for ln in lines_sorted:
@@ -247,38 +246,31 @@ def dequeue_items(dirpath: str, n: int) -> List[Dict]:
             cnt_scanned += 1
 
             if obj is None:
-                # 坏行：直接不放回
                 continue
 
             clean = _sanitize_item(obj)
             if clean is None:
-                # 不合格：直接不放回
                 continue
 
-            # 过滤旧样本
             if not _is_fresh(clean, now_ts):
                 cnt_dropped_stale += 1
                 continue
 
-            # 回复太短过滤
             if not _resp_len_ok(clean):
                 cnt_dropped_short += 1
                 continue
 
-            # 批内去重（hid）
             hid = clean["hid"]
             if hid in seen_hid:
                 cnt_dropped_dup_hid += 1
                 continue
 
-            # 批内按 prompt 去重（可选）
             if ROLL_DEDUP_PROMPT_IN_BATCH:
                 pid = clean["pid"]
                 if pid in seen_pid:
                     cnt_dropped_dup_pid += 1
                     continue
 
-            # 选中：加入 out
             out.append(clean)
             seen_hid.add(hid)
             if ROLL_DEDUP_PROMPT_IN_BATCH:
@@ -286,11 +278,9 @@ def dequeue_items(dirpath: str, n: int) -> List[Dict]:
             cnt_taken += 1
 
             if len(out) >= want:
-                # 剩余行全部保留（但要过滤坏行/过期行）
                 break
 
-        # 文件回写：仅保留“未被选中且仍然合格的行”
-        # 重新从原 lines 过滤（保证未排序的原始顺序被保留给后续消费）
+        # 回写：仅保留“未被选中且仍合格”的行
         for ln in lines:
             obj = _safe_parse(ln)
             if obj is None:
@@ -302,16 +292,13 @@ def dequeue_items(dirpath: str, n: int) -> List[Dict]:
                 continue
             if not _resp_len_ok(clean):
                 continue
-            # 若该行已被本次取走（按 hid 判断），则不保留
             if clean["hid"] in seen_hid:
                 continue
-            # 若批内按 prompt 去重已命中，但未来批次仍可消费，所以保留
             keep_lines.append(_stringify(clean) + "\n")
 
         try:
             _atomic_rewrite(fp, keep_lines)
         except Exception:
-            # 写回失败，尽量不阻塞主流程：尝试删除
             try:
                 os.remove(fp)
             except Exception:
@@ -331,14 +318,12 @@ def dequeue_items(dirpath: str, n: int) -> List[Dict]:
 
     return out
 
-
 # 估算 & 统计
 def estimate_size(dirpath: str, approx_per_file: int = None, scan_cap_files: int = None) -> int:
     """
     估算池中“可能可用”的样本数量（粗略）：
-    - 优先扫描一定数量的文件（默认 ROLL_SCAN_CAP_FILES）并数非空行
-    - 忽略明显坏行；对有 ts 的样本，**超过 TTL 的不计入**
-    - 扫描集得到平均行数 -> 外推剩余文件
+    - 扫描部分文件，数“不过期 & 回复足够”的行
+    - 外推剩余文件
     - 兜底：文件数 * approx_per_file
     """
     try:
@@ -364,7 +349,6 @@ def estimate_size(dirpath: str, approx_per_file: int = None, scan_cap_files: int
                         obj = _safe_parse(ln)
                         if not isinstance(obj, dict):
                             continue
-                        # 过滤过期/短回复行
                         clean = _sanitize_item(obj)
                         if clean is None:
                             continue
@@ -391,15 +375,7 @@ def estimate_size(dirpath: str, approx_per_file: int = None, scan_cap_files: int
 
 def get_pool_stats(dirpath: str) -> Dict:
     """
-    返回更详细的池统计（用于日志/监控）：
-    {
-        'files': N,
-        'candidates': 行计数（含坏行/过期前）,
-        'usable': 可用行（不过期 & 回复长度足够）,
-        'avg_age_sec': 平均年龄（可用行）,
-        'p50_age_sec': 中位数年龄（可用行）,
-        'p90_age_sec': 90 分位年龄（可用行）
-    }
+    返回更详细的池统计（用于日志/监控）。
     """
     import statistics as _st
 

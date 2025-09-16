@@ -1,4 +1,4 @@
-# run 
+<!-- # run 
 + LLM-RL
 ```
 !apt-get update
@@ -90,7 +90,7 @@ PY
 
 # 测试
 python3 /root/test_sglang_offline.py
-```
+``` -->
 # final
 ```
 apt-get update
@@ -157,10 +157,51 @@ python3 train_RL_only.py config/train_RL_PPO_0.py
 
 # python3 test_sglang.py
 ```
+
 每次开机重新执行
 export HF_ENDPOINT=https://hf-mirror.com
 
-## finetue:
++ 离线上传wandb
+```
+# 先登录（只需做一次）
+wandb login   # 输入你的 API key
+
+# 同步某个 run
+wandb sync /root/autodl-tmp/Results/wandb/run-2025xxxx_xxxxxx-*
+
+# 或一次性同步整个目录下的所有离线 runs
+wandb sync /root/autodl-tmp/Results/wandb
+```
+
++ 每次开新轮
+```
+# 可选：停掉还在跑的旧 worker
+pkill -f rollout_worker.py || true
+
+rm -f  /root/autodl-tmp/sgl_pool/roll_*.jsonl
+rm -f  /root/autodl-tmp/actor_exports/current
+rm -rf /root/autodl-tmp/actor_exports/ts_*
+mkdir -p /root/autodl-tmp/sgl_pool /root/autodl-tmp/actor_exports
+
+# 可选：新一轮想要全新日志
+rm -f /root/autodl-tmp/Results/metrics.csv
+rm -f /root/autodl-tmp/Results/rollout_logs/*.log
+
+python -u rollout_worker.py \
+  --model /root/autodl-tmp/actor_exports/current \
+  --reload-strategy realpath \
+  --prompt-bin data/RL_dataset/prompt.bin \
+  --out-dir /root/autodl-tmp/sgl_pool \
+  --count 64 --max-new 96 --block-size 256 \
+  --mb 6 --use-only-train --min-resp 16 \
+  --temperature 0.8 --top-p 0.9 --repetition-penalty 1.1 \
+  --min-free-mb 3500
+
+python3 train_RL_only.py config/train_RL_PPO_0.py
+```
+
+
+<!-- ## finetue:
 + pip install torch numpy transformers datasets tiktoken wandb tqdm
 + python data/shakespeare_char/prepare.py
 + python train.py config/finetune_yourdata.py
@@ -417,4 +458,4 @@ os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
 !python train_RL_only.py config/train_RL.py
 ```
 # sglang
-export TORCH_CUDA_ARCH_LIST="8.9"
+export TORCH_CUDA_ARCH_LIST="8.9" -->

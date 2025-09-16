@@ -1,4 +1,3 @@
-# RL/common.py
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Iterable, Union
 
@@ -11,7 +10,7 @@ import torch.nn.functional as F
 from torch import amp
 
 
-# 数据结构
+# ===================== Data structs =====================
 @dataclass
 class Samples:
     """
@@ -26,6 +25,7 @@ class Samples:
     num_actions: torch.Tensor
     response_length: torch.Tensor
     total_length: torch.Tensor
+
 
 @dataclass
 class Experience:
@@ -42,6 +42,7 @@ class Experience:
     reward: torch.Tensor
     num_actions: torch.Tensor
     kl: torch.Tensor
+
 
 class ExperienceBuffer:
     """
@@ -63,7 +64,7 @@ class ExperienceBuffer:
         self.buffer = []
 
 
-# 文本归一化（奖励模型友好）
+# ===================== Text normalization =====================
 def contains_chinese(text: str) -> bool:
     return any('\u4e00' <= c <= '\u9fff' for c in text)
 
@@ -79,10 +80,11 @@ def normalize_for_reward(text: str, reward_tokenizer=None) -> str:
     # 去掉不可打印字符
     text = "".join(c for c in text if c.isprintable())
     text = text.replace("\ufffd", "")
-    # 去除多余空白（避免奖励侧不必要差异）
+    # 去除多余空白
     return text.strip()
 
-# Ragged → Padded（构造 Samples）
+
+# ===================== Ragged -> Padded =====================
 def _pad_to_multiple(length: int, multiple: int) -> int:
     if multiple <= 1:
         return length
@@ -106,9 +108,7 @@ def build_samples_from_generations(
     兼容两种输入：
       - dict 内部直接是 Tensor：{"prompt_ids": Tensor[Ti], "full_ids": Tensor[Ti+Tj], "response_ids": Tensor[Tj]?}
       - 或 Python list[int]
-
-    右 pad 到本 batch 的最大实际长度（不超过 block_size）
-    仅在 response 段打 action_mask。
+    右 pad 到本 batch 的最大实际长度（不超过 block_size），仅在 response 段打 action_mask。
     """
     assert len(gens) > 0, "gens 为空"
 
@@ -142,7 +142,6 @@ def build_samples_from_generations(
     seqs = torch.full((B, T_max), pad_id, dtype=torch.long, device=device)
     attention_mask = torch.zeros((B, T_max), dtype=torch.long, device=device)
     action_mask    = torch.zeros((B, T_max), dtype=torch.long, device=device)
-    # 先用“原始”长度占位，最后再根据 action_mask 纠正
     response_length = torch.tensor(resp_lens, dtype=torch.long, device=device)
     total_length    = torch.tensor([min(L, T_max) for L in total_lens], dtype=torch.long, device=device)
 
@@ -168,7 +167,8 @@ def build_samples_from_generations(
         total_length=total_length,
     )
 
-# 显存友好：micro-batch 前向
+
+# ===================== Forward helpers =====================
 def iter_batch_indices(n_items: int, micro_batch_size: int) -> Iterable[Tuple[int, int]]:
     if micro_batch_size is None or micro_batch_size <= 0 or micro_batch_size >= n_items:
         yield 0, n_items
@@ -200,12 +200,9 @@ def model_all_logits(
         with ctx:
             logits_chunk, _ = model(seqs[s:e], return_all_logits=True)
         chunks.append(logits_chunk)
-        # 及时释放中间张量，避免堆叠
         del logits_chunk
     return torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
 
-
-# token logprob / mask
 def token_logprobs_from_logits(
     logits: torch.Tensor,  # [B, T, V]
     seqs: torch.Tensor,    # [B, T]
@@ -215,12 +212,14 @@ def token_logprobs_from_logits(
     tgt = seqs[:, 1:].unsqueeze(-1)                  # [B, T-1, 1]
     return torch.gather(logp, dim=-1, index=tgt).squeeze(-1).contiguous()
 
+
+# ===================== Basic math =====================
 def masked_mean(x: torch.Tensor, mask: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     denom = mask.sum().clamp_min(eps)
     return (x * mask).sum() / denom
 
 
-# KL / 熵 / 值函数
+# ===================== KL / Entropy / Critic routing =====================
 def compute_approx_kl(
     log_probs: torch.Tensor,
     ref_log_probs: torch.Tensor,
@@ -233,9 +232,7 @@ def compute_approx_kl(
     return log_ratio if action_mask is None else (log_ratio * action_mask)
 
 def kl_k3_from_logratio(log_ratio: torch.Tensor) -> torch.Tensor:
-    """
-    PPO 常用的对称 KL 近似：exp(lr) - 1 - lr
-    """
+    """ PPO 常用对称 KL 近似：exp(lr) - 1 - lr """
     return log_ratio.exp() - 1.0 - log_ratio
 
 def approx_kl_from_logprobs(
@@ -243,10 +240,6 @@ def approx_kl_from_logprobs(
     ref_logprobs: torch.Tensor,
     mask_target: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    项目原有接口：返回 KL 的 masked 均值（两者相同，兼容老代码）。
-    这里使用 k3 近似。
-    """
     lr = (actor_logprobs - ref_logprobs)
     k3 = kl_k3_from_logratio(lr)
     kl_mean = masked_mean(k3, mask_target.float())
@@ -258,18 +251,6 @@ def entropy_from_logits(logits: torch.Tensor, mask_time: torch.Tensor) -> torch.
     ent = -(probs * logp).sum(dim=-1)
     return masked_mean(ent, mask_time.float())
 
-def critic_values_from_hidden(
-    critic: nn.Module,
-    hidden_states: torch.Tensor,
-    mask_time: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    v = critic(hidden_states)
-    if v.dim() == 3 and v.size(-1) == 1:
-        v = v.squeeze(-1)
-    if mask_time is not None:
-        v = v * mask_time
-    return v
-
 def forward_values_via_actor(
     model: nn.Module,
     critic: nn.Module,
@@ -279,6 +260,9 @@ def forward_values_via_actor(
     micro_batch_size: int = 0,
     detach_hidden: bool = False,
 ) -> torch.Tensor:
+    """
+    用 actor 前传得到隐藏状态，再走 critic 分支；可选择 detach 隐藏，避免 critic 反传进 actor。
+    """
     if ptdtype is None:
         ptdtype = next(model.parameters()).dtype
     B = seqs.size(0)
@@ -297,7 +281,7 @@ def forward_values_via_actor(
     return torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
 
 
-# 优势/回报（GAE）
+# ===================== GAE / returns =====================
 def gae_compute(
     values: torch.Tensor,      # [B, T]
     rewards: torch.Tensor,     # [B, T] 或 [B]
@@ -323,7 +307,7 @@ def gae_compute(
 
     V = values
     V_next = torch.zeros_like(V)
-    V_next[:, :-1] = V[:, 1:]  # 末位 0（若 use_last_as_terminal=True，不做 bootstrap）
+    V_next[:, :-1] = V[:, 1:]  # 末位 0
 
     deltas = (rewards + gamma * V_next - V) * mask_time
 
@@ -346,14 +330,10 @@ def get_advantages_and_returns(
     gamma: float,
     lambd: float,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    参考实现接口的别名：按 response 时间轴计算 GAE。
-    """
-    returns, advantages = gae_compute(values, rewards, action_mask, gamma=gamma, lam=lambd)
-    return advantages.detach(), returns.detach()
+    return gae_compute(values, rewards, action_mask, gamma=gamma, lam=lambd)
 
 
-# 便捷打包 / 奖励工具
+# ===================== Reward / misc =====================
 @torch.no_grad()
 def _ref_logits(ref: nn.Module, seqs: torch.Tensor, device_type: str, micro_batch_size: int):
     return model_all_logits(ref, seqs, device_type, ptdtype=None, micro_batch_size=micro_batch_size)
@@ -368,11 +348,6 @@ def compute_actor_ref_logprobs(
     ptdtype: Optional[torch.dtype] = None,
     micro_batch_size: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    返回：
-      - lp_actor, lp_ref: [B, T-1] 的逐 token logprob（与 seq 对齐）
-      - mask_tgt:        [B, T-1] 的 action 区间掩码（= action_mask[:, 1:]）
-    """
     forced_dtype = ptdtype if ptdtype is not None else torch.float32
     logits_actor = model_all_logits(actor, seqs, device_type, ptdtype=forced_dtype, micro_batch_size=micro_batch_size)
     logits_ref   = model_all_logits(ref,   seqs, device_type, ptdtype=forced_dtype, micro_batch_size=micro_batch_size)
@@ -386,27 +361,6 @@ def compute_actor_ref_logprobs(
         mask_tgt = mask_tgt[:, :L]
     return lp_actor, lp_ref, mask_tgt
 
-def compute_values_on_response(
-    model: nn.Module,
-    critic: nn.Module,
-    seqs: torch.Tensor,
-    action_mask: torch.Tensor,
-    device_type: str,
-    ptdtype: Optional[torch.dtype] = None,
-    micro_batch_size: int = 0,
-    detach_hidden: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    取 actor 的 hidden 送给 critic，得到 [B, T] 的 values；
-    再对齐到 response 时间轴（外层通常会切到 [:, 1:]）。
-    """
-    values = forward_values_via_actor(
-        model, critic, seqs, device_type, ptdtype=ptdtype,
-        micro_batch_size=micro_batch_size, detach_hidden=detach_hidden
-    )
-    mask_time = action_mask.clone()
-    return values, mask_time
-
 def last_indices_from_mask(mask_time: torch.Tensor) -> torch.Tensor:
     B, T = mask_time.shape
     ar = torch.arange(T, device=mask_time.device).view(1, T)
@@ -419,7 +373,6 @@ def scatter_last_token_rewards(
 ) -> torch.Tensor:
     """
     将句级奖励散射到“最后一个 action token”，可选叠加 KL shaping。
-    用于 PPO/GRPO 的“末位奖励”范式。
     """
     B, T = mask_time.shape
     rewards_t = torch.zeros((B, T), dtype=r_seq.dtype, device=mask_time.device)
@@ -435,26 +388,21 @@ def scatter_last_token_rewards(
 
 def scatter_uniform_rewards(r_seq, mask_time, beta_kl=None):
     """
-    将句级奖励在 response 区间“均匀摊”，并可按 KL 形状惩罚分摊。
+    将句级奖励在 response 区间“均匀摊”，可选按 KL 形状分摊（此项目中默认不用）。
     """
     B, T = mask_time.shape
     m = mask_time.float()
     denom = m.sum(dim=1, keepdim=True).clamp_min(1e-8)
-    base = (r_seq.view(-1, 1) / denom) * m  # 均匀摊
+    base = (r_seq.view(-1, 1) / denom) * m
     if beta_kl is None:
         return base
     k3, beta = beta_kl
-    pen = beta * (k3 * m) / denom  # 与 token 级 k3 成比例分摊
+    pen = beta * (k3 * m) / denom
     return base - pen
 
 
-# 诊断/统计工具（供日志打印）
+# ===================== Diagnostics =====================
 def ratio_stats(log_ratio: torch.Tensor, mask: torch.Tensor) -> Tuple[float, float, float, float]:
-    """
-    给定逐 token log_ratio 和掩码，返回：
-      - rΔ 的 q50 / q90 / q99（其中 rΔ = exp(lr)-1）
-      - rΔ 的最大值
-    """
     with torch.no_grad():
         m = mask.float()
         lr = log_ratio
@@ -472,7 +420,7 @@ def adv_abs_mean(advantages: torch.Tensor, mask: torch.Tensor) -> float:
         return float(a.sum().item() / denom.item())
 
 
-# 杂项
+# ===================== Utilities =====================
 def to_device_rec(obj, device):
     if torch.is_tensor(obj):
         return obj.to(device)
@@ -524,6 +472,7 @@ def apply_entropy_mask(
         new_mask[i, selected_pos] = 1
     return new_mask
 
+
 __all__ = [
     "Samples",
     "Experience",
@@ -536,7 +485,6 @@ __all__ = [
     "kl_k3_from_logratio",
     "approx_kl_from_logprobs",
     "entropy_from_logits",
-    "critic_values_from_hidden",
     "forward_values_via_actor",
     "gae_compute",
     "get_advantages_and_returns",
