@@ -1,12 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-RL 训练主流程（适配 32GB GPU）：
-- 全局超参可被外部 .py 配置文件覆盖（运行时传该文件路径作为第一个参数）
-- 移除环境变量依赖；默认值稳健
-- 支持 W&B 日志分享（wandb_log=True 时启用）
-- sglang 离线补货：子进程生成，完成后释放显存；自动导出 actor 为 HF 目录，并通过 pointer 热重载
-"""
-
 import os, sys, time, random, json, subprocess, glob, tempfile, shutil
 from datetime import datetime
 import numpy as np
@@ -42,49 +33,51 @@ wandb_run_name        = "ppo_gpt2l_vgpu32"
 
 # 模型结构（从 gpt2-large 加载后会被覆盖为一致）
 n_layer = 12; n_head = 12; n_embd = 768
-block_size            = 256    # 与 rollout_worker 对齐（prompt≈96 + max_new≤96 余量）
+block_size            = 256    # 重要：与 rollout_worker 对齐（prompt 96 + max_new 128 余量）
 dropout               = 0.0
 bias                  = False
-init_from             = "gpt2-large"
+init_from             = "gpt2-large"   # 不再支持 resume
 
 # 训练批次
 batch_size                        = 4
-gradient_accumulation_steps       = 1   # Trainer 内部自 step，这里保持 1
+gradient_accumulation_steps       = 1   # 当前 Trainer 内部自 step，这里保持 1
 
-# PPO/优化（与“上一轮好用”口味一致）
-RL_learning_rate      = 1.7e-6
+# PPO/优化（32GB 稳健默认）
+RL_learning_rate      = 1.5e-6
 weight_decay          = 5e-3
 beta1                 = 0.9
 beta2                 = 0.95
-kl_ctl_init           = 1.2
-max_grad_norm         = 0.5
-vf_clip               = 0.1
+kl_ctl_init           = 0.7
+max_grad_norm         = 1.0
+vf_clip               = 0.2
 
 # 生成/停词（与 rollout 对齐）
-SAMPLE_TEMPERATURE    = 0.7
+SAMPLE_TEMPERATURE    = 0.8
 SAMPLE_TOP_P          = 0.9
 SAMPLE_TOP_K          = 0
 SAMPLE_REP_PENALTY    = 1.1
 SAMPLE_STOPS          = ["\nHuman:", "\n\nHuman:"]  # 不拦 "Assistant:"，避免误停
 MIN_RESP_TOK          = 16
 
-# sglang 离线池（与配置保持一致）
+# sglang 离线池
 SGLANG_ON             = True
 SGLANG_OFFLINE        = True
-SGLANG_MODEL_PATH     = "/root/autodl-tmp/actor_exports/current"  # 指向可热切换的 symlink
-SGLANG_EXPORT_BASE    = "/root/autodl-tmp/actor_exports"
-SGLANG_EXPORT_EVERY   = 20
+SGLANG_MODEL_PATH     = "gpt2-large"          # 初始生成模型（可与 actor 不同）
+# —— 热更相关（本脚本自动维护，无需手工改 txt）——
+SGLANG_EXPORT_BASE    = "/root/autodl-tmp/actor_exports"   # 导出目录的“父”路径
+# SGLANG_POINTER_FILE   = "/root/autodl-tmp/actor_current.txt"  # 指向“当前可用 HF 模型目录”的 pointer 文件
+SGLANG_EXPORT_EVERY   = 30                                   # 每多少 iter 导出一次给 sglang
 SGLANG_SYNC_DIR       = "/root/autodl-tmp/sgl_pool"
-SGLANG_MAX_NEW        = 96                    # 关键：回到 96，避免生成被过多截断
-ROLL_LOW_WATERMARK_FACTOR = 2
-SGLANG_ROLLOUT_TARGET = 200
-SGLANG_REFILL_BATCH   = 32
-ROLL_REFILL_COUNT     = 40
-ROLL_COOLDOWN_SEC     = 6
-ROLL_MIN_FREE_MB      = 2500
+SGLANG_MAX_NEW        = 128                   # 新 token 上限
+ROLL_LOW_WATERMARK_FACTOR = 3
+SGLANG_ROLLOUT_TARGET = 96
+SGLANG_REFILL_BATCH   = 48
+ROLL_REFILL_COUNT     = 24
+ROLL_COOLDOWN_SEC     = 18
+ROLL_MIN_FREE_MB      = 6000
 FRESH_RATIO           = 0.50
 POOL_STALE_WARN_SEC   = 600
-REFRESH_EVERY_BATCHES = 17
+REFRESH_EVERY_BATCHES = 30                    # worker 每处理 N 批检查一次指针
 
 # 奖励模型（EN）
 REWARD_MODEL_NAME     = "OpenAssistant/reward-model-deberta-v3-large-v2"
@@ -275,20 +268,24 @@ def export_actor_for_sglang(raw_actor, init_from, export_base: str, symlink_path
             os.remove(symlink_tmp)
     except Exception:
         pass
+    # 若目标已存在且是目录，先移除（或重命名备份）
     if os.path.exists(symlink_path) and not os.path.islink(symlink_path):
-        shutil.rmtree(symlink_path)
+        shutil.rmtree(symlink_path)  # 已 import shutil
     os.symlink(out_dir, symlink_tmp)
     os.replace(symlink_tmp, symlink_path)
 
     print(f"[export] sglang HF model updated. matched={matched}, skipped={skipped}, path={out_dir}", flush=True)
-    def _prune_exports(base, keep_last=1):
+    def _prune_exports(base, keep_last=2):
+        import os, glob
         ds = sorted([d for d in glob.glob(os.path.join(base, "ts_*")) if os.path.isdir(d)])
         for d in ds[:-keep_last]:
             try:
-                shutil.rmtree(d)
+                import shutil; shutil.rmtree(d)
                 print(f"[export][gc] remove old export: {d}")
             except Exception as e:
                 print(f"[export][gc][warn] {d}: {e}")
+    
+    # 在 export_actor_for_sglang(...) 成功后调一次：
     _prune_exports(export_base, keep_last=1)
     return out_dir
 
@@ -310,8 +307,9 @@ def _spawn_rollout_subprocess(prompt_bin_path, count, sync_dir, max_new, rollout
         "--min-resp","16",
         "--refresh-every-batches", str(int(REFRESH_EVERY_BATCHES)),
         "--reload-strategy", "realpath",
-        "--min-free-mb", str(int(ROLL_MIN_FREE_MB)),
+        "--min-free-mb", str(int(ROLL_MIN_FREE_MB)),  # ★ 加这一行
     ]
+
     logf = os.path.join(rollout_log_dir, f"rollout_{int(time.time())}.log")
     if quiet:
         print(f"[rollout] spawn (quiet, cuda) -> {logf}")
@@ -334,9 +332,46 @@ def _ema_update(prev, x, alpha=0.1):
 @torch.no_grad()
 def eval_fixed_raw_reward_sampled(actor_model, gpt2_tok, eval_prompt_ids,
                                   reward_tokenizer, reward_model,
+                                  block_size, max_new_eval=64):
+    dev = next(actor_model.parameters()).device
+    eos_id = gpt2_tok.eos_id
+    texts = []
+    was_training = actor_model.training
+    actor_model.eval()
+    try:
+        for ids in eval_prompt_ids:
+            idx = torch.tensor(ids, dtype=torch.long, device=dev).unsqueeze(0)
+            room = block_size - idx.size(1) - 1
+            if room <= 0:
+                full_ids = ids[:block_size]
+                texts.append(gpt2_tok.decode(full_ids)); continue
+            gen_len = max(8, min(int(max_new_eval), int(room)))
+            out = _decode_with_sampling(
+                actor_model, idx, gen_len, eos_id, block_size,
+                temperature=SAMPLE_TEMPERATURE, top_p=SAMPLE_TOP_P, top_k=SAMPLE_TOP_K,
+                repetition_penalty=SAMPLE_REP_PENALTY,
+                stop_strs=SAMPLE_STOPS, tokenizer_decode=gpt2_tok.decode,
+                min_resp=MIN_RESP_TOK
+            )
+            full = out[0].tolist()[:block_size]
+            texts.append(gpt2_tok.decode(full))
+    finally:
+        if was_training: actor_model.train()
+
+    texts = [normalize_for_reward(t, reward_tokenizer) for t in texts]
+    toks = reward_tokenizer(texts, padding=True, truncation=True, max_length=1024, return_tensors="pt")
+    outs = reward_model(**toks)
+    logits = getattr(outs, "logits", None)
+    if logits is None: return float("nan")
+    if logits.dim() == 2 and logits.size(-1) == 1: logits = logits.squeeze(-1)
+    return float(logits.mean().item()) if len(texts) > 0 else float("nan")
+
+@torch.no_grad()
+def eval_fixed_raw_reward_sampled(actor_model, gpt2_tok, eval_prompt_ids,
+                                  reward_tokenizer, reward_model,
                                   block_size, max_new_eval=64,
                                   mode: str = "greedy",   # "greedy" or "sample"
-                                  seeds: int = 1):
+                                  seeds: int = 1):        # mode=="sample" 时可>1
     dev = next(actor_model.parameters()).device
     eos_id = gpt2_tok.eos_id
     agg = []
@@ -362,10 +397,11 @@ def eval_fixed_raw_reward_sampled(actor_model, gpt2_tok, eval_prompt_ids,
                 gen_len = max(8, min(int(max_new_eval), int(room)))
 
                 if mode == "greedy":
+                    # 贪心：温度=0，等价于取最大概率 token
                     out = _decode_with_sampling(
                         actor_model, idx, gen_len, eos_id, block_size,
-                        temperature=1e-6, top_p=1.0, top_k=0,
-                        repetition_penalty=1.0,
+                        temperature=1e-6, top_p=1.0, top_k=0,  # 实现“近似贪心”
+                        repetition_penalty=1.0,                # 评测不引入惩罚
                         stop_strs=SAMPLE_STOPS, tokenizer_decode=gpt2_tok.decode,
                         min_resp=MIN_RESP_TOK
                     )
@@ -377,6 +413,7 @@ def eval_fixed_raw_reward_sampled(actor_model, gpt2_tok, eval_prompt_ids,
                         stop_strs=SAMPLE_STOPS, tokenizer_decode=gpt2_tok.decode,
                         min_resp=MIN_RESP_TOK
                     )
+
                 full = out[0].tolist()[:block_size]
                 texts.append(gpt2_tok.decode(full))
         finally:
@@ -391,6 +428,8 @@ def eval_fixed_raw_reward_sampled(actor_model, gpt2_tok, eval_prompt_ids,
         else:
             if logits.dim() == 2 and logits.size(-1) == 1: logits = logits.squeeze(-1)
             agg.append(float(logits.mean().item()))
+
+    # 返回均值（若 seeds>1 可再记录方差）
     return float(np.mean(agg)) if len(agg) > 0 else float("nan")
 
 
@@ -501,7 +540,7 @@ def main():
     # 奖励模型（CPU）
     print(f"[reward] loading {REWARD_MODEL_NAME} on CPU ...")
     reward_hf = AutoModelForSequenceClassification.from_pretrained(REWARD_MODEL_NAME, device_map="cpu", torch_dtype=torch.float32).eval()
-    reward_model = reward_hf.eval()
+    reward_model = reward_hf.eval()  # 修复：不再使用错误的下标语法
     reward_tokenizer=AutoTokenizer.from_pretrained(REWARD_MODEL_NAME, use_fast=True)
     try: reward_tokenizer.padding_side = "right"
     except Exception: pass
@@ -509,10 +548,6 @@ def main():
         reward_tokenizer.pad_token = reward_tokenizer.eos_token
 
     # PPO 训练器
-    # ppo_clip 等从外部 config 覆盖，这里只要求存在同名变量
-    ppo_clip       = globals().get("ppo_clip", 0.2)
-    entropy_coef   = globals().get("entropy_coef", 0.005)
-
     trainer=PPOTrainer(
         actor_model=raw_actor, ref_model=ref, reward_model=reward_model,
         critic_model=critic, actor_tokenizer=tok, reward_tokenizer=reward_tokenizer,
@@ -531,8 +566,10 @@ def main():
     if wandb_log:
         try:
             import wandb, json
-            os.environ["WANDB_MODE"] = "offline"
+            os.environ["WANDB_MODE"] = "offline"   # 离线缓存
             os.environ["WANDB_SILENT"] = "true"
+    
+            # 组装“可序列化”的扁平配置（把 list/tuple 等先 JSON 化成字符串，避免被当嵌套 dict 合并）
             cfg_for_log = {}
             white = {
                 "out_dir","eval_interval","max_iters","seed_base","compile","backend","device",
@@ -555,10 +592,14 @@ def main():
                         cfg_for_log[k] = v
                     except Exception:
                         cfg_for_log[k] = json.dumps(v, ensure_ascii=False)
+    
+            # 关键：把 config 直接传给 init，而不是再调 config.update
             wandb.init(project=wandb_project, name=wandb_run_name, dir=out_dir, config=cfg_for_log)
         except Exception as e:
             print(f"[wandb] disabled: {e}")
             wandb_log = False
+
+
 
     # ====== sglang 池启用 ======
     if master and SGLANG_ON and SGLANG_OFFLINE:
@@ -567,16 +608,12 @@ def main():
     r_raw_ema = None
     last_rollout_t = 0.0
 
-    # —— KL 迟滞控制（更稳）——
-    KL_HALT, KL_RESUME = 0.25, 0.05
-    HALT_STREAK, RESUME_STREAK = 3, 6
-    UNFREEZE_COOLDOWN_STEPS = 5  # 解冻后防抖时段
-    unfreeze_cooldown = 0
-
-    actor_frozen = False
-    halt_hits = 0; resume_hits = 0; freeze_steps = 0
-    FORCE_FRESH_STEPS = 7
-    EMERG_SHORT_GEN_STEPS = 0  # 初始化不短生成
+    # KL 迟滞控制
+    KL_HALT, KL_RESUME = 0.12, 0.08
+    HALT_STREAK, RESUME_STREAK = 2, 2
+    actor_frozen = False; halt_hits = 0; resume_hits = 0; freeze_steps = 0
+    FORCE_FRESH_STEPS = 4
+    EMERG_SHORT_GEN_STEPS = 4
     BASE_LR_ACTOR = RL_learning_rate
 
     for iter_num in range(1, max_iters+1):
@@ -622,13 +659,7 @@ def main():
             room = block_size - ids_t.size(1) - 1
             if room <= 0: return None
             max_new_cap = SGLANG_MAX_NEW
-            # 仅在冻结时压短，且只压到 64
-            if actor_frozen:
-                max_new_cap = min(max_new_cap, 64)
-            # 遇到极端 KL 才临时短几步
-            if EMERG_SHORT_GEN_STEPS > 0:
-                max_new_cap = min(max_new_cap, 64)
-
+            if use_ref or EMERG_SHORT_GEN_STEPS > 0: max_new_cap = min(max_new_cap, 32)
             out = _decode_with_sampling(
                 ref if use_ref else raw_actor, ids_t,
                 max_new_tokens=max(8, min(room, max_new_cap)),
@@ -686,60 +717,48 @@ def main():
         ppo_clip_v   = float(stats_last.get("ppo_clip", float("nan")))
         kl_ctl_now   = float(stats_last.get("kl_ctl_now", float("nan")))
 
-        # 极端 KL：才短生成 + critic-only；clip 高不再单独触发
-        if np.isfinite(report_kl) and report_kl > 1.2:
-            EMERG_SHORT_GEN_STEPS = max(EMERG_SHORT_GEN_STEPS, 3)
-
         if np.isfinite(safe_kl) and safe_kl > 1.7:
             actor_frozen = True
             FORCE_FRESH_STEPS = max(FORCE_FRESH_STEPS, 3)
             EMERG_SHORT_GEN_STEPS = max(EMERG_SHORT_GEN_STEPS, 3)
             trainer.kl_ctl = float(min(2.0, trainer.kl_ctl * 1.2))
             for g in opt_a.param_groups:
-                g['lr'] = max(RL_learning_rate * 0.25, 8e-7)
+                g['lr'] = max(BASE_LR_ACTOR * 0.25, 8e-7)
 
-        if EMERG_SHORT_GEN_STEPS > 0:
-            EMERG_SHORT_GEN_STEPS -= 1
+        if EMERG_SHORT_GEN_STEPS > 0: EMERG_SHORT_GEN_STEPS -= 1
 
         # 自适应 KL
-        kl_target = 0.2
+        kl_target = 0.25
         if np.isfinite(safe_kl):
             err = safe_kl / max(kl_target, 1e-8) - 1.0
             up = 0.05; down = 0.03
             trainer.kl_ctl *= float(np.exp(np.clip(err, -down, up)))
-            trainer.kl_ctl = float(np.clip(trainer.kl_ctl, 0.25, 2.0))
+            trainer.kl_ctl = float(np.clip(trainer.kl_ctl, 0.15, 2.0))
 
         r_raw_ema = _ema_update(r_raw_ema, r_raw, alpha=0.1)
 
         # 临时降 LR（actor）
-        KL_STOP = 1.0
+        KL_STOP = 1.5
         if np.isfinite(safe_kl):
             err = max(0.0, safe_kl / KL_STOP - 1.0)
-            scale = 1.0 / (1.0 + 2.5 * err)
-            scale = float(max(0.2, min(1.0, scale)))
+            scale = 1.0 / (1.0 + 2.0 * err)
+            scale = float(max(0.25, min(1.0, scale)))
         else:
             scale = 0.25
         for g in opt_a.param_groups:
-            g['lr'] = RL_learning_rate * scale
+            g['lr'] = BASE_LR_ACTOR * scale
 
-        # 迟滞冻结/解冻 + 防抖
+        # 迟滞冻结/解冻
         if np.isfinite(safe_kl):
-            if unfreeze_cooldown > 0:
-                unfreeze_cooldown -= 1
-            if safe_kl > KL_HALT and unfreeze_cooldown == 0:
-                halt_hits += 1; resume_hits = 0
-            elif safe_kl < KL_RESUME:
-                resume_hits += 1; halt_hits = 0
-            else:
-                halt_hits = 0; resume_hits = 0
+            if safe_kl > KL_HALT:  halt_hits += 1; resume_hits = 0
+            elif safe_kl < KL_RESUME: resume_hits += 1; halt_hits = 0
+            else: halt_hits = 0; resume_hits = 0
 
             if (not actor_frozen) and (halt_hits >= HALT_STREAK):
                 actor_frozen = True; halt_hits = 0
                 if master: print(f"[guard] freeze actor (kl={report_kl:.3f})", flush=True)
-
             if actor_frozen and (resume_hits >= RESUME_STREAK):
                 actor_frozen = False; resume_hits = 0; freeze_steps = 0
-                unfreeze_cooldown = UNFREEZE_COOLDOWN_STEPS
                 if master: print(f"[guard] unfreeze actor (kl={report_kl:.3f})", flush=True)
 
         if actor_frozen:
@@ -747,7 +766,7 @@ def main():
             if freeze_steps >= 8:
                 trainer.kl_ctl = float(min(1.2, trainer.kl_ctl * 1.2))
                 for g in opt_a.param_groups:
-                    g['lr'] = max(RL_learning_rate * 0.4, 6e-7)
+                    g['lr'] = max(BASE_LR_ACTOR * 0.4, 6e-7)
                 if master:
                     print(f"[guard] long-freeze fallback: kl_ctl={trainer.kl_ctl:.3f} actor_lr={opt_a.param_groups[0]['lr']:.2e}", flush=True)
         else:
@@ -776,11 +795,13 @@ def main():
             mean_p = 0.0; mean_v = float(np.mean(vl)) if vl else None
         else:
             # 正常 PPO（actor + critic）
-            POLICY_EPOCHS = 2
+            KL_EPOCH_DROP = 1.10
+            LOW_EPOCH, HIGH_EPOCH = 1, 2
+            POLICY_EPOCHS = LOW_EPOCH if (np.isfinite(safe_kl) and safe_kl > KL_EPOCH_DROP) else HIGH_EPOCH
             if (iter_num > 5) and np.isfinite(safe_kl) and (safe_kl < 0.25) and (clip_frac < 0.01):
                 POLICY_EPOCHS = 3
                 for g in opt_a.param_groups:
-                    g['lr'] = min(RL_learning_rate * 1.2, 5e-6)
+                    g['lr'] = min(BASE_LR_ACTOR * 1.2, 5e-6)
             for _ in range(POLICY_EPOCHS):
                 for exp in experiences:
                     out = trainer.train_on_experience(exp, use_token_entropy=False)
@@ -805,6 +826,7 @@ def main():
                 r_eval_greedy = float("nan")
 
         # ===== 日志输出（控制台 / CSV / W&B）=====
+        # response 长度统计
         resp_lengths = samples.response_length.detach().cpu().numpy().tolist()
         resp_len_stats = {
             "resp_len_min": int(np.min(resp_lengths)) if resp_lengths else 0,
