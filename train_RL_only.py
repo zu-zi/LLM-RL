@@ -75,7 +75,7 @@ SGLANG_MODEL_PATH     = "gpt2-large"          # 初始生成模型（可与 acto
 # —— 热更相关（本脚本自动维护，无需手工改 txt）——
 SGLANG_EXPORT_BASE    = "/root/autodl-tmp/actor_exports"   # 导出目录的“父”路径
 # SGLANG_POINTER_FILE   = "/root/autodl-tmp/actor_current.txt"  # 指向“当前可用 HF 模型目录”的 pointer 文件
-SGLANG_EXPORT_EVERY   = 30                                   # 每多少 iter 导出一次给 sglang
+SGLANG_EXPORT_EVERY   = 20                                   # 每多少 iter 导出一次给 sglang
 SGLANG_SYNC_DIR       = "/root/autodl-tmp/sgl_pool"
 SGLANG_MAX_NEW        = 128                   # 新 token 上限
 ROLL_LOW_WATERMARK_FACTOR = 3
@@ -621,7 +621,7 @@ def main():
     KL_HALT, KL_RESUME = 0.12, 0.08
     HALT_STREAK, RESUME_STREAK = 2, 2
     actor_frozen = False; halt_hits = 0; resume_hits = 0; freeze_steps = 0
-    FORCE_FRESH_STEPS = 4
+    FORCE_FRESH_STEPS = 7
     EMERG_SHORT_GEN_STEPS = 4
     BASE_LR_ACTOR = RL_learning_rate
 
@@ -726,6 +726,12 @@ def main():
         ppo_clip_v   = float(stats_last.get("ppo_clip", float("nan")))
         kl_ctl_now   = float(stats_last.get("kl_ctl_now", float("nan")))
 
+         # 当 report_kl 或 clip_frac 异常时，临时只训 critic 2 个 iter
+        if (np.isfinite(report_kl) and report_kl > 0.80) or (clip_frac > 0.40):
+            actor_frozen = True
+            critic_only_this_iter = True
+            FORCE_FRESH_STEPS = max(FORCE_FRESH_STEPS, 4)
+
         if np.isfinite(safe_kl) and safe_kl > 1.7:
             actor_frozen = True
             FORCE_FRESH_STEPS = max(FORCE_FRESH_STEPS, 3)
@@ -737,21 +743,21 @@ def main():
         if EMERG_SHORT_GEN_STEPS > 0: EMERG_SHORT_GEN_STEPS -= 1
 
         # 自适应 KL
-        kl_target = 0.25
+        kl_target = 0.2
         if np.isfinite(safe_kl):
             err = safe_kl / max(kl_target, 1e-8) - 1.0
             up = 0.05; down = 0.03
             trainer.kl_ctl *= float(np.exp(np.clip(err, -down, up)))
-            trainer.kl_ctl = float(np.clip(trainer.kl_ctl, 0.15, 2.0))
+            trainer.kl_ctl = float(np.clip(trainer.kl_ctl, 0.25, 2.0))
 
         r_raw_ema = _ema_update(r_raw_ema, r_raw, alpha=0.1)
 
         # 临时降 LR（actor）
-        KL_STOP = 1.5
+        KL_STOP = 1
         if np.isfinite(safe_kl):
             err = max(0.0, safe_kl / KL_STOP - 1.0)
-            scale = 1.0 / (1.0 + 2.0 * err)
-            scale = float(max(0.25, min(1.0, scale)))
+            scale = 1.0 / (1.0 + 2.5 * err)
+            scale = float(max(0.2, min(1.0, scale)))
         else:
             scale = 0.25
         for g in opt_a.param_groups:

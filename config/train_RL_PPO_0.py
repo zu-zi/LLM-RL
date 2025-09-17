@@ -47,7 +47,7 @@ SAMPLE_TOP_P       = 0.9
 SAMPLE_TOP_K       = 0
 SAMPLE_REP_PENALTY = 1.1
 SAMPLE_STOPS       = ["\nHuman:", "\n\nHuman:"]
-MIN_RESP_TOK       = 16
+MIN_RESP_TOK       = 24
 
 # -------- sglang 离线样本池 --------
 SGLANG_ON              = True
@@ -65,7 +65,7 @@ ROLL_LOW_WATERMARK_FACTOR = 2      # 低于 batch_size*2 才补
 ROLL_REFILL_COUNT         = 40     # 实际触发的小颗粒补货
 ROLL_COOLDOWN_SEC         = 6    # 两次补货最小间隔
 ROLL_MIN_FREE_MB          = 2500   # 触发前至少空闲显存（MB）
-REFRESH_EVERY_BATCHES     = 26     # worker 每 N 批检查一次指针
+REFRESH_EVERY_BATCHES     = 12     # worker 每 N 批检查一次指针
 FRESH_RATIO               = 0.5    # 训练 batch 中“在线新鲜样本”占比（更稳）
 
 # -------- 奖励模型（英文）--------
