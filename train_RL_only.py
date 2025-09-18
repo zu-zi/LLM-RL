@@ -13,9 +13,12 @@ from RL.common import (
 )
 
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, AutoModelForCausalLM
-from utils.rollout_pool import dequeue_items, estimate_size, ensure_dir
+from utils.rollout_pool import dequeue_items, dequeue_groups, estimate_size, ensure_dir
 
 # =============== 可被外部 config.py 覆盖的全局 ===============
+use_ppo  = True
+use_grpo = False
+use_dapo = False
 
 # 基本运行 & IO
 out_dir               = "/root/autodl-tmp/Results"
@@ -31,18 +34,18 @@ wandb_log             = True
 wandb_project         = "hlhf"
 wandb_run_name        = "ppo_gpt2l_vgpu32"
 
-# 模型结构（从 gpt2-large 加载后会被覆盖为一致）
+# 模型结构
 n_layer = 12; n_head = 12; n_embd = 768
-block_size            = 256    # 重要：与 rollout_worker 对齐（prompt 96 + max_new 128 余量）
+block_size            = 256
 dropout               = 0.0
 bias                  = False
-init_from             = "gpt2-large"   # 不再支持 resume
+init_from             = "gpt2-large"
 
 # 训练批次
-batch_size                        = 4
-gradient_accumulation_steps       = 1   # 当前 Trainer 内部自 step，这里保持 1
+batch_size                        = 4           # PPO：每轮样本条数；GRPO：每轮“组”数（见下文）
+gradient_accumulation_steps       = 1
 
-# PPO/优化（32GB 稳健默认）
+# PPO/优化
 RL_learning_rate      = 1.5e-6
 weight_decay          = 5e-3
 beta1                 = 0.9
@@ -50,25 +53,35 @@ beta2                 = 0.95
 kl_ctl_init           = 0.7
 max_grad_norm         = 1.0
 vf_clip               = 0.2
+ppo_clip              = 0.2
+entropy_coef          = 0.0
+
+# GRPO 相关（若外部配置未覆盖，使用本默认）
+grpo_group_size       = 4        # 每个 prompt 的候选条数
+ratio_min             = 0.75
+ratio_max_stat        = 1.25
+kl_token_cap          = 0.5
+k3_cap                = 1.5
+ent_mask_keep         = 0.20
+mb_size_logits        = 1        # logits 前向微批
+mb_size_values        = 1        # 仅 PPO 用
 
 # 生成/停词（与 rollout 对齐）
 SAMPLE_TEMPERATURE    = 0.8
 SAMPLE_TOP_P          = 0.9
 SAMPLE_TOP_K          = 0
 SAMPLE_REP_PENALTY    = 1.1
-SAMPLE_STOPS          = ["\nHuman:", "\n\nHuman:"]  # 不拦 "Assistant:"，避免误停
+SAMPLE_STOPS          = ["\nHuman:", "\n\nHuman:"]
 MIN_RESP_TOK          = 16
 
 # sglang 离线池
 SGLANG_ON             = True
 SGLANG_OFFLINE        = True
-SGLANG_MODEL_PATH     = "gpt2-large"          # 初始生成模型（可与 actor 不同）
-# —— 热更相关（本脚本自动维护，无需手工改 txt）——
-SGLANG_EXPORT_BASE    = "/root/autodl-tmp/actor_exports"   # 导出目录的“父”路径
-# SGLANG_POINTER_FILE   = "/root/autodl-tmp/actor_current.txt"  # 指向“当前可用 HF 模型目录”的 pointer 文件
-SGLANG_EXPORT_EVERY   = 30                                   # 每多少 iter 导出一次给 sglang
+SGLANG_MODEL_PATH     = "gpt2-large"
+SGLANG_EXPORT_BASE    = "/root/autodl-tmp/actor_exports"
+SGLANG_EXPORT_EVERY   = 30
 SGLANG_SYNC_DIR       = "/root/autodl-tmp/sgl_pool"
-SGLANG_MAX_NEW        = 128                   # 新 token 上限
+SGLANG_MAX_NEW        = 128
 ROLL_LOW_WATERMARK_FACTOR = 3
 SGLANG_ROLLOUT_TARGET = 96
 SGLANG_REFILL_BATCH   = 48
@@ -77,22 +90,19 @@ ROLL_COOLDOWN_SEC     = 18
 ROLL_MIN_FREE_MB      = 6000
 FRESH_RATIO           = 0.50
 POOL_STALE_WARN_SEC   = 600
-REFRESH_EVERY_BATCHES = 30                    # worker 每处理 N 批检查一次指针
+REFRESH_EVERY_BATCHES = 30
 
 # 奖励模型（EN）
 REWARD_MODEL_NAME     = "OpenAssistant/reward-model-deberta-v3-large-v2"
 
 # ===========================================================
-
 def _apply_cli_config_once():
-    """若以 `python train_RL_only.py your_cfg.py` 运行，则执行该 py 覆盖全局变量。"""
     is_main = (os.environ.get("RANK","-1") == "-1") or (os.environ.get("LOCAL_RANK") in (None,"0"))
     if is_main and len(sys.argv)>=2 and sys.argv[1].endswith(".py"):
         cfg=sys.argv[1]
         print(f"[config] Overriding with {cfg}:\n{'-'*60}\n{open(cfg,'r').read()}\n{'-'*60}")
         exec(open(cfg,"r").read(), globals(), globals())
 
-# ========= 简单 GPT-2 分词器 =========
 class GPT2Tok:
     def __init__(self):
         enc=tiktoken.get_encoding("gpt2")
@@ -106,7 +116,6 @@ class GPT2Tok:
         if torch.is_tensor(ids): ids=ids.tolist()
         return self.enc.decode(ids)
 
-# ========= 数据/固定 prompts =========
 def _load_prompts():
     pf=os.path.join(os.path.dirname(__file__),"data/RL_dataset/prompt.bin")
     print(f"Loading fixed prompts from {pf} ...")
@@ -148,7 +157,6 @@ def pack_samples(gen_list, pad_id, block_size, device):
     return Samples(seqs=seqs, attention_mask=attn, action_mask=amsk,
                    num_actions=num_actions, response_length=resp_len, total_length=total_len)
 
-# ========= 采样解码（与 rollout 完全对齐）=========
 @torch.no_grad()
 def _decode_with_sampling(model, idx, max_new_tokens, eos_id, block_size,
                           temperature=0.8, top_p=0.9, top_k=0, repetition_penalty=1.1,
@@ -199,7 +207,6 @@ def _decode_with_sampling(model, idx, max_new_tokens, eos_id, block_size,
     finally:
         if was_train: model.train()
 
-# ========= 显存/新鲜度辅助 =========
 def _cuda_free_mb(device_str="cuda"):
     try:
         if not torch.cuda.is_available():
@@ -220,20 +227,23 @@ def _pool_freshness(dir_path: str, take_last:int=50):
     except Exception:
         return 0, (float("inf"), (float("inf")))
 
-# ========= sglang 导出 + pointer 原子切换 =========
 def _atomic_write_text(path: str, text: str):
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(text.strip() + "\n")
-        f.flush()
-        os.fsync(f.fileno())
+        f.flush(); os.fsync(f.fileno())
     os.replace(tmp, path)
 
-def export_actor_for_sglang(raw_actor, init_from, export_base: str, symlink_path: str):
-    """
-    将当前 actor 导出为 HF 目录，并“原子切换” symlink 到该目录。
-    symlink_path = /root/autodl-tmp/actor_exports/current
-    """
+def export_actor_for_sglang(
+    raw_actor,
+    init_from,
+    export_base: str,
+    symlink_path: str,
+    keep_last_exports: int = 1,   # ← 只保留最新的 N 个，默认 1
+):
+    import os, glob, shutil, random
+    from datetime import datetime
+    from transformers import AutoModelForCausalLM, AutoTokenizer
     os.makedirs(export_base, exist_ok=True)
 
     # 1) 准备骨架，与 init_from 对齐
@@ -248,8 +258,7 @@ def export_actor_for_sglang(raw_actor, init_from, export_base: str, symlink_path
     matched, skipped = 0, 0
     for k in sd_tgt.keys():
         if k in sd_src and sd_tgt[k].shape == sd_src[k].shape:
-            sd_tgt[k].copy_(sd_src[k].to(sd_tgt[k].dtype))
-            matched += 1
+            sd_tgt[k].copy_(sd_src[k].to(sd_tgt[k].dtype)); matched += 1
         else:
             skipped += 1
     hf_model.eval()
@@ -268,32 +277,34 @@ def export_actor_for_sglang(raw_actor, init_from, export_base: str, symlink_path
             os.remove(symlink_tmp)
     except Exception:
         pass
-    # 若目标已存在且是目录，先移除（或重命名备份）
+    # 若目标已存在且是目录（不是符号链接），先删掉，避免占空间
     if os.path.exists(symlink_path) and not os.path.islink(symlink_path):
-        shutil.rmtree(symlink_path)  # 已 import shutil
+        shutil.rmtree(symlink_path)
     os.symlink(out_dir, symlink_tmp)
     os.replace(symlink_tmp, symlink_path)
 
     print(f"[export] sglang HF model updated. matched={matched}, skipped={skipped}, path={out_dir}", flush=True)
-    def _prune_exports(base, keep_last=2):
-        import os, glob
+
+    # 5) 仅保留最新 keep_last_exports 个 ts_* 目录（小于1时强制为1）
+    def _prune_exports(base, keep_last=1):
+        keep_last = max(int(keep_last), 1)
         ds = sorted([d for d in glob.glob(os.path.join(base, "ts_*")) if os.path.isdir(d)])
         for d in ds[:-keep_last]:
             try:
-                import shutil; shutil.rmtree(d)
+                shutil.rmtree(d)
                 print(f"[export][gc] remove old export: {d}")
             except Exception as e:
                 print(f"[export][gc][warn] {d}: {e}")
-    
-    # 在 export_actor_for_sglang(...) 成功后调一次：
-    _prune_exports(export_base, keep_last=1)
+
+    _prune_exports(export_base, keep_last=keep_last_exports)
     return out_dir
 
 
-# ========= sglang 离线补货 =========
 def _spawn_rollout_subprocess(prompt_bin_path, count, sync_dir, max_new, rollout_log_dir, quiet=True):
     ensure_dir(sync_dir)
     os.makedirs(rollout_log_dir, exist_ok=True)
+    # —— 关键：当 use_grpo=True 时，为同一 prompt 生成多条（--per-prompt）
+    per_prompt = int(globals().get("grpo_group_size", 4)) if globals().get("use_grpo", False) else 1
     cmd = [
         "python", "-u", "rollout_worker.py",
         "--model", SGLANG_MODEL_PATH,
@@ -307,9 +318,9 @@ def _spawn_rollout_subprocess(prompt_bin_path, count, sync_dir, max_new, rollout
         "--min-resp","16",
         "--refresh-every-batches", str(int(REFRESH_EVERY_BATCHES)),
         "--reload-strategy", "realpath",
-        "--min-free-mb", str(int(ROLL_MIN_FREE_MB)),  # ★ 加这一行
+        "--min-free-mb", str(int(ROLL_MIN_FREE_MB)),
+        "--per-prompt", str(per_prompt),
     ]
-
     logf = os.path.join(rollout_log_dir, f"rollout_{int(time.time())}.log")
     if quiet:
         print(f"[rollout] spawn (quiet, cuda) -> {logf}")
@@ -321,70 +332,28 @@ def _spawn_rollout_subprocess(prompt_bin_path, count, sync_dir, max_new, rollout
     if ret != 0:
         raise RuntimeError(f"rollout_worker exit with code {ret}")
 
-
 def _is_master(ddp): return (not ddp) or (os.environ.get("RANK","0") == "0")
 
 def _ema_update(prev, x, alpha=0.1):
     if prev is None or np.isnan(prev): return float(x)
     return float(alpha * x + (1.0 - alpha) * prev)
 
-# ========= 评测（采样口径，与 rollout 一致）=========
-@torch.no_grad()
-def eval_fixed_raw_reward_sampled(actor_model, gpt2_tok, eval_prompt_ids,
-                                  reward_tokenizer, reward_model,
-                                  block_size, max_new_eval=64):
-    dev = next(actor_model.parameters()).device
-    eos_id = gpt2_tok.eos_id
-    texts = []
-    was_training = actor_model.training
-    actor_model.eval()
-    try:
-        for ids in eval_prompt_ids:
-            idx = torch.tensor(ids, dtype=torch.long, device=dev).unsqueeze(0)
-            room = block_size - idx.size(1) - 1
-            if room <= 0:
-                full_ids = ids[:block_size]
-                texts.append(gpt2_tok.decode(full_ids)); continue
-            gen_len = max(8, min(int(max_new_eval), int(room)))
-            out = _decode_with_sampling(
-                actor_model, idx, gen_len, eos_id, block_size,
-                temperature=SAMPLE_TEMPERATURE, top_p=SAMPLE_TOP_P, top_k=SAMPLE_TOP_K,
-                repetition_penalty=SAMPLE_REP_PENALTY,
-                stop_strs=SAMPLE_STOPS, tokenizer_decode=gpt2_tok.decode,
-                min_resp=MIN_RESP_TOK
-            )
-            full = out[0].tolist()[:block_size]
-            texts.append(gpt2_tok.decode(full))
-    finally:
-        if was_training: actor_model.train()
-
-    texts = [normalize_for_reward(t, reward_tokenizer) for t in texts]
-    toks = reward_tokenizer(texts, padding=True, truncation=True, max_length=1024, return_tensors="pt")
-    outs = reward_model(**toks)
-    logits = getattr(outs, "logits", None)
-    if logits is None: return float("nan")
-    if logits.dim() == 2 and logits.size(-1) == 1: logits = logits.squeeze(-1)
-    return float(logits.mean().item()) if len(texts) > 0 else float("nan")
-
 @torch.no_grad()
 def eval_fixed_raw_reward_sampled(actor_model, gpt2_tok, eval_prompt_ids,
                                   reward_tokenizer, reward_model,
                                   block_size, max_new_eval=64,
-                                  mode: str = "greedy",   # "greedy" or "sample"
-                                  seeds: int = 1):        # mode=="sample" 时可>1
+                                  mode: str = "greedy",
+                                  seeds: int = 1):
     dev = next(actor_model.parameters()).device
     eos_id = gpt2_tok.eos_id
     agg = []
-
     def _set_all_seeds(base):
         import random, numpy as np, torch
         random.seed(base); np.random.seed(base); torch.manual_seed(base)
         if torch.cuda.is_available(): torch.cuda.manual_seed_all(base)
-
     for rep in range(max(1, seeds)):
         if mode == "sample":
             _set_all_seeds(1337 + rep)
-
         texts = []
         was_training = actor_model.training
         actor_model.eval()
@@ -395,13 +364,11 @@ def eval_fixed_raw_reward_sampled(actor_model, gpt2_tok, eval_prompt_ids,
                 if room <= 0:
                     texts.append(gpt2_tok.decode(ids[:block_size])); continue
                 gen_len = max(8, min(int(max_new_eval), int(room)))
-
                 if mode == "greedy":
-                    # 贪心：温度=0，等价于取最大概率 token
                     out = _decode_with_sampling(
                         actor_model, idx, gen_len, eos_id, block_size,
-                        temperature=1e-6, top_p=1.0, top_k=0,  # 实现“近似贪心”
-                        repetition_penalty=1.0,                # 评测不引入惩罚
+                        temperature=1e-6, top_p=1.0, top_k=0,
+                        repetition_penalty=1.0,
                         stop_strs=SAMPLE_STOPS, tokenizer_decode=gpt2_tok.decode,
                         min_resp=MIN_RESP_TOK
                     )
@@ -413,12 +380,10 @@ def eval_fixed_raw_reward_sampled(actor_model, gpt2_tok, eval_prompt_ids,
                         stop_strs=SAMPLE_STOPS, tokenizer_decode=gpt2_tok.decode,
                         min_resp=MIN_RESP_TOK
                     )
-
                 full = out[0].tolist()[:block_size]
                 texts.append(gpt2_tok.decode(full))
         finally:
             if was_training: actor_model.train()
-
         texts = [normalize_for_reward(t, reward_tokenizer) for t in texts]
         toks = reward_tokenizer(texts, padding=True, truncation=True, max_length=1024, return_tensors="pt")
         outs = reward_model(**toks)
@@ -428,10 +393,7 @@ def eval_fixed_raw_reward_sampled(actor_model, gpt2_tok, eval_prompt_ids,
         else:
             if logits.dim() == 2 and logits.size(-1) == 1: logits = logits.squeeze(-1)
             agg.append(float(logits.mean().item()))
-
-    # 返回均值（若 seeds>1 可再记录方差）
     return float(np.mean(agg)) if len(agg) > 0 else float("nan")
-
 
 # ============================= 主流程 =============================
 def main():
@@ -462,10 +424,7 @@ def main():
 
     # prompts
     tok = GPT2Tok()
-    (
-        PROMPTS_TEXT, PROMPT_TOKEN_IDS, EOS_ID, data_seed, PROMPT_BIN_PATH,
-        TRAIN_INDICES, EVAL_INDICES
-    ) = _load_prompts()
+    (PROMPTS_TEXT, PROMPT_TOKEN_IDS, EOS_ID, data_seed, PROMPT_BIN_PATH, TRAIN_INDICES, EVAL_INDICES) = _load_prompts()
     pad_id = tok.eos_id
 
     ALL_IDX = list(range(len(PROMPT_TOKEN_IDS)))
@@ -516,7 +475,7 @@ def main():
 
     critic=Critic(raw_actor).to(dev)
 
-    # —— 初始引导导出（让 symlink 有东西，worker 才能正常加载）——
+    # 初始导出给 sglang
     if SGLANG_ON and SGLANG_OFFLINE and (os.environ.get("RANK","0") == "0"):
         try:
             os.makedirs(os.path.dirname(SGLANG_MODEL_PATH), exist_ok=True)
@@ -524,7 +483,7 @@ def main():
         except Exception as e:
             print(f"[export][warn] initial export failed: {e}", flush=True)
 
-    # 优化器（8bit 优先）
+    # 优化器
     lr_c = max(2e-6, RL_learning_rate * 1.5)
     weight_decay_c = 1e-3
     try:
@@ -540,36 +499,57 @@ def main():
     # 奖励模型（CPU）
     print(f"[reward] loading {REWARD_MODEL_NAME} on CPU ...")
     reward_hf = AutoModelForSequenceClassification.from_pretrained(REWARD_MODEL_NAME, device_map="cpu", torch_dtype=torch.float32).eval()
-    reward_model = reward_hf.eval()  # 修复：不再使用错误的下标语法
+    reward_model = reward_hf.eval()
     reward_tokenizer=AutoTokenizer.from_pretrained(REWARD_MODEL_NAME, use_fast=True)
     try: reward_tokenizer.padding_side = "right"
     except Exception: pass
     if getattr(reward_tokenizer, "pad_token", None) is None and getattr(reward_tokenizer, "eos_token", None) is not None:
         reward_tokenizer.pad_token = reward_tokenizer.eos_token
 
-    # PPO 训练器
-    trainer=PPOTrainer(
-        actor_model=raw_actor, ref_model=ref, reward_model=reward_model,
-        critic_model=critic, actor_tokenizer=tok, reward_tokenizer=reward_tokenizer,
-        optimizer_actor=opt_a, optimizer_critic=opt_c,
-        device=dev,
-        mb_size_logits=1,
-        mb_size_values=1,
-        kl_ctl=kl_ctl_init,
-        max_grad_norm=max_grad_norm,
-        vf_clip=vf_clip,
-        ppo_clip=ppo_clip,
-        entropy_coef=entropy_coef,
-    )
+    # === 选择算法：PPO 或 GRPO ===
+    if use_ppo:
+        from RL.PPO import PPOTrainer
+        trainer = PPOTrainer(
+            actor_model=raw_actor, ref_model=ref, reward_model=reward_model,
+            critic_model=critic, actor_tokenizer=tok, reward_tokenizer=reward_tokenizer,
+            optimizer_actor=opt_a, optimizer_critic=opt_c,
+            device=dev,
+            mb_size_logits=mb_size_logits,
+            mb_size_values=mb_size_values,
+            kl_ctl=kl_ctl_init,
+            max_grad_norm=max_grad_norm,
+            vf_clip=vf_clip,
+            ppo_clip=ppo_clip,
+            entropy_coef=entropy_coef,
+        )
+    elif use_grpo:
+        from RL.GRPO import GRPOTrainer
+        trainer = GRPOTrainer(
+            actor_model=raw_actor, ref_model=ref, reward_model=reward_model,
+            actor_tokenizer=tok, reward_tokenizer=reward_tokenizer,
+            optimizer_actor=opt_a,
+            device=dev,
+            mb_size_logits=globals().get("mb_size_logits", 1),
+            group_size=globals().get("grpo_group_size", 4),
+            kl_ctl=globals().get("kl_ctl_init", 0.6),
+            ppo_clip=globals().get("ppo_clip", 0.2),
+            entropy_coef=globals().get("entropy_coef", 0.0),
+            max_grad_norm=globals().get("max_grad_norm", 1.0),
+            ratio_min=globals().get("ratio_min", 0.75),
+            ratio_max=globals().get("ratio_max_stat", 1.25),
+            kl_token_cap=globals().get("kl_token_cap", 0.5),
+            k3_cap=globals().get("k3_cap", 1.5),
+            ent_mask_keep=globals().get("ent_mask_keep", 0.20),
+        )
+    else:
+        raise RuntimeError("Please set either use_ppo=True or use_grpo=True in your config.")
 
     # W&B
     if wandb_log:
         try:
             import wandb, json
-            os.environ["WANDB_MODE"] = "offline"   # 离线缓存
+            os.environ["WANDB_MODE"] = "offline"
             os.environ["WANDB_SILENT"] = "true"
-    
-            # 组装“可序列化”的扁平配置（把 list/tuple 等先 JSON 化成字符串，避免被当嵌套 dict 合并）
             cfg_for_log = {}
             white = {
                 "out_dir","eval_interval","max_iters","seed_base","compile","backend","device",
@@ -583,23 +563,16 @@ def main():
                 "SGLANG_ROLLOUT_TARGET","SGLANG_REFILL_BATCH","SGLANG_MAX_NEW",
                 "ROLL_LOW_WATERMARK_FACTOR","ROLL_REFILL_COUNT","ROLL_COOLDOWN_SEC","ROLL_MIN_FREE_MB",
                 "REFRESH_EVERY_BATCHES","FRESH_RATIO",
-                "REWARD_MODEL_NAME"
+                "REWARD_MODEL_NAME","use_ppo","use_grpo","grpo_group_size"
             }
             for k, v in globals().items():
                 if k in white:
-                    try:
-                        json.dumps(v)
-                        cfg_for_log[k] = v
-                    except Exception:
-                        cfg_for_log[k] = json.dumps(v, ensure_ascii=False)
-    
-            # 关键：把 config 直接传给 init，而不是再调 config.update
+                    try: json.dumps(v); cfg_for_log[k] = v
+                    except Exception: cfg_for_log[k] = json.dumps(v, ensure_ascii=False)
             wandb.init(project=wandb_project, name=wandb_run_name, dir=out_dir, config=cfg_for_log)
         except Exception as e:
             print(f"[wandb] disabled: {e}")
             wandb_log = False
-
-
 
     # ====== sglang 池启用 ======
     if master and SGLANG_ON and SGLANG_OFFLINE:
@@ -621,7 +594,7 @@ def main():
         pool_est = estimate_size(SGLANG_SYNC_DIR, SGLANG_REFILL_BATCH) if (SGLANG_ON and SGLANG_OFFLINE) else -1
         n_files, (age_med, age_p90) = _pool_freshness(SGLANG_SYNC_DIR) if (SGLANG_ON and SGLANG_OFFLINE) else (0,(float("inf"),float("inf")))
 
-        # ---- 离线补货（主进程）----
+        # ---- 离线补货 ----
         if master and SGLANG_ON and SGLANG_OFFLINE:
             LOW_WATERMARK = max(batch_size * ROLL_LOW_WATERMARK_FACTOR, 8)
             if pool_est < LOW_WATERMARK:
@@ -642,19 +615,16 @@ def main():
                     if not mem_ok:  why.append(f"free_mem={free_mb}MB<{ROLL_MIN_FREE_MB}MB")
                     print(f"[rollout][skip] pool={pool_est} reasons={'+'.join(why)}", flush=True)
 
-        # ---- 取样：保证“新鲜样本占比” ----
-        want_fresh_base = max(1, int(np.ceil(FRESH_RATIO * batch_size)))
-        force_fresh = (FORCE_FRESH_STEPS > 0)
-        if actor_frozen or force_fresh:
-            want_fresh = batch_size; batch = []
-            if force_fresh: FORCE_FRESH_STEPS -= 1
-        else:
-            want_fresh = want_fresh_base
-            batch = dequeue_items(SGLANG_SYNC_DIR, batch_size - want_fresh) if (SGLANG_ON and SGLANG_OFFLINE) else []
-
-        # 在线补齐
-        def _gen_one_from_train(use_ref: bool):
-            ids = random.choice(TRAIN_PROMPT_IDS)
+        # === 取样 ===
+        # PPO：按条；GRPO：按“组”（每组 grpo_group_size 条，同 pid）
+        groups = None
+        if use_grpo and SGLANG_ON and SGLANG_OFFLINE:
+            # 先从池里取组
+            groups = dequeue_groups(SGLANG_SYNC_DIR, group_size=int(grpo_group_size), num_groups=int(batch_size))
+        # 在线补齐逻辑（PPO/GRPO 共用）
+        def _gen_one_from_train(use_ref: bool, prompt_ids=None):
+            # 当指定 prompt_ids 时，强制使用这组 prompt 生成；否则从训练集随机抽
+            ids = prompt_ids if (isinstance(prompt_ids, list) and prompt_ids) else random.choice(TRAIN_PROMPT_IDS)
             ids_t = torch.tensor(ids, dtype=torch.long, device=dev).unsqueeze(0)
             room = block_size - ids_t.size(1) - 1
             if room <= 0: return None
@@ -674,29 +644,80 @@ def main():
                 return {"prompt_ids": ids, "full_ids": out[0].tolist()}
             return None
 
-        fresh = []
-        for _ in range(want_fresh):
-            g = _gen_one_from_train(use_ref=actor_frozen)
-            if g is not None: fresh.append(g)
-        batch.extend(fresh)
+        experiences_all = []
+        report_kl = r_raw = r_shaped = r_ctr = safe_kl = float("nan")
+        stats_last = {}
+        sel_tokens = 0
 
-        while len(batch) < batch_size:
-            g = _gen_one_from_train(use_ref=actor_frozen)
-            if g is None: break
-            batch.append(g)
+        if use_grpo:
+            # GRPO：优先使用池中组，不足则在线补齐；每组分别 evaluate
+            groups = groups or []
+            # 把组数补齐到 batch_size
+            while len(groups) < int(batch_size):
+                # 随机挑一个 train prompt，生成一组
+                base_ids = random.choice(TRAIN_PROMPT_IDS)
+                g = []
+                for _ in range(int(grpo_group_size)):
+                    it = _gen_one_from_train(use_ref=actor_frozen, prompt_ids=base_ids)
+                    if it is not None: g.append(it)
+                if len(g) == int(grpo_group_size):
+                    groups.append(g)
+                else:
+                    break  # 显存不足或采样失败就先用现有组
 
-        # 打包
-        samples = pack_samples(batch, pad_id=tok.eos_id, block_size=block_size, device=torch.device(dev))
+            # 遍历每组 -> pack -> evaluate -> 累加
+            for grp in groups[:int(batch_size)]:
+                samples = pack_samples(grp, pad_id=tok.eos_id, block_size=block_size, device=torch.device(dev))
+                if int(samples.action_mask.sum().item()) == 0:
+                    continue
+                exps, rep_kl, rr, rshp, rctr, skl = trainer.evaluate_experience(samples)
+                if exps:
+                    experiences_all.extend(exps)
+                # 聚合（取均值/最后一次统计）
+                report_kl = rep_kl if np.isfinite(rep_kl) else report_kl
+                r_raw = rr if np.isfinite(rr) else r_raw
+                r_shaped = rshp if np.isfinite(rshp) else r_shaped
+                r_ctr = rctr if np.isfinite(rctr) else r_ctr
+                safe_kl = skl if np.isfinite(skl) else safe_kl
+                stats_last = getattr(trainer, "last_stats", {}) or stats_last
+                sel_tokens += int(stats_last.get("sel_tokens", 0) or 0)
 
-        # 若整批没有 response，跳过
-        if int(samples.action_mask.sum().item()) == 0:
-            if master: print(f"[iter {iter_num:4d}] skip(empty-response-batch) pool={pool_est}", flush=True)
-            continue
+            if not experiences_all:
+                if master: print(f"[iter {iter_num:4d}] skip(empty-GRPO-exps) pool={pool_est}", flush=True)
+                continue
 
-        # 评估经验（不更新参数）
-        experiences, report_kl, r_raw, r_shaped, r_ctr, safe_kl = trainer.evaluate_experience(samples)
+            trainer.last_stats = stats_last  # 让后面日志读取到
+            # 用 evaluate 汇总得到的 KL 作为本轮指标（简化处理）
+            report_kl = float(report_kl) if np.isfinite(report_kl) else float("nan")
+            safe_kl = float(safe_kl) if np.isfinite(safe_kl) else float("nan")
+        else:
+            # PPO：和原来一致
+            want_fresh_base = max(1, int(np.ceil(FRESH_RATIO * batch_size)))
+            force_fresh = (FORCE_FRESH_STEPS > 0)
+            if actor_frozen or force_fresh:
+                want_fresh = batch_size; batch = []
+                if force_fresh: FORCE_FRESH_STEPS -= 1
+            else:
+                want_fresh = want_fresh_base
+                batch = dequeue_items(SGLANG_SYNC_DIR, batch_size - want_fresh) if (SGLANG_ON and SGLANG_OFFLINE) else []
+            fresh = []
+            for _ in range(want_fresh):
+                g = _gen_one_from_train(use_ref=actor_frozen)
+                if g is not None: fresh.append(g)
+            batch.extend(fresh)
+            while len(batch) < batch_size:
+                g = _gen_one_from_train(use_ref=actor_frozen)
+                if g is None: break
+                batch.append(g)
+            samples = pack_samples(batch, pad_id=tok.eos_id, block_size=block_size, device=torch.device(dev))
+            if int(samples.action_mask.sum().item()) == 0:
+                if master: print(f"[iter {iter_num:4d}] skip(empty-response-batch) pool={pool_est}", flush=True)
+                continue
+            experiences_all, report_kl, r_raw, r_shaped, r_ctr, safe_kl = trainer.evaluate_experience(samples)
+            stats_last = getattr(trainer, "last_stats", {}) or {}
+            sel_tokens = int(stats_last.get("sel_tokens", 0) or 0)
 
-        # —— 安全保险丝 —— #
+        # —— 安全保险丝（两路通用）—— #
         critic_only_this_iter = False
         if (not np.isfinite(safe_kl)) or (safe_kl > 1.7):
             actor_frozen = True; critic_only_this_iter = True
@@ -704,18 +725,35 @@ def main():
             EMERG_SHORT_GEN_STEPS = max(EMERG_SHORT_GEN_STEPS, 3)
             if master: print(f"[guard] skip actor (abnormal KL={report_kl:.4g}) -> critic-only", flush=True)
 
+        # —— 读取上一次 step 的统计（健壮缺省，避免未绑定错误）——
         stats_last = getattr(trainer, "last_stats", {}) or {}
-        clip_frac    = float(stats_last.get("clip_frac", 0.0) or 0.0)
-        approx_kl_pi = float(stats_last.get("approx_kl_pi", float("nan")))
-        entropy_tok  = float(stats_last.get("entropy", float("nan")))
-        v_mae        = float(stats_last.get("v_mae", float("nan")))
-        explained_var= float(stats_last.get("explained_var", float("nan")))
-        ratio_qs     = stats_last.get("ratio_q50_q90_q99", (float("nan"),)*3)
-        ratio_max    = float(stats_last.get("ratio_max",  float("nan")))
-        adv_abs_m    = float(stats_last.get("adv_abs_mean", float("nan")))
-        sel_tokens   = int(stats_last.get("sel_tokens", 0))
-        ppo_clip_v   = float(stats_last.get("ppo_clip", float("nan")))
-        kl_ctl_now   = float(stats_last.get("kl_ctl_now", float("nan")))
+
+        def _as_float(x, default=float("nan")):
+            try:
+                return float(x)
+            except Exception:
+                return default
+
+        # 通用
+        clip_frac      = _as_float(stats_last.get("clip_frac", 0.0), 0.0)
+        approx_kl_pi   = _as_float(stats_last.get("approx_kl_pi"))
+        entropy_tok    = _as_float(stats_last.get("entropy"))
+        v_mae          = _as_float(stats_last.get("v_mae"))
+        explained_var  = _as_float(stats_last.get("explained_var"))
+        sel_tokens     = int(stats_last.get("sel_tokens", 0) or 0)
+        ppo_clip_v     = _as_float(stats_last.get("ppo_clip"))
+        kl_ctl_now     = _as_float(stats_last.get("kl_ctl_now"))
+        adv_abs_m      = _as_float(stats_last.get("adv_abs_mean"))
+
+        # 比率分位数与最大值
+        ratio_qs_stat = stats_last.get("ratio_q50_q90_q99")
+        if not (isinstance(ratio_qs_stat, (list, tuple)) and len(ratio_qs_stat) >= 3):
+            ratio_qs_stat = (float("nan"), float("nan"), float("nan"))
+        ratio_max_stat = _as_float(stats_last.get("ratio_max_stat"))
+
+        # GRPO 专属统计（在 PPO 下可能缺）
+        grpo_group_eff = _as_float(stats_last.get("grpo/group_eff_mean"))
+        grpo_ctr_abs   = _as_float(stats_last.get("grpo/r_center_mean_abs"), 0.0)
 
         if np.isfinite(safe_kl) and safe_kl > 1.7:
             actor_frozen = True
@@ -723,8 +761,7 @@ def main():
             EMERG_SHORT_GEN_STEPS = max(EMERG_SHORT_GEN_STEPS, 3)
             trainer.kl_ctl = float(min(2.0, trainer.kl_ctl * 1.2))
             for g in opt_a.param_groups:
-                g['lr'] = max(BASE_LR_ACTOR * 0.25, 8e-7)
-
+                g['lr'] = max(RL_learning_rate * 0.25, 8e-7)
         if EMERG_SHORT_GEN_STEPS > 0: EMERG_SHORT_GEN_STEPS -= 1
 
         # 自适应 KL
@@ -735,6 +772,7 @@ def main():
             trainer.kl_ctl *= float(np.exp(np.clip(err, -down, up)))
             trainer.kl_ctl = float(np.clip(trainer.kl_ctl, 0.15, 2.0))
 
+        # EMA 奖励
         r_raw_ema = _ema_update(r_raw_ema, r_raw, alpha=0.1)
 
         # 临时降 LR（actor）
@@ -746,40 +784,38 @@ def main():
         else:
             scale = 0.25
         for g in opt_a.param_groups:
-            g['lr'] = BASE_LR_ACTOR * scale
+            g['lr'] = RL_learning_rate * scale
 
         # 迟滞冻结/解冻
         if np.isfinite(safe_kl):
             if safe_kl > KL_HALT:  halt_hits += 1; resume_hits = 0
             elif safe_kl < KL_RESUME: resume_hits += 1; halt_hits = 0
             else: halt_hits = 0; resume_hits = 0
-
             if (not actor_frozen) and (halt_hits >= HALT_STREAK):
                 actor_frozen = True; halt_hits = 0
                 if master: print(f"[guard] freeze actor (kl={report_kl:.3f})", flush=True)
             if actor_frozen and (resume_hits >= RESUME_STREAK):
                 actor_frozen = False; resume_hits = 0; freeze_steps = 0
                 if master: print(f"[guard] unfreeze actor (kl={report_kl:.3f})", flush=True)
-
         if actor_frozen:
             freeze_steps += 1
             if freeze_steps >= 8:
                 trainer.kl_ctl = float(min(1.2, trainer.kl_ctl * 1.2))
                 for g in opt_a.param_groups:
-                    g['lr'] = max(BASE_LR_ACTOR * 0.4, 6e-7)
+                    g['lr'] = max(RL_learning_rate * 0.4, 6e-7)
                 if master:
                     print(f"[guard] long-freeze fallback: kl_ctl={trainer.kl_ctl:.3f} actor_lr={opt_a.param_groups[0]['lr']:.2e}", flush=True)
         else:
             freeze_steps = 0
 
         # === 训练 ===
-        if not experiences:
+        if not experiences_all:
             continue
 
         pl, vl = [], []
-        if actor_frozen or critic_only_this_iter:
-            # 只训 critic
-            for exp in experiences:
+        if use_ppo and (actor_frozen or critic_only_this_iter):
+            # 只训 critic（仅 PPO）
+            for exp in experiences_all:
                 critic.train(); opt_c.zero_grad(set_to_none=True)
                 values_full = forward_values_via_actor(
                     trainer.actor, trainer.critic, exp.seqs, trainer.device_type,
@@ -794,25 +830,27 @@ def main():
                 vl.append(float(v_loss.detach().item()))
             mean_p = 0.0; mean_v = float(np.mean(vl)) if vl else None
         else:
-            # 正常 PPO（actor + critic）
-            KL_EPOCH_DROP = 1.10
-            LOW_EPOCH, HIGH_EPOCH = 1, 2
-            POLICY_EPOCHS = LOW_EPOCH if (np.isfinite(safe_kl) and safe_kl > KL_EPOCH_DROP) else HIGH_EPOCH
-            if (iter_num > 5) and np.isfinite(safe_kl) and (safe_kl < 0.25) and (clip_frac < 0.01):
-                POLICY_EPOCHS = 3
-                for g in opt_a.param_groups:
-                    g['lr'] = min(BASE_LR_ACTOR * 1.2, 5e-6)
+            POLICY_EPOCHS = 2
+            if use_ppo:
+                KL_EPOCH_DROP = 1.10
+                LOW_EPOCH, HIGH_EPOCH = 1, 2
+                POLICY_EPOCHS = LOW_EPOCH if (np.isfinite(safe_kl) and safe_kl > KL_EPOCH_DROP) else HIGH_EPOCH
+                if (iter_num > 5) and np.isfinite(safe_kl) and (safe_kl < 0.25) and (clip_frac < 0.01):
+                    POLICY_EPOCHS = 3
+                    for g in opt_a.param_groups:
+                        g['lr'] = min(RL_learning_rate * 1.2, 5e-6)
             for _ in range(POLICY_EPOCHS):
-                for exp in experiences:
+                for exp in experiences_all:
                     out = trainer.train_on_experience(exp, use_token_entropy=False)
                     if isinstance(out, tuple):
-                        p, v = out; pl.append(float(p.detach().item())); vl.append(float(v.detach().item()))
+                        p, v = out; pl.append(float(p.detach().item()))
+                        if v is not None: vl.append(float(v.detach().item()))
                     else:
                         pl.append(float(out.detach().item()))
             mean_p = float(np.mean(pl)) if pl else 0.0
             mean_v = float(np.mean(vl)) if vl else None
 
-        # 评测
+        # 评测（统一贪心）
         r_eval_greedy = float("nan")
         if (iter_num % eval_interval == 0) and master and len(EVAL_PROMPT_IDS) > 0:
             try:
@@ -826,14 +864,9 @@ def main():
                 r_eval_greedy = float("nan")
 
         # ===== 日志输出（控制台 / CSV / W&B）=====
-        # response 长度统计
-        resp_lengths = samples.response_length.detach().cpu().numpy().tolist()
-        resp_len_stats = {
-            "resp_len_min": int(np.min(resp_lengths)) if resp_lengths else 0,
-            "resp_len_p50": float(np.percentile(resp_lengths, 50)) if resp_lengths else 0.0,
-            "resp_len_p90": float(np.percentile(resp_lengths, 90)) if resp_lengths else 0.0,
-            "resp_len_max": int(np.max(resp_lengths)) if resp_lengths else 0,
-        }
+        # 注意：GRPO 路径下 samples 是分组评估的，这里用 sel_tokens 累加值与 last_stats 的聚合
+        resp_len_stats = {"resp_len_min": 0, "resp_len_p50": 0.0, "resp_len_p90": 0.0, "resp_len_max": 0}
+        # PPO 路径上的统计更精确；GRPO 下若需要也可在 GRPOTrainer 内聚合到 last_stats 后由此读取
 
         if (iter_num % eval_interval == 0) and master:
             cur_lr = opt_a.param_groups[0]['lr']
@@ -841,18 +874,20 @@ def main():
             if age_med != float("inf"):
                 stale_note = f" age_med={age_med:.0f}s p90={age_p90:.0f}s"
                 if age_med > POOL_STALE_WARN_SEC: stale_note += "(!stale)"
+            algo = "PPO" if use_ppo else "GRPO"
             core = (
-                f"[iter {iter_num:4d}] p={mean_p:.4f} " + (f"v={mean_v:.4f} " if mean_v is not None else "") +
-                f"kl={report_kl:.6f} safe_kl={safe_kl:.6f} r_raw={r_raw:.4f} r_ema={r_raw_ema:.4f} "
-                f"r_ctr={r_ctr:.4f} r_shp={r_shaped:.4f} r_eval_greedy={r_eval_greedy:.4f} "
-                f"clip={clip_frac:.3f} akl_pi={approx_kl_pi:.4f} H={entropy_tok:.3f} "
-                f"v_mae={v_mae:.4f} ev={explained_var:.3f} pool={pool_est} "
-                f"| sel_tok={sel_tokens} adv|={adv_abs_m:.3e} "
-                f"rΔ q50/90/99={ratio_qs[0]:.3e}/{ratio_qs[1]:.3e}/{ratio_qs[2]:.3e} "
-                f"rΔmax={ratio_max:.3e} clip_th={ppo_clip_v:.3f} kl_ctl={kl_ctl_now:.3f} "
-                f"lr={cur_lr:.2e} "
-                f"resp_len[min/p50/p90/max]={resp_len_stats['resp_len_min']}/{resp_len_stats['resp_len_p50']:.1f}/{resp_len_stats['resp_len_p90']:.1f}/{resp_len_stats['resp_len_max']} "
-                f"{stale_note}"
+                f"[{algo}] [iter {iter_num:4d}] p={mean_p:.4f} "
+                + (f"v={mean_v:.4f} " if (use_ppo and mean_v is not None) else "")
+                + f"kl={report_kl:.6f} safe_kl={safe_kl:.6f} r_raw={r_raw:.4f} r_ema={_ema_update(None, r_raw_ema, 1.0):.4f} "
+                  f"r_ctr={r_ctr:.4f} r_shp={r_shaped:.4f} r_eval_greedy={r_eval_greedy:.4f} "
+                  f"clip={clip_frac:.3f} akl_pi={approx_kl_pi:.4f} H={entropy_tok:.3f} "
+                + (f"v_mae={v_mae:.4f} ev={explained_var:.3f} " if use_ppo else "")
+                + (f"grp_eff={grpo_group_eff:.2f} ctr_abs={grpo_ctr_abs:.3e} " if use_grpo else "")
+                + f"| sel_tok={sel_tokens} adv|={adv_abs_m:.3e} pool={pool_est} "
+                  f"rΔ q50/90/99={ratio_qs_stat[0]:.3e}/{ratio_qs_stat[1]:.3e}/{ratio_qs_stat[2]:.3e} "
+                  f"rΔmax={ratio_max_stat:.3e} clip_th={ppo_clip_v:.3f} kl_ctl={kl_ctl_now:.3f} "
+                  f"lr={cur_lr:.2e} "
+                  f"{stale_note}"
             )
             print(core, flush=True)
 
@@ -862,7 +897,7 @@ def main():
                     f.write(
                         "iter,p_loss,v_loss,avg_kl,safe_kl,r_raw,r_raw_ema,r_ctr,r_shp,r_eval_greedy,"
                         "clip_frac,approx_kl_pi,entropy,v_mae,explained_var,pool_est,age_med,age_p90,lr,"
-                        "resp_min,resp_p50,resp_p90,resp_max\n"
+                        "resp_min,resp_p50,resp_p90,resp_max,algo,grpo_group_eff,grpo_ctr_abs\n"
                     )
                 f.write(
                     f"{iter_num},{mean_p},{'' if mean_v is None else mean_v},"
@@ -870,16 +905,18 @@ def main():
                     f"{clip_frac},{approx_kl_pi},{entropy_tok},{v_mae},{explained_var},"
                     f"{pool_est},{age_med},{age_p90},{cur_lr},"
                     f"{resp_len_stats['resp_len_min']},{resp_len_stats['resp_len_p50']},"
-                    f"{resp_len_stats['resp_len_p90']},{resp_len_stats['resp_len_max']}\n"
+                    f"{resp_len_stats['resp_len_p90']},{resp_len_stats['resp_len_max']},"
+                    f"{'PPO' if use_ppo else 'GRPO'},{grpo_group_eff},{grpo_ctr_abs}\n"
                 )
 
             if wandb_log:
                 try:
                     import wandb
-                    wandb.log({
+                    wb = {
+                        "algo": ("PPO" if use_ppo else "GRPO"),
                         "iter": iter_num,
                         "loss/policy": mean_p,
-                        "loss/value": mean_v if mean_v is not None else float("nan"),
+                        "loss/value": mean_v if (use_ppo and mean_v is not None) else float("nan"),
                         "kl/report": report_kl,
                         "kl/safe": safe_kl,
                         "reward/raw": r_raw,
@@ -890,9 +927,9 @@ def main():
                         "ppo/clip_frac": clip_frac,
                         "ppo/approx_kl_pi": approx_kl_pi,
                         "entropy/token": entropy_tok,
-                        "value/mae": v_mae,
-                        "value/explained_var": explained_var,
-                        "lr/actor": opt_a.param_groups[0]['lr'],
+                        "value/mae": v_mae if use_ppo else float("nan"),
+                        "value/explained_var": explained_var if use_ppo else float("nan"),
+                        "lr/actor": cur_lr,
                         "pool/estimate": pool_est,
                         "pool/age_med_sec": 0 if age_med==float("inf") else age_med,
                         "pool/age_p90_sec": 0 if age_p90==float("inf") else age_p90,
@@ -901,11 +938,19 @@ def main():
                         "resp/p90": resp_len_stats['resp_len_p90'],
                         "resp/max": resp_len_stats['resp_len_max'],
                         "kl_ctl": kl_ctl_now,
-                    })
+                        "adv/abs_mean": adv_abs_m,
+                        "sel/tokens": sel_tokens,
+                    }
+                    if use_grpo:
+                        wb.update({
+                            "grpo/group_eff_mean": grpo_group_eff,
+                            "grpo/r_center_mean_abs": grpo_ctr_abs,
+                        })
+                    wandb.log(wb)
                 except Exception as e:
                     print(f"[wandb] log error: {e}")
 
-            # 保存 ckpt（简明）
+            # 保存 ckpt
             ckpt = {
                 'model': raw_actor.state_dict(),
                 'critic': critic.state_dict(),
@@ -916,7 +961,7 @@ def main():
             }
             torch.save(ckpt, os.path.join(out_dir, "PPO_ckpt.pt"))
 
-            # —— 每隔 SGLANG_EXPORT_EVERY 步导出给 sglang（HF 目录 + pointer 原子切换） ——
+            # 导出给 sglang
             if SGLANG_ON and SGLANG_OFFLINE and (iter_num % int(SGLANG_EXPORT_EVERY) == 0):
                 try:
                     export_actor_for_sglang(raw_actor, init_from, SGLANG_EXPORT_BASE, SGLANG_MODEL_PATH)

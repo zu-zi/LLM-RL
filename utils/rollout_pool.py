@@ -1,4 +1,4 @@
-# utils/rollout_pool.py  —— 可直接替换
+# utils/rollout_pool.py
 import os
 import json
 import uuid
@@ -156,7 +156,7 @@ def enqueue_items(dirpath: str, items: List[Dict]) -> str:
 
     return path
 
-# 读取
+# 读取顺序
 def _file_order(files: List[str]) -> List[str]:
     if not files:
         return files
@@ -317,6 +317,123 @@ def dequeue_items(dirpath: str, n: int) -> List[Dict]:
         )
 
     return out
+
+# ============ 新增：GRPO 成组弹样 ============
+
+def dequeue_groups(dirpath: str, group_size: int, num_groups: int) -> List[List[Dict]]:
+    """
+    从池中按 pid 成组“弹出”样本：
+    - 与 dequeue_items 相同的新鲜度与最小长度过滤
+    - 但不做 prompt 去重；相反，优先把同 pid 凑满 group_size 条
+    - 取走的行不会回写；未被取走的仍按原样回写
+    返回：list[group]，每个 group 是 list[dict]，长度==group_size
+    """
+    ensure_dir(dirpath)
+    _clean_tmp_leftovers(dirpath)
+
+    want_groups = max(int(num_groups), 0)
+    gs = max(int(group_size), 1)
+    if want_groups == 0:
+        return []
+
+    files = _file_order(sorted(glob.glob(os.path.join(dirpath, ROLL_GLOB))))
+    now_ts = _now_ts()
+
+    # pid -> [(line_text, clean_obj)]（同 pid 内按 ts 降序）
+    pid_bins: Dict[str, List[Tuple[str, dict]]] = {}
+    # 为回写准备：先把原始行保存一份，后面剔除“已消费”的
+    file_lines_keep: Dict[str, List[str]] = {}
+
+    def _ts_from_line(ln: str) -> float:
+        obj = _safe_parse(ln)
+        if isinstance(obj, dict) and isinstance(obj.get("ts"), (int, float)):
+            return float(obj["ts"])
+        return 0.0
+
+    # 扫描并分桶
+    for fp in files:
+        try:
+            lines = _read_lines(fp)
+        except (FileNotFoundError, PermissionError):
+            continue
+
+        file_lines_keep[fp] = lines[:]  # 原样拷贝，稍后剔除已消费行
+        lines_sorted = sorted(lines, key=_ts_from_line, reverse=True)
+        for ln in lines_sorted:
+            obj = _safe_parse(ln)
+            if obj is None:
+                continue
+            clean = _sanitize_item(obj)
+            if clean is None:
+                continue
+            if not _is_fresh(clean, now_ts):
+                continue
+            if not _resp_len_ok(clean):
+                continue
+            pid = clean["pid"]
+            pid_bins.setdefault(pid, []).append((ln, clean))
+
+    out_groups: List[List[Dict]] = []
+    used_lines: set = set()
+
+    # 先收集“天然满组”的 pid
+    for pid, arr in pid_bins.items():
+        if len(out_groups) >= want_groups:
+            break
+        if len(arr) >= gs:
+            group = []
+            for k in range(gs):
+                ln, obj = arr[k]
+                if ln in used_lines:
+                    continue
+                used_lines.add(ln)
+                group.append(obj)
+            if len(group) == gs:
+                out_groups.append(group)
+
+    # 若还不够，则从“欠缺的 pid”聚拢补齐
+    if len(out_groups) < want_groups:
+        # 收集所有欠缺 pid 的样本（按 ts 已经是新鲜优先）
+        flat = []
+        for pid, arr in pid_bins.items():
+            if len(arr) < gs:
+                for ln, obj in arr:
+                    if ln in used_lines:
+                        continue
+                    flat.append((pid, ln, obj))
+
+        # pid -> 当前已收集的组
+        cur: Dict[str, List[Dict]] = {}
+        for pid, ln, obj in flat:
+            if len(out_groups) >= want_groups:
+                break
+            if ln in used_lines:
+                continue
+            used_lines.add(ln)
+            cur.setdefault(pid, []).append(obj)
+            if len(cur[pid]) == gs:
+                out_groups.append(cur[pid])
+                cur[pid] = []
+
+    # 回写：把未被使用的行写回原文件（保持原格式）
+    for fp, lines in file_lines_keep.items():
+        keep = []
+        for ln in lines:
+            if ln in used_lines:
+                continue
+            keep.append(ln if ln.endswith("\n") else (ln + "\n"))
+        try:
+            _atomic_rewrite(fp, keep)
+        except Exception:
+            try:
+                os.remove(fp)
+            except Exception:
+                pass
+
+    if ROLL_VERBOSE:
+        print(f"[rollout_pool.dequeue_groups] want_groups={want_groups} group_size={gs} got_groups={len(out_groups)} used_lines={len(used_lines)} ttl={ROLL_MAX_AGE_SEC}s min_resp={ROLL_MIN_RESP_TOKENS}")
+
+    return out_groups
 
 # 估算 & 统计
 def estimate_size(dirpath: str, approx_per_file: int = None, scan_cap_files: int = None) -> int:

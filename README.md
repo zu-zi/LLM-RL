@@ -122,7 +122,7 @@ python3 -m pip install -U sgl-kernel
 
 # FlashInfer（严格匹配 torch2.5 + cu124）
 python3 -m pip install --no-cache-dir --prefer-binary flashinfer \
-  --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer/
+--find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer/
 
 # 常用依赖
 python3 -m pip install accelerate
@@ -198,6 +198,7 @@ python -u rollout_worker.py \
   --min-free-mb 3500
 
 python3 train_RL_only.py config/train_RL_PPO_0.py
+python3 train_RL_only.py config/train_GRPO_0.py
 ```
 
 

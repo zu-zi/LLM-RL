@@ -1,469 +1,377 @@
 # RL/GRPO.py
-import os, math
 from dataclasses import dataclass
-from typing import List, Tuple, Optional, Dict, Any
+from typing import Optional, Tuple, List, Dict
+import math
+import hashlib
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from RL.common import (
+from .common import (
     Samples, Experience,
     model_all_logits, token_logprobs_from_logits,
-    compute_actor_ref_logprobs, compute_approx_kl, kl_k3_from_logratio,
-    entropy_from_logits, masked_mean,
-    get_advantages_and_returns,  # 仅为签名一致；GRPO不用critic
-    ratio_stats, adv_abs_mean,
-    normalize_for_reward,
-    apply_entropy_mask,
+    masked_mean, normalize_for_reward,
+    scatter_uniform_rewards,
 )
 
-# 环境变量（与 PPO 保持一致的“硬夹”，避免尖峰）
-PPO_RATIO_MIN = float(os.getenv("PPO_RATIO_MIN", "0.75"))
-PPO_RATIO_MAX = float(os.getenv("PPO_RATIO_MAX", "1.25"))
-PPO_KL_TOKEN_CAP = float(os.getenv("PPO_KL_TOKEN_CAP", "0.5"))
-PPO_K3_CAP = float(os.getenv("PPO_K3_CAP", "1.5"))
-ENT_MASK_KEEP = float(os.getenv("ENT_MASK_KEEP", "0.2"))
+# --------- helpers ---------
+def _clean_logp(x: torch.Tensor, fallback: torch.Tensor = None):
+    if fallback is not None and fallback.shape == x.shape:
+        return torch.where(torch.isfinite(x), x, fallback)
+    return torch.where(torch.isfinite(x), x, torch.zeros_like(x))
 
-# 采样解码的默认参数（和 train_RL_only 的一致）
-SAMPLE_TEMPERATURE = float(os.getenv("SAMPLE_TEMPERATURE", "0.8"))
-SAMPLE_TOP_P = float(os.getenv("SAMPLE_TOP_P", "0.9"))
-SAMPLE_TOP_K = int(os.getenv("SAMPLE_TOP_K", "0"))
-SAMPLE_REP_PENALTY = float(os.getenv("SAMPLE_REP_PENALTY", "1.1"))
+def _prompt_end_index(action_mask_row: torch.Tensor) -> int:
+    """
+    action_mask: [T]，prompt 段为 0，response 段为 1
+    返回 prompt 的最后一个索引（如果整段全 0，则返回 T-1 的 -1 视作空 prompt）
+    """
+    idx = (action_mask_row > 0).nonzero(as_tuple=False)
+    if idx.numel() == 0:
+        return action_mask_row.numel() - 1  # 没有 response，就认为整段都是 prompt
+    first_resp = int(idx[0].item())
+    return max(0, first_resp - 1)
 
-MIN_RESP_TOK = int(os.getenv("ROLL_MIN_RESP_TOKENS", "16"))
+def _hash_prompt_ids(ids: torch.Tensor) -> str:
+    if ids.numel() == 0:
+        return "empty"
+    if ids.is_cuda:
+        ids = ids.detach().cpu()
+    b = ",".join(map(str, ids.tolist())).encode("utf-8")
+    return hashlib.sha1(b).hexdigest()
 
-# ------------------------------
-# 简单 nucleus 采样一个 token（与 train_RL_only 内部实现一致口径）
-# ------------------------------
-@torch.no_grad()
-def _sample_next_token(last_logits: torch.Tensor, prev_ids: torch.Tensor,
-                       top_p=0.9, temperature=0.8, top_k=0, repetition_penalty=1.1):
-    if repetition_penalty and prev_ids is not None and prev_ids.numel() > 0:
-        uniq = torch.unique(prev_ids)
-        last_logits[:, uniq] = last_logits[:, uniq] / float(repetition_penalty)
-    last_logits = last_logits / max(float(temperature), 1e-6)
-    if top_k and top_k > 0:
-        kth = torch.topk(last_logits, k=min(int(top_k), last_logits.size(-1)), dim=-1).values[..., -1:]
-        last_logits = torch.where(last_logits < kth, torch.full_like(last_logits, -1e10), last_logits)
-    probs = torch.softmax(last_logits, dim=-1)
-    sorted_probs, sorted_idx = torch.sort(probs, descending=True, dim=-1)
-    cumsum = torch.cumsum(sorted_probs, dim=-1)
-    cutoff = (cumsum > float(top_p)).float().argmax(dim=-1, keepdim=True)
-    mask = torch.arange(probs.size(-1), device=probs.device).view(1, -1) <= cutoff
-    kept = torch.where(mask, sorted_probs, torch.zeros_like(sorted_probs))
-    kept = kept / kept.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-    next_sorted = torch.multinomial(kept, num_samples=1)
-    next_id = sorted_idx.gather(1, next_sorted)  # [1,1]
-    return next_id
-
-
-@torch.no_grad()
-def _decode_with_sampling(model, idx, max_new_tokens, eos_id, block_size,
-                          temperature=SAMPLE_TEMPERATURE, top_p=SAMPLE_TOP_P, top_k=SAMPLE_TOP_K,
-                          repetition_penalty=SAMPLE_REP_PENALTY, min_resp=MIN_RESP_TOK):
-    """单样本按采样生成；仅用于 GRPO 组内补样。"""
-    device = idx.device
-    was_train = model.training
-    model.eval()
-    try:
-        out = idx
-        start_len = out.size(1)
-        for _ in range(int(max_new_tokens)):
-            idx_cond = out[:, -int(block_size):]
-            logits = model(idx_cond)
-            if isinstance(logits, tuple):
-                logits = logits[0]
-            last = logits[:, -1, :]
-
-            next_id = _sample_next_token(last, out, top_p=top_p, temperature=temperature,
-                                         top_k=top_k, repetition_penalty=repetition_penalty)
-
-            # 强制最短回复前不允许 EOS
-            if (out.size(1) - start_len) < int(min_resp) and eos_id is not None and int(next_id.item()) == int(eos_id):
-                # 退而取第二大
-                probs = torch.softmax(last / max(float(temperature), 1e-6), dim=-1)
-                sorted_probs, sorted_idx = torch.sort(probs, descending=True, dim=-1)
-                alt = sorted_idx[:, 1:2] if sorted_idx.size(1) > 1 else next_id
-                next_id = alt
-
-            out = torch.cat((out, next_id.to(device)), dim=1)
-
-            if (out.size(1) - start_len) >= int(min_resp):
-                if eos_id is not None and int(next_id.item()) == int(eos_id):
-                    break
-        return out
-    finally:
-        if was_train:
-            model.train()
-
-
+# --------- GRPO Trainer ---------
 class GRPOTrainer:
     """
-    组相对策略优化（Group Relative Policy Optimization）
-    - 不用 value/critic，优势由“组内标准化奖励”得到。
-    - 句级优势 → 复制到每个 action token。
-    - 可选：对 ref 使用 KL k3 惩罚。
-    - 可选：PPO 风格的 ratio 裁剪。
+    Group Relative Policy Optimization（无 critic，组内中心化优势）
+    - 分组：按“prompt token 序列”的哈希在一个 batch 内分桶
+    - 奖励：句级 reward 送入组中心化 r_i - mean(group)
+    - 优势：把中心化后的句级奖励均匀摊到 response token（和 PPO 的 mask 口径一致）
+    - KL：沿用项目中 PPO 的“k3 KL”作为 policy-level 正则（相同口径，便于统一控制）
+    - Log：与 PPO 对齐的公共字段 + GRPO 特有诊断
     """
     def __init__(
         self,
         actor_model: nn.Module,
-        ref_model: Optional[nn.Module],
-        reward_model: nn.Module,               # 标量 RM（如 OASST RM）；或自定义函数也可，在外面包一下
-        actor_tokenizer,                       # 你项目里的 GPT2Tok
-        reward_tokenizer,                      # HF tokenizer（CPU）
-        optimizer_actor: torch.optim.Optimizer,
+        ref_model: nn.Module,
+        reward_model: nn.Module,
+        actor_tokenizer,
+        reward_tokenizer,
+        optimizer_actor,
         device: str = "cuda",
-        group_size: int = 4,
-        kl_coef: float = 0.0,
-        clip_reward: float = 5.0,
-        mb_size_logits: int = 1,               # micro-batch for logits
-        block_size: int = 384,
-        max_new_tokens: int = 6,              # 在线补样时的最大生成
-        # use_token_entropy: bool = False,
-        # ent_keep_ratio: float = 0.2,
+        mb_size_logits: int = 1,
+        group_size: int = 4,          # 期望的每 prompt 组内样本数（诊断期望值；实际由采样决定）
+        # main RL hparams（与 PPO 对齐的口径）
+        kl_ctl: float = 0.6,
+        ppo_clip: float = 0.2,
+        entropy_coef: float = 0.0,
+        max_grad_norm: float = 1.0,
+        # safety caps（与 PPO 对齐，便于共享自适应/保险丝）
+        ratio_min: float = 0.75,
+        ratio_max: float = 1.25,
+        kl_token_cap: float = 0.5,    # 对 Δlogp 的逐 token 上限
+        k3_cap: float = 1.5,          # 对 k3 的逐 token 上限
+        ent_mask_keep: float = 0.20,  # 预留：若用到 token-entropy 子采样
     ):
         self.actor = actor_model
-        self.ref = ref_model
+        self.ref   = ref_model
         self.reward_model = reward_model
-        self.tok = actor_tokenizer
-        self.rtok = reward_tokenizer
+        self.actor_tok = actor_tokenizer
+        self.reward_tok = reward_tokenizer
+
+        if getattr(self.reward_tok, "pad_token_id", None) is None:
+            if getattr(self.reward_tok, "eos_token", None) is not None:
+                self.reward_tok.pad_token = self.reward_tok.eos_token
+        try:
+            self.reward_tok.padding_side = "right"
+        except Exception:
+            pass
+
         self.opt_actor = optimizer_actor
 
-        self.device_type = "cuda" if ("cuda" in str(device)) else "cpu"
-        self.mb_logits = int(mb_size_logits) if mb_size_logits else 0
+        self.device = device
+        self.device_type = "cuda" if "cuda" in str(device) else "cpu"
+        self.mb_logits = max(1, int(mb_size_logits))
+        self.group_size_expect = int(group_size)
 
-        self.group_size = int(group_size)
-        self.kl_coef = float(kl_coef)
-        self.clip_reward = float(clip_reward)
-        self.block_size = int(block_size)
-        self.max_new_tokens = int(max_new_tokens)
-        # self.use_token_entropy = bool(use_token_entropy)
-        # self.ent_keep_ratio = float(ent_keep_ratio)
+        self.kl_ctl = float(kl_ctl)
+        self.ppo_clip = float(ppo_clip)
+        self.entropy_coef = float(entropy_coef)
+        self.max_grad_norm = float(max_grad_norm)
 
-        self.last_stats: Dict[str, Any] = {}
+        self.ratio_min = max(0.0, float(ratio_min))
+        self.ratio_max = max(0.0, float(ratio_max))
+        if 0.0 < self.ratio_max < 1.0:
+            self.ratio_max = 10.0
+        self.kl_token_cap = float(kl_token_cap)
+        self.k3_cap = float(k3_cap)
+        self.ent_mask_keep = float(min(max(ent_mask_keep, 0.0), 1.0))
 
-        # 日志辅助
-        self.kl_ctl = self.kl_coef  # 为了和主循环打印字段名对齐
-        self._eps = 1e-8
+        self.last_stats: Dict[str, float] = {
+            "safety_ratio_min": float(self.ratio_min),
+            "safety_ratio_max": float(self.ratio_max),
+            "safety_logratio_cap": float(self.kl_token_cap),
+            "safety_k3_cap": float(self.k3_cap),
+            "safety_ent_keep": float(self.ent_mask_keep),
+            # GRPO 诊断
+            "grpo/group_eff_mean": float("nan"),
+            "grpo/r_center_mean_abs": float("nan"),
+        }
 
-    # --------------------------
-    # 工具：从 batch 中恢复 prompt ids（通过 action_mask 边界）
-    # --------------------------
-    @staticmethod
-    def _prompt_len_from_mask(action_mask_row: torch.Tensor) -> int:
-        # action_mask=1 的第一位是 response 起点
-        nz = (action_mask_row > 0).nonzero(as_tuple=False)
-        return int(nz[0].item()) if nz.numel() > 0 else int(action_mask_row.numel())
-
-    def _split_prompt_response(self, seqs: torch.Tensor, action_mask: torch.Tensor) -> Tuple[List[List[int]], List[List[int]]]:
-        B, T = seqs.shape
-        prompts, responses = [], []
-        for i in range(B):
-            p_len = self._prompt_len_from_mask(action_mask[i])
-            L = int((action_mask[i] > 0).nonzero(as_tuple=False))
-            tlen = int((action_mask[i] > 0).sum().item() + p_len)
-            # 用 attention_mask 会更准，这里取 action_mask 范围对齐
-            full = seqs[i].tolist()
-            prompts.append(full[:p_len])
-            responses.append(full[p_len:tlen])
-        return prompts, responses
-
-    # --------------------------
-    # 评分：把 prompt+response 文本走 RM
-    # --------------------------
+    # ------------------- Reward scoring -------------------
     @torch.no_grad()
-    def _score_with_rm(self, full_texts: List[str]) -> torch.Tensor:
-        if len(full_texts) == 0:
-            return torch.zeros(0, device="cpu")
-        texts = [normalize_for_reward(t, self.rtok) for t in full_texts]
-        toks = self.rtok(texts, padding=True, truncation=True, max_length=1024, return_tensors="pt")
+    def _decode_and_score(self, seqs: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        B, T = seqs.size()
+        texts = []
+        for i in range(B):
+            L_i = int(attention_mask[i].sum().item())
+            ids = seqs[i, :L_i].detach().cpu().tolist()
+            if hasattr(self.actor_tok, "decode"):
+                raw = self.actor_tok.decode(ids)
+            else:
+                raw = self.actor_tok.batch_decode([ids])[0]
+            txt = normalize_for_reward(raw, reward_tokenizer=self.reward_tok)
+            if "Assistant:" not in txt and "Human:" in txt:
+                txt = txt.rstrip() + "\n\nAssistant:"
+            texts.append(txt)
+
+        toks = self.reward_tok(texts, padding=True, truncation=True, max_length=1024, return_tensors="pt")
         outs = self.reward_model(**{k: v for k, v in toks.items()})
         logits = getattr(outs, "logits", None)
         if logits is None:
-            return torch.zeros(len(full_texts), device="cpu")
+            return torch.zeros(B, dtype=torch.float32, device=self.device)
         if logits.dim() == 2 and logits.size(-1) == 1:
             logits = logits.squeeze(-1)
-        return logits.detach().float()
+        return logits.detach().to(self.device).float()
 
-    # --------------------------
-    # 组内补样：基于已有 prompt，再生成 (group_size-1) 个 response
-    # --------------------------
-    @torch.no_grad()
-    def _augment_group_for_prompt(self, prompt_ids: List[int], use_actor=True) -> List[List[int]]:
-        dev = next(self.actor.parameters()).device
-        base = torch.tensor(prompt_ids, dtype=torch.long, device=dev).unsqueeze(0)
-        eos_id = self.tok.eos_id
-        room = self.block_size - base.size(1) - 1
-        if room <= 0:
-            return [prompt_ids[:self.block_size]]
-
-        K = max(1, int(self.group_size))
-        seqs: List[List[int]] = []
-        # 包含“现成的一条”（由外部 samples 带入），其余 K-1 条在线生成补齐
-        # 这里只做“全 K 条都采样”，由 evaluate_experience 负责把 batch 里的那条并入组
-        for _ in range(K):
-            out = _decode_with_sampling(
-                self.actor if use_actor else self.ref, base,
-                max_new_tokens=min(self.max_new_tokens, room),
-                eos_id=eos_id, block_size=self.block_size,
-                temperature=SAMPLE_TEMPERATURE, top_p=SAMPLE_TOP_P,
-                top_k=SAMPLE_TOP_K, repetition_penalty=SAMPLE_REP_PENALTY,
-                min_resp=MIN_RESP_TOK
-            )
-            seqs.append(out[0].tolist()[:self.block_size])
-        return seqs
-
-    # --------------------------
-    # 主入口：评估经验（不更新），返回 Experience 列表 + 各指标
-    # --------------------------
+    # ------------------- Step 1: rollouts -> Experience -------------------
     @torch.no_grad()
     def evaluate_experience(self, samples: Samples):
         """
-        输入：一个 batch 的样本（每条只有一条 response）。
-        本实现会按“同一 prompt”为单位，在线补足若干条 response，形成组（group_size）。
-        然后在组内做奖励标准化，得到句级优势；优势复制到每个 token。
+        与 PPO 口径一致，返回：
+          experiences: List[Experience]（这里 values/returns 不参与训练，只占位）
+          report_kl, r_raw_mean, r_shaped_mean, r_centered_mean, safe_kl
         """
-        dev = next(self.actor.parameters()).device
-        B, T = samples.seqs.shape
-        # 先拿到本 batch 的 prompt 边界与文本
-        # prompt_ids_list, response_ids_list = self._split_prompt_response(samples.seqs, samples.action_mask)
+        seqs = samples.seqs.to(self.device)
+        attn = samples.attention_mask.to(self.device)
+        amsk = samples.action_mask.to(self.device)
 
-        # ——更稳的方式：直接根据掩码切 —— #
-        prompt_ids_list = []
-        base_full_list = []  # 把 batch 里已有的“完整一条”放入组
+        assert amsk.size(1) == seqs.size(1)
+        mask_tgt = amsk[:, 1:]
+        assert int(mask_tgt.sum().item()) == int(samples.num_actions.sum().item())
+
+        # 1) actor/ref token-logprobs（float32）
+        lp_actor_full = token_logprobs_from_logits(
+            model_all_logits(self.actor, seqs, self.device_type, ptdtype=torch.float32, micro_batch_size=self.mb_logits),
+            seqs
+        )
+        lp_ref_full = token_logprobs_from_logits(
+            model_all_logits(self.ref,   seqs, self.device_type, ptdtype=torch.float32, micro_batch_size=self.mb_logits),
+            seqs
+        )
+        lp_actor_full = _clean_logp(lp_actor_full, fallback=lp_ref_full)
+        lp_ref_full   = _clean_logp(lp_ref_full,   fallback=lp_actor_full)
+
+        # 2) KL 报告 / 安全 KL（与 PPO 同口径）
+        log_ratio_rep = (lp_actor_full - lp_ref_full).clamp_(-8.0, 8.0)
+        k3_report = torch.expm1(log_ratio_rep) - log_ratio_rep
+        k3_report = torch.clamp(k3_report, 0.0, 50.0)
+        report_kl = float(masked_mean(k3_report * mask_tgt, mask_tgt.float()).detach().item())
+
+        log_ratio = (lp_actor_full - lp_ref_full)
+        if self.kl_token_cap > 0.0:
+            log_ratio = log_ratio.clamp(-self.kl_token_cap, self.kl_token_cap)
+        k3 = torch.expm1(log_ratio) - log_ratio
+        if self.k3_cap > 0.0:
+            k3 = torch.clamp(k3, 0.0, self.k3_cap)
+        k3 = (k3 * mask_tgt)
+        denom = mask_tgt.sum(dim=1).clamp_min(1e-8).float()
+        safe_kl_seq = k3.sum(dim=1) / denom
+        safe_kl = float(safe_kl_seq.mean().detach().item())
+
+        # 3) 句级 raw 奖励
+        r_seq = self._decode_and_score(seqs, attn)  # [B]
+        r_raw_mean = float(r_seq.mean().detach().item())
+
+        # 4) —— 分组（按 prompt ids 哈希）→ 组中心化 —— #
+        B, T = seqs.size()
+        prompt_hash = []
+        prompt_len = []
         for i in range(B):
-            seq = samples.seqs[i]
-            mask = samples.action_mask[i]
-            p_len = self._prompt_len_from_mask(mask)
-            # full 的有效长度（用 attention_mask 更准）
-            t_len = int(samples.attention_mask[i].sum().item())
-            prompt_ids = seq[:p_len].tolist()
-            full_ids   = seq[:t_len].tolist()
-            prompt_ids_list.append(prompt_ids)
-            base_full_list.append(full_ids)
+            end_idx = _prompt_end_index(amsk[i])
+            prompt_len.append(end_idx + 1)
+            pid = _hash_prompt_ids(seqs[i, :end_idx+1])
+            prompt_hash.append(pid)
+        # 按 hash 分桶
+        buckets: Dict[str, List[int]] = {}
+        for i, h in enumerate(prompt_hash):
+            buckets.setdefault(h, []).append(i)
+        group_sizes = [len(buckets[h]) for h in buckets]
+        group_eff_mean = float(sum(group_sizes) / max(len(group_sizes), 1))
 
-        # === 为每条样本补齐 group ===
-        group_full_ids: List[List[List[int]]] = []  # [B][K][T*]
-        for i in range(B):
-            # 在线生成 K 条，再把 batch 自带的那条替换掉其中一条（避免重复费时）
-            g = self._augment_group_for_prompt(prompt_ids_list[i], use_actor=True)  # K 条
-            # 把第 0 条替换为 batch 自带那条（保证“现成的”也被纳入评分）
-            g[0] = base_full_list[i]
-            group_full_ids.append(g)
+        # 组内中心化
+        r_center = r_seq.clone()
+        for h, idxs in buckets.items():
+            idx_t = torch.tensor(idxs, dtype=torch.long, device=r_seq.device)
+            mean_h = r_seq[idx_t].mean()
+            r_center[idx_t] = r_seq[idx_t] - mean_h
 
-        # === 对每条 group，计算：
-        # - actor/ref logprobs（逐 token，方便做 KL 和 ratio）
-        # - action_mask（对齐到 response 段 = 从 prompt_len 开始到句末）
-        # - 奖励（句级）
+        r_center_mean_abs = float(r_center.abs().mean().detach().item())
+
+        # 5) 均匀摊到 response tokens（不在 reward 端叠 KL）
+        rewards_t = scatter_uniform_rewards(r_center, mask_tgt, beta_kl=None)
+
+        # shaped/centered 统计（报告仍用 report_kl 的 k3）
+        denom2 = mask_tgt.sum(dim=1).clamp_min(1e-8).float()
+        kl_mean_per_seq = (k3_report * mask_tgt).sum(dim=1) / denom2
+        r_shaped_seq = r_seq - self.kl_ctl * kl_mean_per_seq
+        r_shaped_mean = float(r_shaped_seq.mean().detach().item())
+        r_centered_mean = float(r_center.mean().detach().item())
+
+        # 6) 构造 Experience（values/returns 为占位，不参与训练）
         experiences: List[Experience] = []
-        all_rewards = []
-        all_k3_means = []
-
-        sel_tokens_total = 0
-        ratio_qs_total = []
-        ratio_max_total = []
-
         for i in range(B):
-            g_full = group_full_ids[i]             # K 条完整 ids
-            K = len(g_full)
-            # 统一右 pad 到本组的最大长度，构造 Samples-like 结构
-            Lmax = min(self.block_size, max(len(x) for x in g_full))
-            seqs = torch.full((K, Lmax), self.tok.eos_id, dtype=torch.long, device=dev)
-            attn = torch.zeros((K, Lmax), dtype=torch.long, device=dev)
-            amsk = torch.zeros((K, Lmax), dtype=torch.long, device=dev)
+            experiences.append(Experience(
+                seqs=seqs[i:i+1],
+                action_log_probs=lp_actor_full[i:i+1].detach(),
+                values=torch.zeros_like(lp_actor_full[i:i+1]).detach(),   # 占位
+                returns=rewards_t[i:i+1].detach(),                         # 直接把中心化奖励当“returns”
+                advantages=rewards_t[i:i+1].detach(),                      # 等价（GRPO 无 value）
+                attention_mask=attn[i:i+1],
+                action_mask=mask_tgt[i:i+1],
+                reward=r_seq[i:i+1].detach(),
+                num_actions=mask_tgt[i:i+1].sum(dim=1).to(torch.long),
+                kl=k3_report[i:i+1].detach(),
+            ))
 
-            # 基于“同一个 prompt”，起点是一致的
-            p_len = self._prompt_len_from_mask(samples.action_mask[i])
+        # 公共诊断
+        with torch.no_grad():
+            logits_actor = model_all_logits(self.actor, seqs, self.device_type, ptdtype=torch.float32, micro_batch_size=self.mb_logits)
+            entropy_tok = -(F.softmax(logits_actor[:, 1:, :], dim=-1).clamp_min(1e-12) *
+                            F.log_softmax(logits_actor[:, 1:, :], dim=-1)).sum(-1)
+            entropy_val = masked_mean(entropy_tok, mask_tgt.float())
+            approx_kl_pi = float(masked_mean(k3_report * mask_tgt, mask_tgt.float()).detach().item())
 
-            for k in range(K):
-                ids = g_full[k][:Lmax]
-                t = len(ids)
-                seqs[k, :t] = torch.tensor(ids, dtype=torch.long, device=dev)
-                attn[k, :t] = 1
-                if p_len < t:
-                    amsk[k, p_len:t] = 1
-
-            # 计算 actor/ref 的逐 token logprob
-            lp_actor, lp_ref, mask_tgt = compute_actor_ref_logprobs(
-                self.actor, self.ref if (self.ref is not None) else self.actor,
-                seqs, amsk, device_type=self.device_type, ptdtype=None, micro_batch_size=self.mb_logits
-            )  # [K, T-1], [K, T-1], [K, T-1]
-            
-            # === Token-entropy 掩码（2/8 高熵保留）===
-            if self.use_token_entropy:
-                logits_actor_full = model_all_logits(
-                    self.actor, seqs, device_type=self.device_type, ptdtype=None, micro_batch_size=self.mb_logits
-                )
-                new_mask_tgt = apply_entropy_mask(
-                    logits_actor_full[:, 1:, :].detach(),  # 与 mask_tgt 对齐
-                    mask_tgt,
-                    keep_ratio=float(ent_keep_ratio)
-                )
-                if new_mask_tgt.sum() > 0:  # 防极端回退
-                    mask_tgt = new_mask_tgt
-
-
-            # 句级奖励（RM）
-            # 注意：GRPO 一般用“prompt+response 全文”送 RM
-            texts = []
-            for k in range(K):
-                tlen = int(attn[k].sum().item())
-                texts.append(self.tok.decode(seqs[k, :tlen]))
-            rw = self._score_with_rm(texts).to(dev)  # [K]
-            if self.clip_reward > 0:
-                rw = torch.clamp(rw, -self.clip_reward, self.clip_reward)
-
-            # 组内标准化优势（句级）
-            mean_r = rw.mean()
-            std_r = rw.std(unbiased=False)
-            adv_sent = (rw - mean_r) / (std_r + self._eps)  # [K]
-
-            # k3 KL（对 ref；若不提供 ref，就把 ref=actor，相当于 0）
-            log_ratio = (lp_actor - lp_ref) * mask_tgt
-            # 夹紧 Δlogp，避免尖峰
-            if PPO_KL_TOKEN_CAP > 0:
-                log_ratio = torch.clamp(log_ratio, -PPO_KL_TOKEN_CAP, PPO_KL_TOKEN_CAP)
-            k3 = kl_k3_from_logratio(log_ratio)
-            if PPO_K3_CAP > 0:
-                k3 = torch.clamp(k3, max=PPO_K3_CAP)
-
-            # 重要性比 r = exp(Δlogp)
-            ratio = torch.exp(log_ratio)
-            ratio = torch.clamp(ratio, PPO_RATIO_MIN, PPO_RATIO_MAX)
-
-            # 复制句级优势到 token
-            adv_tok = adv_sent.view(-1, 1).expand_as(ratio) * mask_tgt
-
-            # GRPO 的 per-token 损失（句级优势 * 比率，PPO-style 裁剪）
-            unclipped =  ratio * adv_tok
-            clipped   = torch.clamp(ratio, 1.0 - (PPO_RATIO_MAX-1.0), 1.0 + (PPO_RATIO_MAX-1.0)) * adv_tok
-            per_tok_loss = -torch.minimum(unclipped, clipped)
-            # KL 惩罚
-            if self.kl_coef and self.kl_coef > 0:
-                per_tok_loss = per_tok_loss + self.kl_coef * k3
-
-            # 聚合为 per-seq，再做 batch mean（训练时）
-            # 这里只是准备 Experience；真正的 backward 在 train_on_experience
-            # old_action_log_probs 取当前 lp_actor（detach）做“快照”
-            # advantage 存句级（复用 Experience.advantages 字段的 [K, T] 形式方便）
-            # returns/values 在 GRPO 不用，放 0
-            per_seq_mask = mask_tgt
-            # 统计
-            k3_mean = masked_mean(k3, mask_tgt.float()).item()
-            all_k3_means.append(k3_mean)
-            all_rewards.extend(rw.detach().tolist())
-
-            r_q50, r_q90, r_q99, r_max = ratio_stats(log_ratio, mask_tgt)
-            ratio_qs_total.append((r_q50, r_q90, r_q99))
-            ratio_max_total.append(r_max)
-            sel_tokens_total += int(mask_tgt.sum().item())
-
-            # 打包 Experience
-            exp = Experience(
-                seqs=seqs,                                   # [K, Lmax]
-                action_log_probs=lp_actor.detach(),          # 作为 old_pi
-                values=torch.zeros_like(lp_actor),           # 占位
-                returns=torch.zeros_like(lp_actor),          # 占位
-                advantages=adv_tok.detach(),                 # [K, T-1]
-                attention_mask=attn,
-                action_mask=mask_tgt,
-                reward=rw.view(-1, 1),                       # 句级 reward（仅日志）
-                num_actions=mask_tgt.sum(dim=1).long(),
-                kl=k3,                                       # 保存逐 token k3，训练期也可用
-            )
-            experiences.append(exp)
-
-        # 汇总日志指标（模仿 PPOTrainer）
-        approx_kl_pi = float(sum(all_k3_means) / max(len(all_k3_means), 1))
-        r_raw = float(torch.tensor(all_rewards).mean().item()) if all_rewards else float("nan")
-        r_shaped = r_raw  # GRPO 没有额外 shaping
-        r_ctr = 0.0       # 无对比奖励
-        safe_kl = approx_kl_pi
-
-        # 存 “last_stats” 供主循环打印
-        if len(ratio_qs_total) > 0:
-            q50 = float(sum(x[0] for x in ratio_qs_total) / len(ratio_qs_total))
-            q90 = float(sum(x[1] for x in ratio_qs_total) / len(ratio_qs_total))
-            q99 = float(sum(x[2] for x in ratio_qs_total) / len(ratio_qs_total))
-            rmax = float(max(ratio_max_total))
-        else:
-            q50 = q90 = q99 = rmax = float("nan")
-
-        self.last_stats = {
-            "approx_kl_pi": approx_kl_pi,
-            "entropy": float("nan"),           # 可选：需要再算一次全 logits；先置空
-            "clip_frac": float("nan"),         # 训练步里再记录
+        self.last_stats.update({
+            "approx_kl_pi": float(approx_kl_pi),
+            "entropy": float(entropy_val.detach().item()),
             "v_mae": float("nan"),
             "explained_var": float("nan"),
-            "ratio_q50_q90_q99": (q50, q90, q99),
-            "ratio_max": rmax,
-            "adv_abs_mean": 0.0,               # 训练时再记
-            "sel_tokens": sel_tokens_total,
-            "ppo_clip": float(PPO_RATIO_MAX-1.0),
-            "kl_ctl_now": self.kl_ctl,
-        }
+            "grpo/group_eff_mean": float(group_eff_mean),
+            "grpo/r_center_mean_abs": float(r_center_mean_abs),
+        })
 
-        return experiences, approx_kl_pi, r_raw, r_shaped, r_ctr, safe_kl
+        return experiences, report_kl, r_raw_mean, r_shaped_mean, r_centered_mean, safe_kl
 
-    # --------------------------
-    # 训练一步：仅更新 actor
-    # --------------------------
+    # ------------------- Step 2: train (actor only) -------------------
     def train_on_experience(self, exp: Experience, use_token_entropy: bool = False):
+        """
+        返回 (policy_loss, None)，保持与 PPO 的返回形态可并行记录。
+        """
+        seqs = exp.seqs
+        action_mask = exp.action_mask
+        old_logp = exp.action_log_probs
+        adv = exp.advantages   # 这里就是中心化奖励均匀摊的 per-token 值
+
+        # —— 归一化优势（逐样本），口径与 PPO 一致 —— #
+        with torch.no_grad():
+            m = action_mask.float()
+            denom = m.sum(dim=1, keepdim=True).clamp_min(1e-8)
+            mean = (adv * m).sum(dim=1, keepdim=True) / denom
+            var  = (((adv - mean) ** 2) * m).sum(dim=1, keepdim=True) / denom
+            std  = var.sqrt().clamp_min(1e-6)
+            adv.copy_(((adv - mean) / std).clamp_(-5.0, 5.0))
+
+        # ===== Actor update =====
         self.actor.train()
         self.opt_actor.zero_grad(set_to_none=True)
 
-        # 重新前向拿到当前 logprob（新 pi）
-        logits = model_all_logits(self.actor, exp.seqs, self.device_type, ptdtype=None, micro_batch_size=self.mb_logits)
-        lp_new = token_logprobs_from_logits(logits, exp.seqs)  # [K, T-1]
-        mask_tgt = exp.action_mask
+        logits = model_all_logits(self.actor, seqs, self.device_type, ptdtype=torch.float32, micro_batch_size=self.mb_logits)
+        logp_all = token_logprobs_from_logits(logits, seqs)
+        logp_all = _clean_logp(logp_all, fallback=old_logp)
 
-        lp_new = torch.where(mask_tgt > 0, lp_new, torch.zeros_like(lp_new))
-        old_lp = torch.where(mask_tgt > 0, exp.action_log_probs, torch.zeros_like(exp.action_log_probs))
+        L = old_logp.size(1)
+        logp = logp_all[:, :L]
+        sel_mask = action_mask[:, :L]
 
-        # Δlogp + ratio（裁剪）
-        log_ratio = lp_new - old_lp
-        if PPO_KL_TOKEN_CAP > 0:
-            log_ratio = torch.clamp(log_ratio, -PPO_KL_TOKEN_CAP, PPO_KL_TOKEN_CAP)
-        ratio = torch.exp(log_ratio)
-        ratio = torch.clamp(ratio, PPO_RATIO_MIN, PPO_RATIO_MAX)
-
-        adv_tok = exp.advantages  # [K, T-1]，已含 mask
-        unclipped =  ratio * adv_tok
-        clipped   = torch.clamp(ratio, 1.0 - (PPO_RATIO_MAX-1.0), 1.0 + (PPO_RATIO_MAX-1.0)) * adv_tok
-        pg_loss_tok = -torch.minimum(unclipped, clipped)  # [K, T-1]
-        pg_loss = (pg_loss_tok * mask_tgt).sum() / mask_tgt.sum().clamp_min(1.0)
-
-        # KL（对 ref；如果 ref=None，相当于 0）
-        if self.ref is not None and self.kl_coef > 0:
-            with torch.no_grad():
-                logits_ref = model_all_logits(self.ref, exp.seqs, self.device_type, ptdtype=None, micro_batch_size=self.mb_logits)
-                lp_ref = token_logprobs_from_logits(logits_ref, exp.seqs)
-            log_ratio_ref = (lp_new - lp_ref) * mask_tgt
-            k3 = kl_k3_from_logratio(log_ratio_ref)
-            if PPO_K3_CAP > 0:
-                k3 = torch.clamp(k3, max=PPO_K3_CAP)
-            kl_loss = (k3 * mask_tgt).sum() / mask_tgt.sum().clamp_min(1.0)
-            loss = pg_loss + self.kl_coef * kl_loss
+        # 重要性比值（对数域夹紧）
+        if self.ratio_min > 0.0 and self.ratio_max > 0.0 and self.ratio_max > self.ratio_min:
+            lo = math.log(self.ratio_min); hi = math.log(self.ratio_max)
+            delta = torch.clamp(logp - old_logp, lo, hi)
+            ratio = torch.exp(delta)
         else:
-            loss = pg_loss
+            ratio = torch.exp(logp - old_logp)
 
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
+        # PPO clipped objective（与 PPO 同式）
+        surr1 = ratio * (adv * sel_mask)
+        surr2 = torch.clamp(ratio, 1.0 - self.ppo_clip, 1.0 + self.ppo_clip) * (adv * sel_mask)
+        policy_loss_tok = -torch.min(surr1, surr2)
+
+        if self.entropy_coef != 0.0:
+            ent_tok = -(F.softmax(logits[:, 1:, :], dim=-1).clamp_min(1e-12) *
+                        F.log_softmax(logits[:, 1:, :], dim=-1)).sum(-1)
+            policy_loss_tok = policy_loss_tok - self.entropy_coef * ent_tok[:, :policy_loss_tok.size(1)] * sel_mask
+
+        policy_loss = policy_loss_tok.sum() / sel_mask.sum().clamp_min(1e-8)
+
+        # KL 正则（与 PPO 同口径：k3）
+        with torch.no_grad():
+            logits_ref = model_all_logits(self.ref, seqs, self.device_type, ptdtype=torch.float32, micro_batch_size=self.mb_logits)
+            lp_ref_full = token_logprobs_from_logits(logits_ref, seqs)
+            lp_ref_full = _clean_logp(lp_ref_full, fallback=logp_all)
+
+        Lr = min(logp.size(1), lp_ref_full.size(1))
+        lp_ref = lp_ref_full[:, :Lr]
+        logp_cut = logp[:, :Lr]
+        sel = sel_mask[:, :Lr].float()
+
+        log_ratio_raw = (logp_cut - lp_ref)
+        if self.kl_token_cap > 0.0:
+            log_ratio = torch.clamp(log_ratio_raw, -self.kl_token_cap, self.kl_token_cap)
+        else:
+            log_ratio = log_ratio_raw
+        k3 = torch.expm1(log_ratio) - log_ratio
+        if self.k3_cap > 0.0:
+            k3 = torch.clamp(k3, 0.0, self.k3_cap)
+        kl_mean = (k3 * sel).sum() / sel.sum().clamp_min(1e-8)
+        policy_loss = policy_loss + self.kl_ctl * kl_mean
+
+        policy_loss.backward()
+        if self.max_grad_norm and self.max_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(list(self.actor.parameters()), self.max_grad_norm)
         self.opt_actor.step()
 
-        # 日志
+        # 统计（与 PPO 对齐）
         with torch.no_grad():
-            clip_frac = float(((ratio <= PPO_RATIO_MIN) | (ratio >= PPO_RATIO_MAX)).float()[mask_tgt>0].float().mean().item())
-            r_q50, r_q90, r_q99, r_max = ratio_stats(log_ratio, mask_tgt)
-            H = entropy_from_logits(logits[:, 1:, :], mask_tgt)  # 对齐 action 轴
-            self.last_stats.update({
-                "clip_frac": clip_frac,
-                "ratio_q50_q90_q99": (r_q50, r_q90, r_q99),
-                "ratio_max": r_max,
-                "entropy": float(H.item()),
-                "adv_abs_mean": adv_abs_mean(adv_tok, mask_tgt),
-            })
+            Lm = ratio.size(1)
+            sel = sel_mask[:, :Lm].to(ratio.dtype)
+            over = (torch.abs(ratio - 1.0) > self.ppo_clip).to(ratio.dtype)
+            clipped = over * sel
+            denom = sel.sum().clamp_min(1e-8)
+            clip_frac = float((clipped.sum() / denom).item())
 
-        return loss
+            # ratio/adv 诊断
+            rdiff = (ratio - 1.0).abs() * sel
+            if sel.sum() > 0:
+                q = torch.quantile(
+                    rdiff[sel.bool()], torch.tensor([0.5, 0.9, 0.99], device=rdiff.device)
+                )
+                q50, q90, q99 = q.tolist()
+                rmax = float(rdiff.max().item())
+                adv_abs_mean = float(((adv.abs() * sel).sum() / sel.sum()).item())
+                sel_tokens = int(sel.sum().item())
+            else:
+                q50 = q90 = q99 = rmax = adv_abs_mean = 0.0
+                sel_tokens = 0
+
+        self.last_stats.update({
+            "clip_frac": float(clip_frac),
+            "ratio_q50_q90_q99": (float(q50), float(q90), float(q99)),
+            "ratio_max": float(rmax),
+            "adv_abs_mean": float(adv_abs_mean),
+            "sel_tokens": int(sel_tokens),
+            "ppo_clip": float(self.ppo_clip),
+            "kl_ctl_now": float(self.kl_ctl),
+        })
+
+        return policy_loss.detach(), None

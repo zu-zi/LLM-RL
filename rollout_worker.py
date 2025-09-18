@@ -1,4 +1,3 @@
-# rollout_worker.py  —— 支持无指针热重载（dir_mtime / realpath）
 import argparse
 import os
 import json
@@ -153,8 +152,6 @@ class EngineWrapper:
         if self.strategy in ("none", None): return False
         new_sig = self._current_signature()
         if new_sig != self._last_sig:
-            # dir_mtime: 路径不变，直接重载同一路径
-            # realpath : 符号链接切换 → realpath 变了，仍用 self.path 加载即可
             print(f"[worker] detected change in signature: {self._last_sig} -> {new_sig}", flush=True)
             self._load(self.path)
             self._last_sig = new_sig
@@ -200,6 +197,10 @@ def main():
     ap.add_argument("--refresh-every-batches", type=int, default=30)
     ap.add_argument("--min-free-mb", type=int, default=6000)
     ap.add_argument("--sleep-on-lowmem", type=float, default=1.0)
+
+    # —— 新增：GRPO 需要 —— 每个 prompt 生成多条
+    ap.add_argument("--per-prompt", type=int, default=1,
+                    help="为同一 prompt 生成的样本数量（GRPO 设为 group_size）")
 
     args = ap.parse_args()
 
@@ -264,6 +265,8 @@ def main():
         ratio = (rep + digits + puncts) / max(len(s), 1)
         return (rep > 0) or (ratio > 0.40)
 
+    per_prompt = max(1, int(args.per_prompt))
+
     while total_ok < args.count:
         # 热重载检查
         if args.refresh_every_batches > 0 and batch_counter > 0 and (batch_counter % args.refresh_every_batches == 0):
@@ -274,7 +277,8 @@ def main():
                 print(f"[worker][warn] hot-reload check failed: {e}", flush=True)
 
         # 显存保护
-        free_mb = _cuda_free_mb(); mb = int(args.mb)
+        free_mb = _cuda_free_mb()
+        mb = int(args.mb)
         if free_mb < int(args.min_free_mb):
             if mb > 1:
                 mb = max(1, mb // 2); print(f"[worker] low mem {free_mb}MB -> shrink mb to {mb}", flush=True)
@@ -282,13 +286,20 @@ def main():
                 print(f"[worker] low mem {free_mb}MB -> sleep {args.sleep_on_lowmem}s", flush=True)
                 time.sleep(max(0.1, float(args.sleep_on_lowmem)))
 
-        take = min(mb, args.count - total_ok)
-        if len(train_indices) >= take:
-            idxs = random.sample(train_indices, k=take)
+        # 作为“prompt 组”的数量（每个组会被复制 per_prompt 次）
+        take_groups = min(mb, args.count - total_ok)
+        if len(train_indices) >= take_groups:
+            base_idxs = random.sample(train_indices, k=take_groups)
         else:
-            idxs = [train_indices[(total_ok + i) % len(train_indices)] for i in range(take)]
+            base_idxs = [train_indices[(total_ok + i) % len(train_indices)] for i in range(take_groups)]
+
+        # 将每个选中的 idx 重复 per_prompt 次
+        idxs = []
+        for i in base_idxs:
+            idxs.extend([i] * per_prompt)
 
         batch_prompts_ids  = [prompt_token_ids[i] for i in idxs]
+        # 直接用提示文本（保持和你原逻辑一致）
         batch_prompts_txt  = [tok.decode(prompt_token_ids[i]) for i in idxs]
 
         params = {

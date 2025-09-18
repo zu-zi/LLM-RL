@@ -1,53 +1,75 @@
-# ================== Offline rollouts (sglang) ==================
-SGLANG_ON = True
-SGLANG_OFFLINE = True
-SGLANG_MODEL_PATH = "gpt2-large"
-SGLANG_SYNC_DIR = "/root/autodl-tmp/sgl_pool"
-SGLANG_ROLLOUT_TARGET = 96
-SGLANG_REFILL_BATCH = 24
-SGLANG_MAX_NEW = 96
+# configs/GRPO_config.py
+import os
+os.environ["WANDB_MODE"] = "offline"
+os.environ["WANDB_SILENT"] = "true"
 
-# ===== 补货调度阈值 =====
-ROLL_LOW_WATERMARK_FACTOR = 2
-ROLL_REFILL_COUNT = 16
-ROLL_COOLDOWN_SEC = 20
-ROLL_MIN_FREE_MB = 6000
-
-# ================== Training ==================
-init_from = "gpt2-large"
-block_size = 384
-
-# ——GRPO 更依赖“组内相对”稳定性，建议 batch 是 group_size 的整数倍——
-batch_size = 4                     # 和 group_size=4 对齐
-gradient_accumulation_steps = 2
-
-# ——无 critic；policy 更“轻”，LR 可略高于 PPO（别太激进）——
-RL_learning_rate = 2.5e-6          # 你的 PPO 是 2e-6，这里小幅上调
-
-# ——GRPO 专用超参（新增）——
-GRPO_GROUP_SIZE   = 4              # 每组样本数；>=4 更稳
-GRPO_KL_COEF      = 0.15           # 句级 KL 正则初值（训练中会被主循环动态微调）
-GRPO_CLIP_REWARD  = 3.0            # 组内标准化后的权重裁剪（|w|<=3）
-MB_SIZE_LOGITS    = 2              # 计算 logits 时的 micro-batch，大模型可再加大
-
-# ——PPO 专属项在 GRPO 中无效；显式设为 0 以免误读——
-kl_ctl        = GRPO_KL_COEF       # 复用变量名，便于主循环里的自适应逻辑
-
+# —— 算法开关 —— #
 use_ppo  = False
 use_grpo = True
-use_dapo = False
-use_token_entropy = False
-ent_keep_ratio=0.2
 
-# ——在线新鲜样本占比——
-FRESH_RATIO = 0.5
+# —— 训练基本面（与 PPO 保持一致，必要时覆盖）—— #
+wandb_log  = True
+from datetime import datetime
+wandb_project  = "LLM-RL-GRPO"
+wandb_run_name = f"grpo_gpt2l_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
-# ================== Reward model (EN) ==================
+out_dir        = "/root/autodl-tmp/Results_GRPO"
+eval_interval  = 10
+max_iters      = 1500
+seed_base      = 1337
+compile        = False
+backend        = "nccl"
+device         = "cuda"
+
+init_from   = "gpt2-large"
+block_size  = 256
+bias        = False
+dropout     = 0.0
+
+batch_size                  = 4
+gradient_accumulation_steps = 1
+RL_learning_rate            = 1.7e-6
+weight_decay                = 5e-3
+beta1, beta2                = 0.9, 0.95
+max_grad_norm               = 0.5
+
+# —— PPO 专属（GRPO 不用 critic，留空值不影响）—— #
+vf_clip                     = None
+ppo_clip                    = 0.2
+entropy_coef                = 0.005
+kl_ctl_init                 = 1.0
+
+# —— GRPO 专属 —— #
+grpo_group_size             = 4          # 诊断期望值（实际组大小看日志 grpo/group_eff_mean）
+mb_size_logits              = 1
+ratio_min                   = 0.75
+ratio_max                   = 1.25
+kl_token_cap                = 0.5
+k3_cap                      = 1.5
+ent_mask_keep               = 0.20
+
+# —— 采样口径（评测/在线补齐一致）—— #
+SAMPLE_TEMPERATURE = 0.7
+SAMPLE_TOP_P       = 0.9
+SAMPLE_TOP_K       = 0
+SAMPLE_REP_PENALTY = 1.1
+SAMPLE_STOPS       = ["\nHuman:", "\n\nHuman:"]
+MIN_RESP_TOK       = 16
+
+# —— sglang 离线样本池（与你 PPO 配置一致即可）—— #
+SGLANG_ON              = True
+SGLANG_OFFLINE         = True
+SGLANG_MODEL_PATH      = "/root/autodl-tmp/actor_exports/current"
+SGLANG_EXPORT_BASE     = "/root/autodl-tmp/actor_exports"
+SGLANG_SYNC_DIR        = "/root/autodl-tmp/sgl_pool"
+SGLANG_ROLLOUT_TARGET  = 200
+SGLANG_REFILL_BATCH    = 32
+SGLANG_MAX_NEW         = 128
+ROLL_LOW_WATERMARK_FACTOR = 2
+ROLL_REFILL_COUNT      = 40
+ROLL_COOLDOWN_SEC      = 6
+ROLL_MIN_FREE_MB       = 2500
+REFRESH_EVERY_BATCHES  = 26
+FRESH_RATIO            = 0.5
+
 REWARD_MODEL_NAME = "OpenAssistant/reward-model-deberta-v3-large-v2"
-
-# ================== Logging / runtime ==================
-out_dir = "/root/autodl-tmp/Results"
-eval_interval = 8
-max_iters = 1000
-always_save_checkpoint = False
-wandb_log = False
