@@ -243,6 +243,7 @@ def approx_kl_from_logprobs(
     lr = (actor_logprobs - ref_logprobs)
     k3 = kl_k3_from_logratio(lr)
     kl_mean = masked_mean(k3, mask_target.float())
+    # 返回 (报告用 KL, 安全 KL)；此处两者等价，保持接口一致
     return kl_mean, kl_mean
 
 def entropy_from_logits(logits: torch.Tensor, mask_time: torch.Tensor) -> torch.Tensor:
@@ -297,17 +298,23 @@ def gae_compute(
     B, T = values.shape
     device = values.device
 
+    # 句级 -> 逐 token（落在“最后一个有效 action token”）
     if rewards.dim() == 1:
         r_full = torch.zeros_like(values)
+        # 最后一个有效位下标；若该行全 0，则返回 0（整行奖励为 0）
         last_idx = (mask_time * torch.arange(T, device=device).view(1, T)).argmax(dim=1)
-        r_full[torch.arange(B, device=device), last_idx] = rewards
+        has_any = mask_time.sum(dim=1) > 0
+        r_full[has_any.nonzero(as_tuple=False).squeeze(-1), last_idx[has_any]] = rewards[has_any]
         rewards = r_full
     else:
         rewards = rewards * mask_time
 
     V = values
     V_next = torch.zeros_like(V)
-    V_next[:, :-1] = V[:, 1:]  # 末位 0
+    V_next[:, :-1] = V[:, 1:]
+    if not use_last_as_terminal:
+        # 允许末位 bootstrap：V_next[:, -1] = V[:, -1]
+        V_next[:, -1] = V[:, -1]
 
     deltas = (rewards + gamma * V_next - V) * mask_time
 
@@ -348,7 +355,8 @@ def compute_actor_ref_logprobs(
     ptdtype: Optional[torch.dtype] = None,
     micro_batch_size: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    forced_dtype = ptdtype if ptdtype is not None else torch.float32
+    # 统一 dtype：默认用 actor 参数 dtype，更快且避免 KL 因精度不同产生的偏差
+    forced_dtype = ptdtype if ptdtype is not None else next(actor.parameters()).dtype
     logits_actor = model_all_logits(actor, seqs, device_type, ptdtype=forced_dtype, micro_batch_size=micro_batch_size)
     logits_ref   = model_all_logits(ref,   seqs, device_type, ptdtype=forced_dtype, micro_batch_size=micro_batch_size)
     lp_actor = token_logprobs_from_logits(logits_actor, seqs)
@@ -373,6 +381,7 @@ def scatter_last_token_rewards(
 ) -> torch.Tensor:
     """
     将句级奖励散射到“最后一个 action token”，可选叠加 KL shaping。
+    行全 0 的情况不散射（保持 0），避免误落到位置 0。
     """
     B, T = mask_time.shape
     rewards_t = torch.zeros((B, T), dtype=r_seq.dtype, device=mask_time.device)
@@ -383,7 +392,10 @@ def scatter_last_token_rewards(
         denom = mask_time.sum(dim=1).clamp_min(1e-8).float()
         kl_mean = (kl_t * mask_time).sum(dim=1) / denom
         shaped = shaped - beta * kl_mean
-    rewards_t.scatter_(1, last_idx.view(B, 1), shaped.unsqueeze(1))
+    has_any = (mask_time.sum(dim=1) > 0)
+    if has_any.any():
+        idx = has_any.nonzero(as_tuple=False).squeeze(-1)
+        rewards_t[idx].scatter_(1, last_idx[idx].view(-1, 1), shaped[idx].unsqueeze(1))
     return rewards_t
 
 def scatter_uniform_rewards(r_seq, mask_time, beta_kl=None):

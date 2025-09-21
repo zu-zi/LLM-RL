@@ -181,13 +181,13 @@ class PPOTrainer:
         amsk = samples.action_mask.to(self.device)
 
         assert amsk.size(1) == seqs.size(1)
-        mask_tgt = amsk[:, 1:]
-        assert int(mask_tgt.sum().item()) == int(samples.num_actions.sum().item())
+        mask_tgt_check = amsk[:, 1:]
+        assert int(mask_tgt_check.sum().item()) == int(samples.num_actions.sum().item())
 
-        # 1) actor/ref token-logprobs（float32 更稳）
+        # 1) actor/ref token-logprobs（默认用 actor 的参数 dtype，数值异常用 _clean_logp 兜底）
         lp_actor_full, lp_ref_full, mask_target = compute_actor_ref_logprobs(
             self.actor, self.ref, seqs, amsk, self.device_type,
-            ptdtype=torch.float32, micro_batch_size=self.mb_logits
+            ptdtype=None, micro_batch_size=self.mb_logits
         )
         lp_actor_full = _clean_logp(lp_actor_full, fallback=lp_ref_full)
         lp_ref_full   = _clean_logp(lp_ref_full,   fallback=lp_actor_full)
@@ -215,10 +215,10 @@ class PPOTrainer:
         # 3) critic 值函数（完整时间轴，随后按 action 轴裁切）
         values_full = forward_values_via_actor(
             self.actor, self.critic, seqs, self.device_type,
-            ptdtype=torch.float32, micro_batch_size=self.mb_values, detach_hidden=False
+            ptdtype=None, micro_batch_size=self.mb_values, detach_hidden=False
         )
         values = values_full[:, 1:]
-        action_mask = mask_target
+        action_mask = mask_target  # [B, T-1]
 
         # 4) 句级 raw 奖励
         r_seq = self._decode_dialogue_and_score(seqs, attn)
@@ -259,9 +259,8 @@ class PPOTrainer:
 
         # 额外日志统计
         with torch.no_grad():
-            approx_kl_pi = float(masked_mean(k3_report * action_mask, action_mask.float()).detach().item())
             logits_actor = model_all_logits(
-                self.actor, seqs, self.device_type, ptdtype=torch.float32, micro_batch_size=self.mb_logits
+                self.actor, seqs, self.device_type, ptdtype=None, micro_batch_size=self.mb_logits
             )
             entropy_tok = float(entropy_from_logits(logits_actor[:, 1:, :], action_mask).detach().item())
             v_mae = float(((values - returns).abs() * action_mask).sum() / action_mask.sum().clamp_min(1e-8))
@@ -277,7 +276,7 @@ class PPOTrainer:
             explained_var = float(1.0 - (var_err / var_y.clamp_min(1e-8)))
 
         self.last_stats.update({
-            "approx_kl_pi": float(approx_kl_pi),
+            "approx_kl_pi": float(masked_mean(k3_report * action_mask, action_mask.float()).detach().item()),
             "entropy": float(entropy_tok),
             "v_mae": float(v_mae),
             "explained_var": float(explained_var),
@@ -312,22 +311,24 @@ class PPOTrainer:
         self.opt_actor.zero_grad(set_to_none=True)
 
         logits = model_all_logits(
-            self.actor, seqs, self.device_type, ptdtype=torch.float32, micro_batch_size=self.mb_logits
+            self.actor, seqs, self.device_type, ptdtype=None, micro_batch_size=self.mb_logits
         )  # [B, T, V]
         logp_all = token_logprobs_from_logits(logits, seqs)  # [B, T-1]
         logp_all = _clean_logp(logp_all)
 
-        L = old_logp.size(1)
+        # 统一长度裁剪，避免越界
+        L = min(old_logp.size(1), logp_all.size(1), action_mask.size(1), attn.size(1))
         logp = logp_all[:, :L]
-        action_mask = action_mask[:, :L]
+        old_logp = old_logp[:, :L]
+        sel_mask_full = action_mask[:, :L]
         attn = attn[:, :L]
 
         # token-entropy 子采样（只改 loss 掩码）
         if use_token_entropy:
             keep = self.ent_mask_keep if (0.0 < self.ent_mask_keep <= 1.0) else 0.25
-            sel_mask = apply_entropy_mask(logits[:, 1:, :].detach(), action_mask, keep_ratio=keep)
+            sel_mask = apply_entropy_mask(logits[:, 1:L+1, :].detach(), sel_mask_full, keep_ratio=keep)
         else:
-            sel_mask = action_mask
+            sel_mask = sel_mask_full
 
         # 重要性采样比值（对数域夹紧更稳）
         raw_delta = logp - old_logp
@@ -339,11 +340,11 @@ class PPOTrainer:
         else:
             ratio = torch.exp(raw_delta)
 
-        # 统计
+        # 统计（分位 & |adv| 均值 & 选择 token 数）
         with torch.no_grad():
             sel = sel_mask.float()
-            rdiff = (ratio - 1.0).abs() * sel
             if sel.sum() > 0:
+                rdiff = (ratio - 1.0).abs() * sel
                 q = torch.quantile(
                     rdiff[sel.bool()], torch.tensor([0.5, 0.9, 0.99], device=rdiff.device)
                 )
@@ -356,36 +357,40 @@ class PPOTrainer:
                 sel_tokens = 0
 
             self.last_stats["ratio_q50_q90_q99"] = (float(q50), float(q90), float(q99))
-            self.last_stats["ratio_max"] = float(rmax)
+            self.last_stats["ratio_max_stat"] = float(rmax)   # ← 与主训练脚本键名对齐
             self.last_stats["adv_abs_mean"] = float(adv_abs_mean)
             self.last_stats["sel_tokens"] = int(sel_tokens)
             self.last_stats["ppo_clip"] = float(self.ppo_clip)
             self.last_stats["kl_ctl_now"] = float(self.kl_ctl)
 
         # PPO clipped objective（仅选中 token）
-        surr1 = ratio * (adv * sel_mask)
-        surr2 = torch.clamp(ratio, 1.0 - self.ppo_clip, 1.0 + self.ppo_clip) * (adv * sel_mask)
+        sel = sel_mask
+        denom_tok = sel.sum().clamp_min(1e-8)
+
+        surr1 = ratio * (adv * sel)
+        surr2 = torch.clamp(ratio, 1.0 - self.ppo_clip, 1.0 + self.ppo_clip) * (adv * sel)
         policy_loss_tok = -torch.min(surr1, surr2)
 
         if self.entropy_coef != 0.0:
             ent_tok = -(F.softmax(logits[:, 1:, :], dim=-1).clamp_min(1e-12) *
                         F.log_softmax(logits[:, 1:, :], dim=-1)).sum(-1)
-            policy_loss_tok = policy_loss_tok - self.entropy_coef * ent_tok * sel_mask
+            policy_loss_tok = policy_loss_tok - self.entropy_coef * ent_tok[:, :L] * sel
 
-        policy_loss = policy_loss_tok.sum() / sel_mask.sum().clamp_min(1e-8)
+        policy_loss = policy_loss_tok.sum() / denom_tok
 
         # KL （唯一的 KL，放在 policy loss 中；对 Δlogp/ k3 做安全夹紧）
         with torch.no_grad():
             logits_ref = model_all_logits(
-                self.ref, seqs, self.device_type, ptdtype=torch.float32, micro_batch_size=self.mb_logits
+                self.ref, seqs, self.device_type, ptdtype=None, micro_batch_size=self.mb_logits
             )
             lp_ref_full = token_logprobs_from_logits(logits_ref, seqs)
             lp_ref_full = _clean_logp(lp_ref_full, fallback=logp_all)
 
-        Lr = min(logp.size(1), lp_ref_full.size(1))
+        Lr = min(logp.size(1), lp_ref_full.size(1), sel.size(1))
         lp_ref = lp_ref_full[:, :Lr]
         logp_cut = logp[:, :Lr]
-        sel = sel_mask[:, :Lr].float()
+        sel_cut = sel[:, :Lr].float()
+        denom_cut = sel_cut.sum().clamp_min(1e-8)
 
         log_ratio_raw = (logp_cut - lp_ref)
         if self.kl_token_cap > 0.0:
@@ -395,7 +400,7 @@ class PPOTrainer:
         k3 = torch.expm1(log_ratio) - log_ratio
         if self.k3_cap > 0.0:
             k3 = torch.clamp(k3, 0.0, self.k3_cap)
-        kl_mean = (k3 * sel).sum() / sel.sum().clamp_min(1e-8)
+        kl_mean = (k3 * sel_cut).sum() / denom_cut
         policy_loss = policy_loss + self.kl_ctl * kl_mean
 
         policy_loss.backward()
@@ -405,12 +410,9 @@ class PPOTrainer:
 
         # clip_frac
         with torch.no_grad():
-            Lm = ratio.size(1)
-            sel = sel_mask[:, :Lm].to(ratio.dtype)
             over = (torch.abs(ratio - 1.0) > self.ppo_clip).to(ratio.dtype)
             clipped = over * sel
-            denom = sel.sum().clamp_min(1e-8)
-            clip_frac = float((clipped.sum() / denom).item())
+            clip_frac = float((clipped.sum() / denom_tok).item())
         self.last_stats["clip_frac"] = clip_frac
 
         # ===== Critic update =====
@@ -419,11 +421,16 @@ class PPOTrainer:
 
         values_full = forward_values_via_actor(
             self.actor, self.critic, seqs, self.device_type,
-            ptdtype=torch.float32, micro_batch_size=self.mb_values, detach_hidden=True
+            ptdtype=None, micro_batch_size=self.mb_values, detach_hidden=True
         )  # [B, T]
         values_new = values_full[:, 1:]  # [B, T-1]
+        V_L = min(values_new.size(1), returns.size(1), action_mask.size(1))
+        values_new = values_new[:, :V_L]
+        returns = returns[:, :V_L]
+        am = action_mask[:, :V_L]
 
         if self.vf_clip is not None:
+            old_values = old_values[:, :V_L]
             values_clipped = old_values + (values_new - old_values).clamp(-self.vf_clip, self.vf_clip)
             vloss1 = (values_new - returns) ** 2
             vloss2 = (values_clipped - returns) ** 2
@@ -431,7 +438,7 @@ class PPOTrainer:
         else:
             v_loss_tok = F.smooth_l1_loss(values_new, returns, beta=1.0, reduction="none")
 
-        v_loss = (v_loss_tok * action_mask).sum() / action_mask.sum().clamp_min(1e-8)
+        v_loss = (v_loss_tok * am).sum() / am.sum().clamp_min(1e-8)
         v_loss.backward()
         clip_by_global_norm(self.critic.parameters(), 0.5)
         self.opt_critic.step()

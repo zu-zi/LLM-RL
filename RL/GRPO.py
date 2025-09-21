@@ -24,11 +24,11 @@ def _clean_logp(x: torch.Tensor, fallback: torch.Tensor = None):
 def _prompt_end_index(action_mask_row: torch.Tensor) -> int:
     """
     action_mask: [T]，prompt 段为 0，response 段为 1
-    返回 prompt 的最后一个索引（如果整段全 0，则返回 T-1 的 -1 视作空 prompt）
+    返回 prompt 的最后一个索引（若整段全 0，返回 T-1）
     """
     idx = (action_mask_row > 0).nonzero(as_tuple=False)
     if idx.numel() == 0:
-        return action_mask_row.numel() - 1  # 没有 response，就认为整段都是 prompt
+        return action_mask_row.numel() - 1
     first_resp = int(idx[0].item())
     return max(0, first_resp - 1)
 
@@ -45,10 +45,9 @@ class GRPOTrainer:
     """
     Group Relative Policy Optimization（无 critic，组内中心化优势）
     - 分组：按“prompt token 序列”的哈希在一个 batch 内分桶
-    - 奖励：句级 reward 送入组中心化 r_i - mean(group)
-    - 优势：把中心化后的句级奖励均匀摊到 response token（和 PPO 的 mask 口径一致）
-    - KL：沿用项目中 PPO 的“k3 KL”作为 policy-level 正则（相同口径，便于统一控制）
-    - Log：与 PPO 对齐的公共字段 + GRPO 特有诊断
+    - 奖励：句级 reward 做组内中心化 r_i - mean(group)
+    - 优势：把中心化后的句级奖励均匀摊到 response token
+    - KL：沿用 PPO 的 k3 KL 作为正则（统一口径，便于共享自适应/保险丝）
     """
     def __init__(
         self,
@@ -60,18 +59,18 @@ class GRPOTrainer:
         optimizer_actor,
         device: str = "cuda",
         mb_size_logits: int = 1,
-        group_size: int = 4,          # 期望的每 prompt 组内样本数（诊断期望值；实际由采样决定）
-        # main RL hparams（与 PPO 对齐的口径）
+        group_size: int = 4,
+        # main RL hparams
         kl_ctl: float = 0.6,
         ppo_clip: float = 0.2,
         entropy_coef: float = 0.0,
         max_grad_norm: float = 1.0,
-        # safety caps（与 PPO 对齐，便于共享自适应/保险丝）
+        # safety caps（与 PPO 对齐）
         ratio_min: float = 0.75,
         ratio_max: float = 1.25,
-        kl_token_cap: float = 0.5,    # 对 Δlogp 的逐 token 上限
-        k3_cap: float = 1.5,          # 对 k3 的逐 token 上限
-        ent_mask_keep: float = 0.20,  # 预留：若用到 token-entropy 子采样
+        kl_token_cap: float = 0.5,
+        k3_cap: float = 1.5,
+        ent_mask_keep: float = 0.20,
     ):
         self.actor = actor_model
         self.ref   = ref_model
@@ -148,8 +147,8 @@ class GRPOTrainer:
     @torch.no_grad()
     def evaluate_experience(self, samples: Samples):
         """
-        与 PPO 口径一致，返回：
-          experiences: List[Experience]（这里 values/returns 不参与训练，只占位）
+        返回：
+          experiences: List[Experience]（这里 values/returns 不参与 value 训练，只占位）
           report_kl, r_raw_mean, r_shaped_mean, r_centered_mean, safe_kl
         """
         seqs = samples.seqs.to(self.device)
@@ -160,15 +159,11 @@ class GRPOTrainer:
         mask_tgt = amsk[:, 1:]
         assert int(mask_tgt.sum().item()) == int(samples.num_actions.sum().item())
 
-        # 1) actor/ref token-logprobs（float32）
-        lp_actor_full = token_logprobs_from_logits(
-            model_all_logits(self.actor, seqs, self.device_type, ptdtype=torch.float32, micro_batch_size=self.mb_logits),
-            seqs
-        )
-        lp_ref_full = token_logprobs_from_logits(
-            model_all_logits(self.ref,   seqs, self.device_type, ptdtype=torch.float32, micro_batch_size=self.mb_logits),
-            seqs
-        )
+        # 1) actor/ref token-logprobs（默认用 actor 参数 dtype，更省显存/更快）
+        logits_actor = model_all_logits(self.actor, seqs, self.device_type, ptdtype=None, micro_batch_size=self.mb_logits)
+        logits_ref   = model_all_logits(self.ref,   seqs, self.device_type, ptdtype=None, micro_batch_size=self.mb_logits)
+        lp_actor_full = token_logprobs_from_logits(logits_actor, seqs)
+        lp_ref_full   = token_logprobs_from_logits(logits_ref,   seqs)
         lp_actor_full = _clean_logp(lp_actor_full, fallback=lp_ref_full)
         lp_ref_full   = _clean_logp(lp_ref_full,   fallback=lp_actor_full)
 
@@ -196,10 +191,8 @@ class GRPOTrainer:
         # 4) —— 分组（按 prompt ids 哈希）→ 组中心化 —— #
         B, T = seqs.size()
         prompt_hash = []
-        prompt_len = []
         for i in range(B):
             end_idx = _prompt_end_index(amsk[i])
-            prompt_len.append(end_idx + 1)
             pid = _hash_prompt_ids(seqs[i, :end_idx+1])
             prompt_hash.append(pid)
         # 按 hash 分桶
@@ -235,8 +228,8 @@ class GRPOTrainer:
                 seqs=seqs[i:i+1],
                 action_log_probs=lp_actor_full[i:i+1].detach(),
                 values=torch.zeros_like(lp_actor_full[i:i+1]).detach(),   # 占位
-                returns=rewards_t[i:i+1].detach(),                         # 直接把中心化奖励当“returns”
-                advantages=rewards_t[i:i+1].detach(),                      # 等价（GRPO 无 value）
+                returns=rewards_t[i:i+1].detach(),                         # 直接把中心化奖励当“returns/adv”
+                advantages=rewards_t[i:i+1].detach(),
                 attention_mask=attn[i:i+1],
                 action_mask=mask_tgt[i:i+1],
                 reward=r_seq[i:i+1].detach(),
@@ -246,7 +239,7 @@ class GRPOTrainer:
 
         # 公共诊断
         with torch.no_grad():
-            logits_actor = model_all_logits(self.actor, seqs, self.device_type, ptdtype=torch.float32, micro_batch_size=self.mb_logits)
+            logits_actor = model_all_logits(self.actor, seqs, self.device_type, ptdtype=None, micro_batch_size=self.mb_logits)
             entropy_tok = -(F.softmax(logits_actor[:, 1:, :], dim=-1).clamp_min(1e-12) *
                             F.log_softmax(logits_actor[:, 1:, :], dim=-1)).sum(-1)
             entropy_val = masked_mean(entropy_tok, mask_tgt.float())
@@ -286,12 +279,14 @@ class GRPOTrainer:
         self.actor.train()
         self.opt_actor.zero_grad(set_to_none=True)
 
-        logits = model_all_logits(self.actor, seqs, self.device_type, ptdtype=torch.float32, micro_batch_size=self.mb_logits)
+        logits = model_all_logits(self.actor, seqs, self.device_type, ptdtype=None, micro_batch_size=self.mb_logits)
         logp_all = token_logprobs_from_logits(logits, seqs)
         logp_all = _clean_logp(logp_all, fallback=old_logp)
 
-        L = old_logp.size(1)
+        # 统一长度裁剪，避免越界
+        L = min(old_logp.size(1), logp_all.size(1), action_mask.size(1))
         logp = logp_all[:, :L]
+        old_logp = old_logp[:, :L]
         sel_mask = action_mask[:, :L]
 
         # 重要性比值（对数域夹紧）
@@ -303,27 +298,29 @@ class GRPOTrainer:
             ratio = torch.exp(logp - old_logp)
 
         # PPO clipped objective（与 PPO 同式）
-        surr1 = ratio * (adv * sel_mask)
-        surr2 = torch.clamp(ratio, 1.0 - self.ppo_clip, 1.0 + self.ppo_clip) * (adv * sel_mask)
+        surr1 = ratio * (adv[:, :L] * sel_mask)
+        surr2 = torch.clamp(ratio, 1.0 - self.ppo_clip, 1.0 + self.ppo_clip) * (adv[:, :L] * sel_mask)
         policy_loss_tok = -torch.min(surr1, surr2)
 
         if self.entropy_coef != 0.0:
             ent_tok = -(F.softmax(logits[:, 1:, :], dim=-1).clamp_min(1e-12) *
                         F.log_softmax(logits[:, 1:, :], dim=-1)).sum(-1)
-            policy_loss_tok = policy_loss_tok - self.entropy_coef * ent_tok[:, :policy_loss_tok.size(1)] * sel_mask
+            policy_loss_tok = policy_loss_tok - self.entropy_coef * ent_tok[:, :L] * sel_mask
 
-        policy_loss = policy_loss_tok.sum() / sel_mask.sum().clamp_min(1e-8)
+        denom_tok = sel_mask.sum().clamp_min(1e-8)
+        policy_loss = policy_loss_tok.sum() / denom_tok
 
         # KL 正则（与 PPO 同口径：k3）
         with torch.no_grad():
-            logits_ref = model_all_logits(self.ref, seqs, self.device_type, ptdtype=torch.float32, micro_batch_size=self.mb_logits)
+            logits_ref = model_all_logits(self.ref, seqs, self.device_type, ptdtype=None, micro_batch_size=self.mb_logits)
             lp_ref_full = token_logprobs_from_logits(logits_ref, seqs)
             lp_ref_full = _clean_logp(lp_ref_full, fallback=logp_all)
 
-        Lr = min(logp.size(1), lp_ref_full.size(1))
+        Lr = min(logp.size(1), lp_ref_full.size(1), sel_mask.size(1))
         lp_ref = lp_ref_full[:, :Lr]
         logp_cut = logp[:, :Lr]
         sel = sel_mask[:, :Lr].float()
+        denom_cut = sel.sum().clamp_min(1e-8)
 
         log_ratio_raw = (logp_cut - lp_ref)
         if self.kl_token_cap > 0.0:
@@ -333,7 +330,7 @@ class GRPOTrainer:
         k3 = torch.expm1(log_ratio) - log_ratio
         if self.k3_cap > 0.0:
             k3 = torch.clamp(k3, 0.0, self.k3_cap)
-        kl_mean = (k3 * sel).sum() / sel.sum().clamp_min(1e-8)
+        kl_mean = (k3 * sel).sum() / denom_cut
         policy_loss = policy_loss + self.kl_ctl * kl_mean
 
         policy_loss.backward()
@@ -341,25 +338,22 @@ class GRPOTrainer:
             torch.nn.utils.clip_grad_norm_(list(self.actor.parameters()), self.max_grad_norm)
         self.opt_actor.step()
 
-        # 统计（与 PPO 对齐）
+        # 统计（与主循环键名 100% 对齐）
         with torch.no_grad():
-            Lm = ratio.size(1)
-            sel = sel_mask[:, :Lm].to(ratio.dtype)
             over = (torch.abs(ratio - 1.0) > self.ppo_clip).to(ratio.dtype)
-            clipped = over * sel
-            denom = sel.sum().clamp_min(1e-8)
-            clip_frac = float((clipped.sum() / denom).item())
+            clipped = over * sel_mask[:, :ratio.size(1)].to(ratio.dtype)
+            clip_frac = float((clipped.sum() / denom_tok).item())
 
-            # ratio/adv 诊断
-            rdiff = (ratio - 1.0).abs() * sel
-            if sel.sum() > 0:
+            rdiff = (ratio - 1.0).abs() * sel_mask[:, :ratio.size(1)].float()
+            if rdiff.sum() > 0:
                 q = torch.quantile(
-                    rdiff[sel.bool()], torch.tensor([0.5, 0.9, 0.99], device=rdiff.device)
+                    rdiff[rdiff > 0], torch.tensor([0.5, 0.9, 0.99], device=rdiff.device)
                 )
                 q50, q90, q99 = q.tolist()
                 rmax = float(rdiff.max().item())
-                adv_abs_mean = float(((adv.abs() * sel).sum() / sel.sum()).item())
-                sel_tokens = int(sel.sum().item())
+                adv_abs_mean = float(((adv.abs() * sel_mask.float()).sum() /
+                                      sel_mask.float().sum()).item())
+                sel_tokens = int(sel_mask.sum().item())
             else:
                 q50 = q90 = q99 = rmax = adv_abs_mean = 0.0
                 sel_tokens = 0
@@ -367,7 +361,7 @@ class GRPOTrainer:
         self.last_stats.update({
             "clip_frac": float(clip_frac),
             "ratio_q50_q90_q99": (float(q50), float(q90), float(q99)),
-            "ratio_max": float(rmax),
+            "ratio_max_stat": float(rmax),   # ← 关键：主脚本读取的是 ratio_max_stat
             "adv_abs_mean": float(adv_abs_mean),
             "sel_tokens": int(sel_tokens),
             "ppo_clip": float(self.ppo_clip),

@@ -11,15 +11,15 @@ from typing import List, Dict, Optional, Tuple
 ROLL_GLOB = "roll_*.jsonl"
 TMP_SUFFIX = ".tmp"
 
-# —— 池子策略（按需硬编码，别做成超参，稳定即可）——
-ROLL_MAX_AGE_SEC = 420          # 样本TTL=7分钟，保证“不陈旧”
-ROLL_MIN_RESP_TOKENS = 16       # 严一点：和训练/worker 保持一致
+# —— 池子策略（按需硬编码，稳定即可）——
+ROLL_MAX_AGE_SEC = 420          # 样本TTL，避免过陈旧
+ROLL_MIN_RESP_TOKENS = 16       # 与训练/worker 一致
 ROLL_DEDUP_PROMPT_IN_BATCH = True
 ROLL_FILE_ORDER = "mtime_desc"  # 新文件优先
 ROLL_VERBOSE = True
 
-# —— 估算参数（之前代码里引用但没定义，导致异常）——
-ROLL_SCAN_CAP_FILES = 12        # 最多扫描这么多文件做估算
+# —— 估算参数 —— 
+ROLL_SCAN_CAP_FILES = 12        # 估算时最多扫描这么多文件
 ROLL_APPROX_PER_FILE = 64       # 兜底：每文件大致可用行数
 
 # 基础 IO
@@ -85,6 +85,7 @@ def _sanitize_item(it: dict) -> Optional[dict]:
     - 必须有 prompt_ids/full_ids 且为 List[int]
     - full_ids 长度 > prompt_ids（保证有 response）
     - 填充 ts/hid/pid 等元数据
+    - 保留 model_sig 与 _mtime（如有），供“按导出版本过滤”
     """
     if not isinstance(it, dict):
         return None
@@ -112,6 +113,12 @@ def _sanitize_item(it: dict) -> Optional[dict]:
     for k in ("prompt_text", "response_text"):
         if k in it:
             clean[k] = it[k]
+    # 关键：保留 model_sig 与 _mtime（若存在）
+    if isinstance(it.get("model_sig"), str):
+        clean["model_sig"] = it["model_sig"]
+    if isinstance(it.get("_mtime"), (int, float)):
+        clean["_mtime"] = float(it["_mtime"])
+
     return clean
 
 # 写入
@@ -318,13 +325,14 @@ def dequeue_items(dirpath: str, n: int) -> List[Dict]:
 
     return out
 
-# ============ 新增：GRPO 成组弹样 ============
-
-def dequeue_groups(dirpath: str, group_size: int, num_groups: int) -> List[List[Dict]]:
+# ============ GRPO 成组弹样（与导出版本对齐） ============
+def dequeue_groups(dirpath: str, group_size: int, num_groups: int,
+                   required_model_sig: Optional[str] = None) -> List[List[Dict]]:
     """
     从池中按 pid 成组“弹出”样本：
     - 与 dequeue_items 相同的新鲜度与最小长度过滤
-    - 但不做 prompt 去重；相反，优先把同 pid 凑满 group_size 条
+    - 不做 prompt 去重；相反，优先把同 pid 凑满 group_size 条
+    - 仅保留 model_sig 与 required_model_sig 匹配的样本（如指定）
     - 取走的行不会回写；未被取走的仍按原样回写
     返回：list[group]，每个 group 是 list[dict]，长度==group_size
     """
@@ -370,6 +378,9 @@ def dequeue_groups(dirpath: str, group_size: int, num_groups: int) -> List[List[
                 continue
             if not _resp_len_ok(clean):
                 continue
+            if isinstance(required_model_sig, str) and required_model_sig:
+                if clean.get("model_sig") != required_model_sig:
+                    continue
             pid = clean["pid"]
             pid_bins.setdefault(pid, []).append((ln, clean))
 
@@ -431,7 +442,12 @@ def dequeue_groups(dirpath: str, group_size: int, num_groups: int) -> List[List[
                 pass
 
     if ROLL_VERBOSE:
-        print(f"[rollout_pool.dequeue_groups] want_groups={want_groups} group_size={gs} got_groups={len(out_groups)} used_lines={len(used_lines)} ttl={ROLL_MAX_AGE_SEC}s min_resp={ROLL_MIN_RESP_TOKENS}")
+        print(
+            f"[rollout_pool.dequeue_groups] want_groups={want_groups} group_size={gs} "
+            f"got_groups={len(out_groups)} used_lines={len(used_lines)} "
+            f"ttl={ROLL_MAX_AGE_SEC}s min_resp={ROLL_MIN_RESP_TOKENS} "
+            f"model_sig={'<any>' if not required_model_sig else required_model_sig}"
+        )
 
     return out_groups
 
@@ -494,8 +510,6 @@ def get_pool_stats(dirpath: str) -> Dict:
     """
     返回更详细的池统计（用于日志/监控）。
     """
-    import statistics as _st
-
     stats = {
         "files": 0,
         "candidates": 0,

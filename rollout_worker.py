@@ -1,3 +1,4 @@
+# rollout_worker.py
 import argparse
 import os
 import json
@@ -72,7 +73,7 @@ def _retry_sleep(backoff_s: float) -> float:
     time.sleep(backoff_s)
     return min(backoff_s * 2.0, 8.0)
 
-# ====== 关键：统一的“签名”提取，用于决定是否重载 ======
+# ====== 导出目录“签名”，用于与训练侧严格对齐 ======
 def _dir_mtime_signature(path: str, glob_pat: str = "**/*", limit: int = 4096) -> float:
     sig = 0.0
     if not os.path.isdir(path): return sig
@@ -187,7 +188,7 @@ def main():
     ap.add_argument("--train-indices", type=str, default=None)
     ap.add_argument("--eval-indices", type=str, default=None)
 
-    # —— 热重载策略（新增）——
+    # 热重载策略
     ap.add_argument("--reload-strategy", type=str, default="dir_mtime",
                     choices=["none", "pointer", "dir_mtime", "realpath"])
     ap.add_argument("--model-pointer", type=str, default=None,
@@ -198,7 +199,7 @@ def main():
     ap.add_argument("--min-free-mb", type=int, default=6000)
     ap.add_argument("--sleep-on-lowmem", type=float, default=1.0)
 
-    # —— 新增：GRPO 需要 —— 每个 prompt 生成多条
+    # GRPO：每个 prompt 生成多条
     ap.add_argument("--per-prompt", type=int, default=1,
                     help="为同一 prompt 生成的样本数量（GRPO 设为 group_size）")
 
@@ -218,7 +219,7 @@ def main():
         print(f"[worker][fatal] failed to load prompts: {e}", flush=True); sys.exit(0)
 
     N = len(prompt_token_ids); all_indices = list(range(N))
-    tok = tiktoken.get_encoding("gpt2"); eos_token = "<|endoftext|>"
+    tok = tiktoken.get_encoding("gpt2")
 
     # train / eval 选择
     train_idx_from_file = _load_json_list(args.train_indices)
@@ -286,7 +287,7 @@ def main():
                 print(f"[worker] low mem {free_mb}MB -> sleep {args.sleep_on_lowmem}s", flush=True)
                 time.sleep(max(0.1, float(args.sleep_on_lowmem)))
 
-        # 作为“prompt 组”的数量（每个组会被复制 per_prompt 次）
+        # “prompt 组”的数量（每个组会被复制 per_prompt 次）
         take_groups = min(mb, args.count - total_ok)
         if len(train_indices) >= take_groups:
             base_idxs = random.sample(train_indices, k=take_groups)
@@ -299,7 +300,6 @@ def main():
             idxs.extend([i] * per_prompt)
 
         batch_prompts_ids  = [prompt_token_ids[i] for i in idxs]
-        # 直接用提示文本（保持和你原逻辑一致）
         batch_prompts_txt  = [tok.decode(prompt_token_ids[i]) for i in idxs]
 
         params = {
@@ -353,12 +353,15 @@ def main():
             if (pid, resp_md5) in seen_pid_resp: continue
             seen_hid.add(key_hid); seen_pid_resp.add((pid, resp_md5))
 
+            # 关键：写入 model_sig 与 _mtime，便于训练侧“按导出版本过滤”
             stash.append({
                 "prompt_ids": batch_prompts_ids[k],
                 "full_ids": full_ids,
                 "ts": time.time(),
                 "pid": pid,
                 "hid": _hash_ids(full_ids),
+                "model_sig": _realpath_signature(engw.path),
+                "_mtime": time.time(),
             })
 
             total_ok += 1
