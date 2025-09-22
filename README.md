@@ -187,6 +187,8 @@ mkdir -p /root/autodl-tmp/sgl_pool /root/autodl-tmp/actor_exports
 rm -f /root/autodl-tmp/Results/metrics.csv
 rm -f /root/autodl-tmp/Results/rollout_logs/*.log
 
+sudo rm -rf /root/autodl-tmp/.Trash-0/*
+
 python -u rollout_worker.py \
   --model /root/autodl-tmp/actor_exports/current \
   --reload-strategy realpath \

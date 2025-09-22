@@ -1,14 +1,10 @@
 import os
-os.environ["WANDB_MODE"] = "offline"
-os.environ["WANDB_SILENT"] = "true"
+os.environ["WANDB_MODE"] = "offline"   # 纯离线记录到本地
+os.environ["WANDB_SILENT"] = "true"    # 少打日志
+wandb_log  = True
 from datetime import datetime
 
-# —— 日志 —— #
-wandb_log      = True
-wandb_project  = "LLM-RL-PPO"
-wandb_run_name = f"ppo_gpt2l_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-
-# —— 运行 —— #
+# -------- 运行 / 日志 --------
 out_dir        = "/root/autodl-tmp/Results"
 eval_interval  = 10
 max_iters      = 1500
@@ -17,40 +13,31 @@ compile        = False
 backend        = "nccl"
 device         = "cuda"
 
-# —— 模型 / 上下文 —— #
-init_from   = "gpt2-large"
-block_size  = 256
+# -------- Weights & Biases --------
+wandb_project  = "LLM-RL-PPO"
+wandb_run_name = f"ppo_gpt2l_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+# -------- 模型 / 上下文 --------
+init_from   = "gpt2-large"  # actor/ref 初始化
+block_size  = 256           # 96(prompt) + ~96(new) + 余量；更省显存更稳
 bias        = False
 dropout     = 0.0
 
-# —— 批次 / 优化 —— #
-batch_size                  = 4
-gradient_accumulation_steps = 1
-RL_learning_rate            = 1.7e-6
-CRITIC_LR_MULT              = 1.8    # 训练脚本里若支持：critic_lr = RL_learning_rate * CRITIC_LR_MULT
+# -------- 批次 / 优化 --------
+batch_size                  = 4        # 32GB 稳健
+gradient_accumulation_steps = 1        # Trainer 内部有 micro-batch
+RL_learning_rate            = 1.7e-6   # 比 1.5e-6 略激进，收敛更快
 weight_decay                = 5e-3
 beta1, beta2                = 0.9, 0.95
 max_grad_norm               = 0.5
-vf_clip                     = 0.15   # 稍放松（日志里 v_mae 偏大）
+vf_clip                     = 0.1
 
-# —— PPO 关键超参 —— #
-kl_ctl_init  = 1.4           # 提高初值，抑制你日志中期 KL 失控
-kl_ctl_min   = 0.35          # 加下限（训练代码里若有自适应，别降到 0.15 以下）
-ppo_clip     = 0.15          # 收紧步长，减少 clip 爆表
-entropy_coef = 0.003         # 略降，避免与 KL 冲突；高 KL 时建议训练里把它门控到 0
+# -------- PPO 关键超参 --------
+kl_ctl_init  = 1.2         # 稍低于 0.9；前期探索更自由，配合自适应调整
+ppo_clip     = 0.2
+entropy_coef = 0.005      # 轻微熵正则，稳定但不过分抑制
 
-# —— PPO 安全帽（需要在构造 PPOTrainer 时传入这些）—— #
-ratio_min     = 0.75
-ratio_max     = 1.25
-kl_token_cap  = 0.40         # 0.5 -> 0.4
-k3_cap        = 1.20         # 1.5 -> 1.2
-ent_mask_keep = 0.20
-
-# —— iter0 —— #
-EVAL_ITER0     = True
-ITER0_BATCHES  = 2
-
-# —— 采样口径 —— #
+# -------- 采样口径（与离线池一致）--------
 SAMPLE_TEMPERATURE = 0.7
 SAMPLE_TOP_P       = 0.9
 SAMPLE_TOP_K       = 0
@@ -58,24 +45,25 @@ SAMPLE_REP_PENALTY = 1.1
 SAMPLE_STOPS       = ["\nHuman:", "\n\nHuman:"]
 MIN_RESP_TOK       = 16
 
-# —— sglang 样本池 —— #
+# -------- sglang 离线样本池 --------
 SGLANG_ON              = True
 SGLANG_OFFLINE         = True
-SGLANG_MODEL_PATH      = "/root/autodl-tmp/actor_exports/current"
-SGLANG_EXPORT_BASE     = "/root/autodl-tmp/actor_exports"
-SGLANG_MODEL_POINTER   = None
+SGLANG_MODEL_PATH   = "/root/autodl-tmp/actor_exports/current"                # 可换更快推理模型
+SGLANG_EXPORT_BASE  = "/root/autodl-tmp/actor_exports" 
+SGLANG_MODEL_POINTER   = None                         # 需要热切换时填指针文件路径
 SGLANG_SYNC_DIR        = "/root/autodl-tmp/sgl_pool"
-SGLANG_ROLLOUT_TARGET  = 300   # 200 -> 300，更稳
-SGLANG_REFILL_BATCH    = 32
-SGLANG_MAX_NEW         = 128
-SGLANG_EXPORT_EVERY   = 30
-# —— 补货调度 —— #
-ROLL_LOW_WATERMARK_FACTOR = 3  # 2 -> 3
-ROLL_REFILL_COUNT         = 48 # 40 -> 48
-ROLL_COOLDOWN_SEC         = 4  # 6 -> 4
-ROLL_MIN_FREE_MB          = 2500
-REFRESH_EVERY_BATCHES     = 26
-FRESH_RATIO               = 0.5
+SGLANG_ROLLOUT_TARGET  = 200                          # 目标可用样本估算上限
+SGLANG_REFILL_BATCH    = 32                           # 一次子进程总生成量（粗粒度）
+SGLANG_MAX_NEW         = 128                           # 与 block_size 配合（96 new 更稳）
 
-# —— 奖励模型 —— #
+# —— 补货调度（避免与训练抢显存）——
+ROLL_LOW_WATERMARK_FACTOR = 2      # 低于 batch_size*2 才补
+ROLL_REFILL_COUNT         = 40     # 实际触发的小颗粒补货
+ROLL_COOLDOWN_SEC         = 6    # 两次补货最小间隔
+ROLL_MIN_FREE_MB          = 2500   # 触发前至少空闲显存（MB）
+REFRESH_EVERY_BATCHES     = 26     # worker 每 N 批检查一次指针
+FRESH_RATIO               = 0.5    # 训练 batch 中“在线新鲜样本”占比（更稳）
+
+# -------- 奖励模型（英文）--------
+# 资源更友好（CPU/RAM 压力小），总体效果稳定；若追求更强可切回 large-v2
 REWARD_MODEL_NAME = "OpenAssistant/reward-model-deberta-v3-large-v2"
