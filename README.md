@@ -203,6 +203,24 @@ python3 train_RL_only.py config/train_RL_PPO_0.py
 python3 train_RL_only.py config/train_GRPO_0.py
 ```
 
+```
+rm -f  /root/autodl-tmp/rlhf_ppo/rollout_pool/roll_*.jsonl
+rm -f  /root/autodl-tmp/rlhf_ppo/rollout_pool/*.tmp
+rm -f  /root/autodl-tmp/rlhf_ppo/rollout_pool/*.lock
+
+rm -f  /root/autodl-tmp/rlhf_ppo/hf_export/current
+rm -rf /root/autodl-tmp/rlhf_ppo/hf_export/step_*
+rm -rf /root/autodl-tmp/rlhf_ppo/hf_export/step_init
+
+rm -f  /root/autodl-tmp/rlhf_ppo/checkpoints/*.pt
+
+rm -rf /root/autodl-tmp/rlhf_ppo/logs/*
+
+<!-- mkdir -p /root/autodl-tmp/rlhf_ppo/rollout_pool \
+         /root/autodl-tmp/rlhf_ppo/hf_export \
+         /root/autodl-tmp/rlhf_ppo/checkpoints \
+         /root/autodl-tmp/rlhf_ppo/logs -->
+```
 
 <!-- ## finetue:
 + pip install torch numpy transformers datasets tiktoken wandb tqdm

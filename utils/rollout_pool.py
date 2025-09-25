@@ -1,28 +1,22 @@
 # utils/rollout_pool.py
-import os
-import json
-import uuid
-import glob
-import time
-import random
-import hashlib
-from typing import List, Dict, Optional, Tuple
+import os, json, uuid, glob, time, random, hashlib
+from typing import List, Dict, Optional
 
 ROLL_GLOB = "roll_*.jsonl"
 TMP_SUFFIX = ".tmp"
 
-# —— 池子策略（按需硬编码，稳定即可）——
-ROLL_MAX_AGE_SEC = 420          # 样本TTL，避免过陈旧
-ROLL_MIN_RESP_TOKENS = 16       # 与训练/worker 一致
+# 固定策略
+ROLL_MAX_AGE_SEC = 420
+ROLL_MIN_RESP_TOKENS = 24
 ROLL_DEDUP_PROMPT_IN_BATCH = True
-ROLL_FILE_ORDER = "mtime_desc"  # 新文件优先
+ROLL_FILE_ORDER = "mtime_desc"
 ROLL_VERBOSE = True
 
-# —— 估算参数 —— 
-ROLL_SCAN_CAP_FILES = 12        # 估算时最多扫描这么多文件
-ROLL_APPROX_PER_FILE = 64       # 兜底：每文件大致可用行数
+# 估算用
+ROLL_SCAN_CAP_FILES = 12
+ROLL_APPROX_PER_FILE = 64
 
-# 基础 IO
+# ---- 基础 IO ----
 def ensure_dir(d: str) -> None:
     os.makedirs(d, exist_ok=True)
 
@@ -30,8 +24,7 @@ def _atomic_write(path: str, text: str) -> None:
     tmp = path + TMP_SUFFIX
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
+        f.flush(); os.fsync(f.fileno())
     os.replace(tmp, path)
 
 def _read_lines(fp: str) -> List[str]:
@@ -39,40 +32,32 @@ def _read_lines(fp: str) -> List[str]:
         return f.readlines()
 
 def _safe_parse(line: str) -> Optional[dict]:
-    line = line.strip()
-    if not line:
-        return None
     try:
-        return json.loads(line)
+        s = line.strip()
+        return json.loads(s) if s else None
     except Exception:
         return None
 
 def _atomic_rewrite(fp: str, lines: List[str]) -> None:
     if not lines:
-        try:
-            os.remove(fp)
-        except FileNotFoundError:
-            pass
+        try: os.remove(fp)
+        except FileNotFoundError: pass
         return
-    if lines and (not lines[-1].endswith("\n")):
+    if not lines[-1].endswith("\n"):
         lines = lines + ["\n"]
     _atomic_write(fp, "".join(lines))
 
 def _clean_tmp_leftovers(dirpath: str) -> None:
     for fp in glob.glob(os.path.join(dirpath, f"*{TMP_SUFFIX}")):
-        try:
-            os.remove(fp)
-        except Exception:
-            pass
+        try: os.remove(fp)
+        except Exception: pass
 
 def _now_ts() -> float:
     return time.time()
 
-# 校验与哈希
+# ---- 校验 / 规范化 ----
 def _is_int_list(x) -> bool:
-    if not isinstance(x, list):
-        return False
-    return all(isinstance(t, int) for t in x)
+    return isinstance(x, list) and all(isinstance(t, int) for t in x)
 
 def _hash_ids(ids: List[int]) -> str:
     h = hashlib.sha1()
@@ -80,486 +65,207 @@ def _hash_ids(ids: List[int]) -> str:
     return h.hexdigest()
 
 def _sanitize_item(it: dict) -> Optional[dict]:
-    """
-    清洗输入样本：
-    - 必须有 prompt_ids/full_ids 且为 List[int]
-    - full_ids 长度 > prompt_ids（保证有 response）
-    - 填充 ts/hid/pid 等元数据
-    - 保留 model_sig 与 _mtime（如有），供“按导出版本过滤”
-    """
-    if not isinstance(it, dict):
-        return None
-    p = it.get("prompt_ids", None)
-    f = it.get("full_ids", None)
-    if (not _is_int_list(p)) or (not _is_int_list(f)):
-        return None
-    if len(f) <= len(p):
-        return None
+    if not isinstance(it, dict): return None
+    p, f = it.get("prompt_ids"), it.get("full_ids")
+    if not (_is_int_list(p) and _is_int_list(f)): return None
+    if len(f) <= len(p): return None  # 必须含响应
 
-    # 元信息
-    ts = it.get("ts", None)
-    if not isinstance(ts, (int, float)):
-        ts = _now_ts()
+    ts = it.get("ts"); ts = float(ts) if isinstance(ts, (int, float)) else _now_ts()
     pid = it.get("pid") or _hash_ids(p)
     hid = it.get("hid") or _hash_ids(f)
 
-    clean = {
-        "prompt_ids": p,
-        "full_ids": f,
-        "ts": float(ts),
-        "pid": pid,
-        "hid": hid,
-    }
+    out = {"prompt_ids": p, "full_ids": f, "ts": ts, "pid": pid, "hid": hid}
     for k in ("prompt_text", "response_text"):
-        if k in it:
-            clean[k] = it[k]
-    # 关键：保留 model_sig 与 _mtime（若存在）
-    if isinstance(it.get("model_sig"), str):
-        clean["model_sig"] = it["model_sig"]
-    if isinstance(it.get("_mtime"), (int, float)):
-        clean["_mtime"] = float(it["_mtime"])
+        if k in it: out[k] = it[k]
+    return out
 
-    return clean
-
-# 写入
+# ---- 写入 ----
 def enqueue_items(dirpath: str, items: List[Dict]) -> str:
-    """
-    写入一批 JSONL（原子落盘）
-    items: [{'prompt_ids': [...], 'full_ids': [...], ...}]
-    - 仅写入通过 _sanitize_item 的样本
-    - 批内按 hid 去重
-    - 自动写入 ts/pid/hid
-    """
-    ensure_dir(dirpath)
-    _clean_tmp_leftovers(dirpath)
+    ensure_dir(dirpath); _clean_tmp_leftovers(dirpath)
+    path = os.path.join(dirpath, f"roll_{uuid.uuid4().hex}.jsonl")
 
-    fname = f"roll_{uuid.uuid4().hex}.jsonl"
-    path = os.path.join(dirpath, fname)
-
-    seen = set()
-    buf = []
-    kept, dropped = 0, 0
-
+    seen, buf, kept, dropped = set(), [], 0, 0
     for it in items:
         clean = _sanitize_item(it)
-        if clean is None:
-            dropped += 1
-            continue
-        h = clean["hid"]
-        if h in seen:
-            dropped += 1
-            continue
-        seen.add(h)
+        if clean is None: dropped += 1; continue
+        hid = clean["hid"]
+        if hid in seen: dropped += 1; continue
+        seen.add(hid)
         buf.append(json.dumps(clean, ensure_ascii=False))
         kept += 1
 
     if not buf:
-        return path  # 返回占位路径，但不会落盘
+        return path  # 不落盘：用于上层拿到拟写入路径也不影响逻辑
 
     _atomic_write(path, "\n".join(buf) + "\n")
-
     if ROLL_VERBOSE:
         print(f"[rollout_pool.enqueue] file={os.path.basename(path)} kept={kept} dropped={dropped}")
-
     return path
 
-# 读取顺序
+# ---- 读取 ----
 def _file_order(files: List[str]) -> List[str]:
-    if not files:
-        return files
+    if not files: return files
     mode = ROLL_FILE_ORDER
     if mode == "random":
-        random.shuffle(files)
-        return files
+        random.shuffle(files); return files
     if mode == "name_asc":
-        return sorted(files)  # 字典序
-    # 默认：按 mtime 逆序（新文件优先）
-    files_sorted = sorted(files, key=lambda fp: os.path.getmtime(fp), reverse=True)
-    return files_sorted
+        return sorted(files)
+    return sorted(files, key=lambda fp: os.path.getmtime(fp), reverse=True)
 
 def _is_fresh(obj: dict, now_ts: float) -> bool:
-    if ROLL_MAX_AGE_SEC <= 0:
-        return True
+    if ROLL_MAX_AGE_SEC <= 0: return True
     ts = obj.get("ts")
-    if not isinstance(ts, (int, float)):
-        return True
-    age = max(0.0, now_ts - float(ts))
-    return age <= float(ROLL_MAX_AGE_SEC)
+    if not isinstance(ts, (int, float)): return True
+    return (now_ts - float(ts)) <= float(ROLL_MAX_AGE_SEC)
 
 def _resp_len_ok(obj: dict) -> bool:
-    p = obj.get("prompt_ids", [])
-    f = obj.get("full_ids", [])
-    if not (_is_int_list(p) and _is_int_list(f)):
-        return False
-    resp_len = len(f) - len(p)
-    return resp_len >= max(0, int(ROLL_MIN_RESP_TOKENS))
+    p, f = obj.get("prompt_ids", []), obj.get("full_ids", [])
+    if not (_is_int_list(p) and _is_int_list(f)): return False
+    return (len(f) - len(p)) >= max(0, int(ROLL_MIN_RESP_TOKENS))
 
 def _stringify(obj: dict) -> str:
     return json.dumps(obj, ensure_ascii=False)
 
 def dequeue_items(dirpath: str, n: int) -> List[Dict]:
-    """
-    从池中“弹出”n 条样本（优先新鲜）：
-    - 文件顺序：默认按 mtime 逆序（新 -> 旧）
-    - 行过滤：TTL（max_age_sec）、最小回复长度
-    - 批内去重：按 hid；可选地按 pid（去重复 prompt）
-    - 文件内就地消费：取走行不再放回；淘汰行直接丢弃；剩余行原子回写
-    返回：list[dict]，长度 <= n
-    """
-    ensure_dir(dirpath)
-    _clean_tmp_leftovers(dirpath)
-
+    ensure_dir(dirpath); _clean_tmp_leftovers(dirpath)
     want = max(int(n), 0)
-    if want == 0:
-        return []
+    if want == 0: return []
 
     files = _file_order(sorted(glob.glob(os.path.join(dirpath, ROLL_GLOB))))
-    out: List[Dict] = []
-
-    seen_hid = set()
-    seen_pid = set()
+    out, seen_hid, seen_pid = [], set(), set()
     now_ts = _now_ts()
 
-    # 统计
-    cnt_scanned = 0
-    cnt_taken = 0
-    cnt_dropped_stale = 0
-    cnt_dropped_short = 0
-    cnt_dropped_dup_hid = 0
-    cnt_dropped_dup_pid = 0
+    cnt_scanned = cnt_taken = cnt_dropped_stale = 0
+    cnt_dropped_short = cnt_dropped_dup_hid = cnt_dropped_dup_pid = 0
 
     for fp in files:
-        if len(out) >= want:
-            break
+        if len(out) >= want: break
+        try: lines = _read_lines(fp)
+        except (FileNotFoundError, PermissionError): continue
 
-        try:
-            lines = _read_lines(fp)
-        except (FileNotFoundError, PermissionError):
-            continue
+        def _ts(ln: str) -> float:
+            obj = _safe_parse(ln)
+            return float(obj["ts"]) if isinstance(obj, dict) and isinstance(obj.get("ts"), (int, float)) else 0.0
 
+        lines_sorted = sorted(lines, key=_ts, reverse=True)
         keep_lines: List[str] = []
 
-        # 文件内也“新鲜优先”：按 ts 逆序消费
-        def _ts_from_line(ln: str) -> float:
-            obj = _safe_parse(ln)
-            if isinstance(obj, dict) and isinstance(obj.get("ts"), (int, float)):
-                return float(obj["ts"])
-            return 0.0
-
-        lines_sorted = sorted(lines, key=_ts_from_line, reverse=True)
-
         for ln in lines_sorted:
-            obj = _safe_parse(ln)
-            cnt_scanned += 1
-
-            if obj is None:
-                continue
-
+            obj = _safe_parse(ln); cnt_scanned += 1
+            if obj is None: continue
             clean = _sanitize_item(obj)
-            if clean is None:
-                continue
-
-            if not _is_fresh(clean, now_ts):
-                cnt_dropped_stale += 1
-                continue
-
-            if not _resp_len_ok(clean):
-                cnt_dropped_short += 1
-                continue
+            if clean is None: continue
+            if not _is_fresh(clean, now_ts): cnt_dropped_stale += 1; continue
+            if not _resp_len_ok(clean): cnt_dropped_short += 1; continue
 
             hid = clean["hid"]
-            if hid in seen_hid:
-                cnt_dropped_dup_hid += 1
-                continue
+            if hid in seen_hid: cnt_dropped_dup_hid += 1; continue
 
             if ROLL_DEDUP_PROMPT_IN_BATCH:
                 pid = clean["pid"]
-                if pid in seen_pid:
-                    cnt_dropped_dup_pid += 1
-                    continue
+                if pid in seen_pid: cnt_dropped_dup_pid += 1; continue
 
-            out.append(clean)
-            seen_hid.add(hid)
-            if ROLL_DEDUP_PROMPT_IN_BATCH:
-                seen_pid.add(clean["pid"])
+            out.append(clean); seen_hid.add(hid)
+            if ROLL_DEDUP_PROMPT_IN_BATCH: seen_pid.add(clean["pid"])
             cnt_taken += 1
+            if len(out) >= want: break
 
-            if len(out) >= want:
-                break
-
-        # 回写：仅保留“未被选中且仍合格”的行
+        # 回写剩余合格但未被取走的
         for ln in lines:
             obj = _safe_parse(ln)
-            if obj is None:
-                continue
-            clean = _sanitize_item(obj)
-            if clean is None:
-                continue
-            if not _is_fresh(clean, now_ts):
-                continue
-            if not _resp_len_ok(clean):
-                continue
-            if clean["hid"] in seen_hid:
-                continue
-            keep_lines.append(_stringify(clean) + "\n")
+            if obj is None: continue
+            c = _sanitize_item(obj)
+            if c is None: continue
+            if not _is_fresh(c, now_ts): continue
+            if not _resp_len_ok(c): continue
+            if c["hid"] in seen_hid: continue
+            keep_lines.append(_stringify(c) + "\n")
 
-        try:
-            _atomic_rewrite(fp, keep_lines)
+        try: _atomic_rewrite(fp, keep_lines)
         except Exception:
-            try:
-                os.remove(fp)
-            except Exception:
-                pass
+            try: os.remove(fp)
+            except Exception: pass
 
     if ROLL_VERBOSE:
         print(
             "[rollout_pool.dequeue] "
-            f"want={want} got={len(out)} "
-            f"scanned={cnt_scanned} taken={cnt_taken} "
-            f"drop(stale)={cnt_dropped_stale} "
-            f"drop(short)={cnt_dropped_short} "
-            f"drop(dup_hid)={cnt_dropped_dup_hid} "
-            f"drop(dup_pid)={cnt_dropped_dup_pid} "
+            f"want={want} got={len(out)} scanned={cnt_scanned} taken={cnt_taken} "
+            f"drop(stale)={cnt_dropped_stale} drop(short)={cnt_dropped_short} "
+            f"drop(dup_hid)={cnt_dropped_dup_hid} drop(dup_pid)={cnt_dropped_dup_pid} "
             f"ttl={ROLL_MAX_AGE_SEC}s min_resp={ROLL_MIN_RESP_TOKENS}"
         )
-
     return out
 
-# ============ GRPO 成组弹样（与导出版本对齐） ============
-def dequeue_groups(dirpath: str, group_size: int, num_groups: int,
-                   required_model_sig: Optional[str] = None) -> List[List[Dict]]:
-    """
-    从池中按 pid 成组“弹出”样本：
-    - 与 dequeue_items 相同的新鲜度与最小长度过滤
-    - 不做 prompt 去重；相反，优先把同 pid 凑满 group_size 条
-    - 仅保留 model_sig 与 required_model_sig 匹配的样本（如指定）
-    - 取走的行不会回写；未被取走的仍按原样回写
-    返回：list[group]，每个 group 是 list[dict]，长度==group_size
-    """
-    ensure_dir(dirpath)
-    _clean_tmp_leftovers(dirpath)
-
-    want_groups = max(int(num_groups), 0)
-    gs = max(int(group_size), 1)
-    if want_groups == 0:
-        return []
-
-    files = _file_order(sorted(glob.glob(os.path.join(dirpath, ROLL_GLOB))))
-    now_ts = _now_ts()
-
-    # pid -> [(line_text, clean_obj)]（同 pid 内按 ts 降序）
-    pid_bins: Dict[str, List[Tuple[str, dict]]] = {}
-    # 为回写准备：先把原始行保存一份，后面剔除“已消费”的
-    file_lines_keep: Dict[str, List[str]] = {}
-
-    def _ts_from_line(ln: str) -> float:
-        obj = _safe_parse(ln)
-        if isinstance(obj, dict) and isinstance(obj.get("ts"), (int, float)):
-            return float(obj["ts"])
-        return 0.0
-
-    # 扫描并分桶
-    for fp in files:
-        try:
-            lines = _read_lines(fp)
-        except (FileNotFoundError, PermissionError):
-            continue
-
-        file_lines_keep[fp] = lines[:]  # 原样拷贝，稍后剔除已消费行
-        lines_sorted = sorted(lines, key=_ts_from_line, reverse=True)
-        for ln in lines_sorted:
-            obj = _safe_parse(ln)
-            if obj is None:
-                continue
-            clean = _sanitize_item(obj)
-            if clean is None:
-                continue
-            if not _is_fresh(clean, now_ts):
-                continue
-            if not _resp_len_ok(clean):
-                continue
-            if isinstance(required_model_sig, str) and required_model_sig:
-                if clean.get("model_sig") != required_model_sig:
-                    continue
-            pid = clean["pid"]
-            pid_bins.setdefault(pid, []).append((ln, clean))
-
-    out_groups: List[List[Dict]] = []
-    used_lines: set = set()
-
-    # 先收集“天然满组”的 pid
-    for pid, arr in pid_bins.items():
-        if len(out_groups) >= want_groups:
-            break
-        if len(arr) >= gs:
-            group = []
-            for k in range(gs):
-                ln, obj = arr[k]
-                if ln in used_lines:
-                    continue
-                used_lines.add(ln)
-                group.append(obj)
-            if len(group) == gs:
-                out_groups.append(group)
-
-    # 若还不够，则从“欠缺的 pid”聚拢补齐
-    if len(out_groups) < want_groups:
-        # 收集所有欠缺 pid 的样本（按 ts 已经是新鲜优先）
-        flat = []
-        for pid, arr in pid_bins.items():
-            if len(arr) < gs:
-                for ln, obj in arr:
-                    if ln in used_lines:
-                        continue
-                    flat.append((pid, ln, obj))
-
-        # pid -> 当前已收集的组
-        cur: Dict[str, List[Dict]] = {}
-        for pid, ln, obj in flat:
-            if len(out_groups) >= want_groups:
-                break
-            if ln in used_lines:
-                continue
-            used_lines.add(ln)
-            cur.setdefault(pid, []).append(obj)
-            if len(cur[pid]) == gs:
-                out_groups.append(cur[pid])
-                cur[pid] = []
-
-    # 回写：把未被使用的行写回原文件（保持原格式）
-    for fp, lines in file_lines_keep.items():
-        keep = []
-        for ln in lines:
-            if ln in used_lines:
-                continue
-            keep.append(ln if ln.endswith("\n") else (ln + "\n"))
-        try:
-            _atomic_rewrite(fp, keep)
-        except Exception:
-            try:
-                os.remove(fp)
-            except Exception:
-                pass
-
-    if ROLL_VERBOSE:
-        print(
-            f"[rollout_pool.dequeue_groups] want_groups={want_groups} group_size={gs} "
-            f"got_groups={len(out_groups)} used_lines={len(used_lines)} "
-            f"ttl={ROLL_MAX_AGE_SEC}s min_resp={ROLL_MIN_RESP_TOKENS} "
-            f"model_sig={'<any>' if not required_model_sig else required_model_sig}"
-        )
-
-    return out_groups
-
-# 估算 & 统计
+# ---- 估算 / 统计 ----
 def estimate_size(dirpath: str, approx_per_file: int = None, scan_cap_files: int = None) -> int:
-    """
-    估算池中“可能可用”的样本数量（粗略）：
-    - 扫描部分文件，数“不过期 & 回复足够”的行
-    - 外推剩余文件
-    - 兜底：文件数 * approx_per_file
-    """
     try:
         _clean_tmp_leftovers(dirpath)
         files_all = sorted(glob.glob(os.path.join(dirpath, ROLL_GLOB)))
-        if not files_all:
-            return 0
+        if not files_all: return 0
 
         cap = scan_cap_files if isinstance(scan_cap_files, int) and scan_cap_files > 0 else ROLL_SCAN_CAP_FILES
         approx = approx_per_file if isinstance(approx_per_file, int) and approx_per_file > 0 else ROLL_APPROX_PER_FILE
 
         files_scan = files_all[:max(int(cap), 1)]
-        total_kept = 0
-        now_ts = _now_ts()
+        total_kept, now_ts = 0, _now_ts()
 
         for fp in files_scan:
             try:
                 with open(fp, "r", encoding="utf-8") as f:
                     for ln in f:
-                        ln = ln.strip()
-                        if not ln:
-                            continue
                         obj = _safe_parse(ln)
-                        if not isinstance(obj, dict):
-                            continue
-                        clean = _sanitize_item(obj)
-                        if clean is None:
-                            continue
-                        if not _is_fresh(clean, now_ts):
-                            continue
-                        if not _resp_len_ok(clean):
-                            continue
-                        total_kept += 1
+                        if not isinstance(obj, dict): continue
+                        c = _sanitize_item(obj)
+                        if c and _is_fresh(c, now_ts) and _resp_len_ok(c):
+                            total_kept += 1
             except Exception:
                 continue
 
         scanned = len(files_scan)
-        if scanned == 0:
-            return len(files_all) * max(int(approx), 1)
+        if scanned == 0: return len(files_all) * max(int(approx), 1)
 
         avg = total_kept / scanned
-        rest_files = max(len(files_all) - scanned, 0)
-        return int(total_kept + avg * rest_files)
-
+        rest = max(len(files_all) - scanned, 0)
+        return int(total_kept + avg * rest)
     except Exception:
-        return len(glob.glob(os.path.join(dirpath, ROLL_GLOB))) * (
-            approx_per_file if approx_per_file else ROLL_APPROX_PER_FILE
-        )
+        files = glob.glob(os.path.join(dirpath, ROLL_GLOB))
+        base = approx_per_file if approx_per_file else ROLL_APPROX_PER_FILE
+        return len(files) * base
 
 def get_pool_stats(dirpath: str) -> Dict:
-    """
-    返回更详细的池统计（用于日志/监控）。
-    """
-    stats = {
-        "files": 0,
-        "candidates": 0,
-        "usable": 0,
-        "avg_age_sec": None,
-        "p50_age_sec": None,
-        "p90_age_sec": None,
-    }
+    stats = {"files": 0, "candidates": 0, "usable": 0, "avg_age_sec": None, "p50_age_sec": None, "p90_age_sec": None}
     try:
         _clean_tmp_leftovers(dirpath)
         files = glob.glob(os.path.join(dirpath, ROLL_GLOB))
         stats["files"] = len(files)
-        if not files:
-            return stats
+        if not files: return stats
 
         now_ts = _now_ts()
-        ages = []
+        ages: List[float] = []
 
         for fp in files:
             try:
                 with open(fp, "r", encoding="utf-8") as f:
                     for ln in f:
-                        ln = ln.strip()
-                        if not ln:
-                            continue
+                        s = ln.strip()
+                        if not s: continue
                         stats["candidates"] += 1
                         obj = _safe_parse(ln)
-                        if not isinstance(obj, dict):
-                            continue
-                        clean = _sanitize_item(obj)
-                        if clean is None:
-                            continue
-                        if not _is_fresh(clean, now_ts):
-                            continue
-                        if not _resp_len_ok(clean):
-                            continue
-                        stats["usable"] += 1
-                        ts = clean.get("ts")
-                        if isinstance(ts, (int, float)):
-                            ages.append(max(0.0, now_ts - float(ts)))
+                        if not isinstance(obj, dict): continue
+                        c = _sanitize_item(obj)
+                        if c and _is_fresh(c, now_ts) and _resp_len_ok(c):
+                            stats["usable"] += 1
+                            ts = c.get("ts")
+                            if isinstance(ts, (int, float)): ages.append(max(0.0, now_ts - float(ts)))
             except Exception:
                 continue
 
         if ages:
-            ages_sorted = sorted(ages)
-            stats["avg_age_sec"] = float(sum(ages_sorted) / len(ages_sorted))
-            stats["p50_age_sec"] = float(ages_sorted[len(ages_sorted)//2])
-            p90_idx = int(len(ages_sorted) * 0.9) - 1
-            p90_idx = min(max(p90_idx, 0), len(ages_sorted) - 1)
-            stats["p90_age_sec"] = float(ages_sorted[p90_idx])
+            ages.sort()
+            n = len(ages)
+            stats["avg_age_sec"] = float(sum(ages) / n)
+            stats["p50_age_sec"] = float(ages[n // 2])
+            stats["p90_age_sec"] = float(ages[min(max(int(n * 0.9) - 1, 0), n - 1)])
 
         if ROLL_VERBOSE:
             print(
@@ -568,7 +274,6 @@ def get_pool_stats(dirpath: str) -> Dict:
                 f"avg_age={stats['avg_age_sec']}s p50={stats['p50_age_sec']}s p90={stats['p90_age_sec']}s "
                 f"ttl={ROLL_MAX_AGE_SEC}s min_resp={ROLL_MIN_RESP_TOKENS}"
             )
-
-        return stats
     except Exception:
-        return stats
+        pass
+    return stats
