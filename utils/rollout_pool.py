@@ -6,7 +6,7 @@ ROLL_GLOB = "roll_*.jsonl"
 TMP_SUFFIX = ".tmp"
 
 # 固定策略
-ROLL_MAX_AGE_SEC = 420
+ROLL_MAX_AGE_SEC = 300
 ROLL_MIN_RESP_TOKENS = 24
 ROLL_DEDUP_PROMPT_IN_BATCH = True
 ROLL_FILE_ORDER = "mtime_desc"
@@ -195,6 +195,95 @@ def dequeue_items(dirpath: str, n: int) -> List[Dict]:
             f"ttl={ROLL_MAX_AGE_SEC}s min_resp={ROLL_MIN_RESP_TOKENS}"
         )
     return out
+
+def dequeue_groups(dirpath: str, group_size: int, num_groups: int, allow_partial: bool = False):
+    """按同一 pid 聚合成组出队；不影响现有 PPO 逻辑。"""
+    ensure_dir(dirpath); _clean_tmp_leftovers(dirpath)
+    G = max(int(group_size), 1); K = max(int(num_groups), 0)
+    if K == 0: return []
+
+    files = _file_order(sorted(glob.glob(os.path.join(dirpath, ROLL_GLOB))))
+    now_ts = _now_ts()
+
+    buckets = {}          # pid -> {"items": [dict...], "hids": set(...)}
+    used_hid = set()      # 扫描阶段临时防重复
+
+    cnt_scanned = cnt_kept = cnt_drop_stale = cnt_drop_short = 0
+
+    for fp in files:
+        try:
+            lines = _read_lines(fp)
+        except (FileNotFoundError, PermissionError):
+            continue
+
+        def _ts(ln: str) -> float:
+            obj = _safe_parse(ln)
+            return float(obj["ts"]) if isinstance(obj, dict) and isinstance(obj.get("ts"), (int, float)) else 0.0
+
+        for ln in sorted(lines, key=_ts, reverse=True):
+            obj = _safe_parse(ln); cnt_scanned += 1
+            if obj is None: continue
+            c = _sanitize_item(obj)
+            if c is None: continue
+            if not _is_fresh(c, now_ts): cnt_drop_stale += 1; continue
+            if not _resp_len_ok(c): cnt_drop_short += 1; continue
+
+            pid, hid = c["pid"], c["hid"]
+            if hid in used_hid: continue
+            b = buckets.get(pid)
+            if b is None:
+                b = {"items": [], "hids": set()}
+                buckets[pid] = b
+            if hid in b["hids"]:  # 同一 pid 内去重
+                continue
+            b["items"].append(c); b["hids"].add(hid); used_hid.add(hid); cnt_kept += 1
+            if not allow_partial and len(b["items"]) > G:
+                # 只保留最新的前 G 条
+                b["items"] = b["items"][:G]
+                b["hids"]  = set(it["hid"] for it in b["items"])
+
+    groups, chosen_pids = [], set()
+    for pid, b in buckets.items():
+        items = b["items"]
+        if not items: continue
+        if not allow_partial and len(items) < G: continue
+        take = items if allow_partial else items[:G]
+        groups.append(take); chosen_pids.add(pid)
+        if len(groups) >= K: break
+
+    chosen_hids = set(h for grp in groups for h in (it["hid"] for it in grp))
+
+    for fp in files:
+        keep_lines = []
+        try:
+            lines = _read_lines(fp)
+        except (FileNotFoundError, PermissionError):
+            continue
+        for ln in lines:
+            obj = _safe_parse(ln)
+            if obj is None: continue
+            c = _sanitize_item(obj)
+            if c is None: continue
+            if not _is_fresh(c, now_ts): continue
+            if not _resp_len_ok(c): continue
+            if c["hid"] in chosen_hids: continue
+            keep_lines.append(_stringify(c) + "\n")
+        try:
+            _atomic_rewrite(fp, keep_lines)
+        except Exception:
+            try: os.remove(fp)
+            except Exception: pass
+
+    if ROLL_VERBOSE:
+        total_items = sum(len(g) for g in groups)
+        print(
+            "[rollout_pool.dequeue_groups] "
+            f"want_groups={K} got_groups={len(groups)} group_size={G} total_items={total_items} "
+            f"scanned={cnt_scanned} kept_for_bucket={cnt_kept} "
+            f"drop(stale)={cnt_drop_stale} drop(short)={cnt_drop_short} "
+            f"ttl={ROLL_MAX_AGE_SEC}s min_resp={ROLL_MIN_RESP_TOKENS}"
+        )
+    return groups
 
 # ---- 估算 / 统计 ----
 def estimate_size(dirpath: str, approx_per_file: int = None, scan_cap_files: int = None) -> int:
