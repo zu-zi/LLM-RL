@@ -1,26 +1,24 @@
-# train_PPO.py  —— 极简单文件训练脚本（仅 PPO）
-# --------------------------------------------------------
-# 统一配置（不要外部 config 覆盖；减少超参）
-# --------------------------------------------------------
-import os, sys, time, json, glob, shutil, random
+# train_DAPO.py —— 极简 DAPO 训练脚本（与 GRPO 同构；rollout 逻辑不变）
+import os, sys, time, json, glob, shutil, random, math
 from datetime import datetime
 import numpy as np
 import torch, tiktoken
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, AutoModelForCausalLM
-from utils.rollout_pool import dequeue_items, estimate_size, ensure_dir
+from utils.rollout_pool import dequeue_groups, estimate_size, ensure_dir
 
-from RL.PPO import PPOTrainer, Critic, Samples, normalize_for_reward
+from RL.DAPO import DAPOTrainer                 # ← 仅此处换 Trainer
+from RL.PPO import Samples, normalize_for_reward
 
-# ========= W&B（离线）开关与导入：仅新增，不影响原逻辑 =========
-WANDB_ON = True  # 需要时可改为 False 完全关闭
-os.environ.setdefault("WANDB_MODE", "offline")  # 强制离线
-os.environ.setdefault("WANDB_SILENT", "true")   # 安静模式（仍然保留我们自己的print）
+# ========= W&B（离线） =========
+WANDB_ON = True
+os.environ.setdefault("WANDB_MODE", "offline")
+os.environ.setdefault("WANDB_SILENT", "true")
 try:
     import wandb
     _HAS_WANDB = True
 except Exception:
     _HAS_WANDB = False
-# ======================================================
+# ==============================
 
 # 路径 / 运行
 OUT_DIR         = "/root/autodl-tmp/Results"
@@ -31,52 +29,45 @@ EVAL_INTERVAL   = 10
 MAX_ITERS       = 1000
 
 # 模型
-INIT_FROM       = "gpt2-large"   # 仅支持 gpt2* 系列的 from_pretrained 对齐
+INIT_FROM       = "gpt2-large"
 DROPOUT         = 0.0
 BIAS            = False
 
-# 批次 & 优化（稳定默认）
-BATCH_SIZE      = 8
-POLICY_EPOCHS = 1
-LR_ACTOR        = 7e-7
-LR_CRITIC       = 1.4e-6
+# DAPO（与 GRPO 基本相同；kl_ctl 可设为 0 以关闭 ref KL）
+GROUP_SIZE      = 4
+NUM_GROUPS      = 4
+LR_ACTOR        = 4e-6
 WD_ACTOR        = 3e-3
-WD_CRITIC       = 1e-3
 BETA1, BETA2    = 0.9, 0.95
-MAX_GRAD_NORM   = 0.3
-VF_CLIP         = 0.1
-PPO_CLIP        = 0.07  # 0.07
-ENTROPY_COEF    = 0.0
-KL_CTL_INIT     = 0.6  # 0.6
+MAX_GRAD_NORM   = 0.5
+TAU             = 0.4         # 软目标温度（小 -> 更尖）
+KL_CTL_INIT     = 0.1         # DAPO 推荐默认 0；如需轻量约束可设 0.05~0.2
+LENGTH_NORM     = True
 
-# 生成口径（与 rollout 对齐）
-TEMP            = 0.55
-TOP_P           = 0.9
+# 生成
+TEMP            = 0.9
+TOP_P           = 0.95
 TOP_K           = 0
-REP_PENALTY     = 1
+REP_PENALTY     = 1.0
 STOP_STRS       = ["\nHuman:", "\n\nHuman:"]
 MIN_RESP_TOK    = 24
 MAX_NEW_TOK     = 96
 
-# sglang 池（最小闭环）
+# sglang 池（与训练竞争显存，长期充足且新鲜）
 SGLANG_ON       = True
 SGLANG_MODEL_SYMLINK = "/root/autodl-tmp/actor_exports/current"
 SGLANG_EXPORT_BASE   = "/root/autodl-tmp/actor_exports"
 SGLANG_SYNC_DIR      = "/root/autodl-tmp/sgl_pool"
-SGLANG_REFILL_CHUNK  = 64          # 48
-ROLL_LOW_WATERMARK   = BATCH_SIZE*3
-ROLL_MIN_FREE_MB     = 3000 # 6000
-ROLL_COOLDOWN_SEC    = 7  # 12
+SGLANG_REFILL_CHUNK  = 64
+ROLL_MIN_FREE_MB     = 3000      # 你之前改的值，保留
+ROLL_COOLDOWN_SEC    = 7
 
-# 奖励模型（英文 RM）
+# 奖励模型
 REWARD_MODEL_NAME = "OpenAssistant/reward-model-deberta-v3-large-v2"
 
-# 固定 prompts
+# 数据
 PROMPT_BIN = os.path.join(os.path.dirname(__file__), "data/RL_dataset/prompt.bin")
 
-# --------------------------------------------------------
-# 工具
-# --------------------------------------------------------
 def set_seed(s):
     random.seed(s); np.random.seed(s); torch.manual_seed(s)
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(s)
@@ -109,15 +100,12 @@ def decode_with_sampling(model, idx, max_new, eos_id, block_size,
             logits = model(x)
             if isinstance(logits, tuple): logits = logits[0]
             last = logits[:, -1, :]
-
             if rep_penalty and out.numel() > 0:
                 uniq = torch.unique(out); last[:, uniq] = last[:, uniq] / float(rep_penalty)
-
             last = last / max(float(temperature), 1e-6)
             if top_k and top_k > 0:
                 kth = torch.topk(last, k=min(int(top_k), last.size(-1)), dim=-1).values[..., -1:]
                 last = torch.where(last < kth, torch.full_like(last, -1e10), last)
-
             probs = torch.softmax(last, dim=-1)
             # nucleus
             sorted_probs, sorted_idx = torch.sort(probs, descending=True, dim=-1)
@@ -128,21 +116,16 @@ def decode_with_sampling(model, idx, max_new, eos_id, block_size,
             kept = kept / kept.sum(dim=-1, keepdim=True).clamp_min(1e-12)
             next_sorted = torch.multinomial(kept, num_samples=1)
             next_id = sorted_idx.gather(1, next_sorted)
-
-            # 保底最短响应
+            # 最短响应保护
             if (out.size(1) - start) < int(min_resp) and eos_id is not None and int(next_id.item()) == int(eos_id):
                 alt = sorted_idx[:, 1:2] if sorted_idx.size(1) > 1 else next_id
                 next_id = alt
-
             out = torch.cat((out, next_id.to(device)), dim=1)
-
             if (out.size(1) - start) >= int(min_resp):
-                if eos_id is not None and int(next_id.item()) == int(eos_id):
-                    break
+                if eos_id is not None and int(next_id.item()) == int(eos_id): break
                 if stop_strs and tokenizer_decode is not None:
                     tail = tokenizer_decode(out[0][-min(out.size(1), block_size):].tolist())
-                    if any(s in tail for s in stop_strs):
-                        break
+                    if any(s in tail for s in stop_strs): break
         return out
     finally:
         if was_train: model.train()
@@ -185,11 +168,8 @@ def cuda_free_mb(device_str="cuda"):
 def atomic_symlink_update(target_dir: str, link_path: str):
     tmp = link_path + ".tmp"
     try:
-        if os.path.lexists(tmp):
-            os.remove(tmp)
-    except Exception:
-        pass
-    # 若原路径存在且不是符号链接，清掉目录（避免 replace 失败）
+        if os.path.lexists(tmp): os.remove(tmp)
+    except Exception: pass
     if os.path.exists(link_path) and not os.path.islink(link_path):
         shutil.rmtree(link_path)
     os.symlink(target_dir, tmp)
@@ -197,83 +177,37 @@ def atomic_symlink_update(target_dir: str, link_path: str):
 
 @torch.no_grad()
 def export_actor_for_sglang(raw_actor, init_from: str, export_base: str, symlink_path: str):
-    """将当前 actor 权重对齐到 HF 目录（优先处理需转置的矩阵）。"""
     os.makedirs(export_base, exist_ok=True)
-
     hf_model = AutoModelForCausalLM.from_pretrained(init_from, torch_dtype=torch.float16)
     tok = AutoTokenizer.from_pretrained(init_from, use_fast=True)
     if tok.pad_token is None and tok.eos_token is not None:
         tok.pad_token = tok.eos_token
     hf_model.eval()
-
-    sd_src = raw_actor.state_dict()
-    sd_tgt = hf_model.state_dict()
-
-    TRANSPOSE_SUFFIXES = (
-        "attn.c_attn.weight",
-        "attn.c_proj.weight",
-        "mlp.c_fc.weight",
-        "mlp.c_proj.weight",
-    )
-
-    matched = transposed = skipped = 0
+    sd_src = raw_actor.state_dict(); sd_tgt = hf_model.state_dict()
+    TRANSPOSE_SUFFIXES = ("attn.c_attn.weight","attn.c_proj.weight","mlp.c_fc.weight","mlp.c_proj.weight")
+    matched=transposed=skipped=0
     for k, w_tgt in sd_tgt.items():
         w_src = sd_src.get(k, None)
-        if w_src is None:
-            skipped += 1
-            continue
-
-        # 先处理“需要转置”的键（即使形状相同也要 .T）
+        if w_src is None: skipped+=1; continue
         if any(k.endswith(suf) for suf in TRANSPOSE_SUFFIXES):
-            if w_src.T.shape == w_tgt.shape:
-                w_tgt.copy_(w_src.T.to(w_tgt.dtype))
-                transposed += 1
-                continue
-            # 若没法转置匹配，再试同形状直拷（容错）
-            if w_src.shape == w_tgt.shape:
-                w_tgt.copy_(w_src.to(w_tgt.dtype))
-                matched += 1
-                continue
-            skipped += 1
-            continue
-
-        # 其他权重：同形状直接拷贝
-        if w_src.shape == w_tgt.shape:
-            w_tgt.copy_(w_src.to(w_tgt.dtype))
-            matched += 1
-        else:
-            skipped += 1
-
-    #（HF 已 tying，这里显式再绑一次以防万一）
-    try:
-        hf_model.transformer.wte.weight = hf_model.lm_head.weight
-    except Exception:
-        pass
-
+            if w_src.T.shape == w_tgt.shape: w_tgt.copy_(w_src.T.to(w_tgt.dtype)); transposed+=1; continue
+            if w_src.shape == w_tgt.shape:    w_tgt.copy_(w_src.to(w_tgt.dtype)); matched+=1; continue
+            skipped+=1; continue
+        if w_src.shape == w_tgt.shape: w_tgt.copy_(w_src.to(w_tgt.dtype)); matched+=1
+        else: skipped+=1
+    try: hf_model.transformer.wte.weight = hf_model.lm_head.weight
+    except Exception: pass
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = os.path.join(export_base, f"ts_{ts}_{random.randint(1000,9999)}")
     os.makedirs(out_dir, exist_ok=True)
     hf_model.save_pretrained(out_dir, safe_serialization=True, max_shard_size="2GB")
     tok.save_pretrained(out_dir)
-
     atomic_symlink_update(out_dir, symlink_path)
-
-    # 期望转置数：4 * n_layer（gpt2 为 c_attn/c_proj/c_fc/c_proj）
-    try:
-        exp_transpose = 4 * int(getattr(hf_model.config, "n_layer", 0))
-    except Exception:
-        exp_transpose = None
-
-    note = f" expected_transposed={exp_transpose}" if exp_transpose is not None else ""
-    print(f"[export] to={out_dir} matched={matched} transposed={transposed} skipped={skipped}{note}", flush=True)
-
-    # 仅保留最新 1 份
+    print(f"[export] to={out_dir} matched={matched} transposed={transposed} skipped={skipped}", flush=True)
     ds = sorted([d for d in glob.glob(os.path.join(export_base, "ts_*")) if os.path.isdir(d)])
     for d in ds[:-1]:
-        try:
-            shutil.rmtree(d)
-        except Exception:
-            pass
+        try: shutil.rmtree(d)
+        except Exception: pass
     return out_dir
 
 @torch.no_grad()
@@ -281,7 +215,7 @@ def greedy_eval_reward(actor_model, gpt2_tok, eval_prompt_ids, reward_tokenizer,
     dev = next(actor_model.parameters()).device
     eos_id = gpt2_tok.eos_id
     texts = []
-    was_training = actor_model.training
+    was_train = actor_model.training
     actor_model.eval()
     try:
         for ids in eval_prompt_ids:
@@ -299,8 +233,7 @@ def greedy_eval_reward(actor_model, gpt2_tok, eval_prompt_ids, reward_tokenizer,
             full = out[0].tolist()[:block_size]
             texts.append(gpt2_tok.decode(full))
     finally:
-        if was_training: actor_model.train()
-
+        if was_train: actor_model.train()
     texts = [normalize_for_reward(t, reward_tokenizer) for t in texts]
     toks = reward_tokenizer(texts, padding=True, truncation=True, max_length=1024, return_tensors="pt")
     outs = reward_model(**toks)
@@ -321,9 +254,9 @@ def spawn_rollout(prompt_bin_path, count, sync_dir, max_new):
         "--count", str(int(count)),
         "--max-new", str(int(max_new)),
         "--block-size", str(int(BLOCK_SIZE)),
-        "--mb", "6",
+        "--mb", "3",
         "--use-only-train",
-        "--min-resp",str(int(MIN_RESP_TOK)),
+        "--min-resp", str(int(MIN_RESP_TOK)),
         "--refresh-every-batches","30",
         "--reload-strategy", "realpath",
         "--min-free-mb", str(int(ROLL_MIN_FREE_MB)),
@@ -334,57 +267,87 @@ def spawn_rollout(prompt_bin_path, count, sync_dir, max_new):
     if ret != 0:
         print(f"[rollout] worker exit code {ret}", flush=True)
 
-# --------------------------------------------------------
-# 主流程
-# --------------------------------------------------------
+def _rebucket_and_topup(groups, G, dev, raw_actor, tok):
+    # 1) 拉平成列表
+    flat = []
+    for g in groups:
+        flat.extend(g)
+
+    # 2) 按 prompt_ids 分桶
+    from collections import defaultdict
+    buckets = defaultdict(list)
+    for item in flat:
+        k = tuple(item["prompt_ids"])  # 列表不可哈希，转成 tuple
+        buckets[k].append(item)
+
+    # 3) 对每个桶，尽量产出 size=G 的组；不足 G 但 >=2 也保留
+    regrouped = []
+    singles = []
+    for k, lst in buckets.items():
+        if len(lst) >= 2:
+            for i in range(0, len(lst), G):
+                chunk = lst[i:i+G]
+                if len(chunk) >= 2:
+                    regrouped.append(chunk)
+        else:
+            singles.append(k)
+
+    # 4) 在线补齐“只有 1 个候选的 prompt”
+    for k in singles:
+        base = list(k)
+        need = G - 1
+        new_group = [buckets[k][0]]
+        # 多试几次以防短答/重复
+        for _ in range(need * 3):
+            x = torch.tensor(base, dtype=torch.long, device=dev).unsqueeze(0)
+            room = BLOCK_SIZE - x.size(1) - 1
+            if room <= 0:
+                break
+            out = decode_with_sampling(
+                raw_actor, x, max_new=min(room, MAX_NEW_TOK), eos_id=tok.eos_id, block_size=BLOCK_SIZE,
+                temperature=TEMP, top_p=TOP_P, top_k=TOP_K, rep_penalty=REP_PENALTY,
+                stop_strs=STOP_STRS, tokenizer_decode=tok.decode, min_resp=MIN_RESP_TOK
+            )
+            if (out.size(1) - x.size(1)) < MIN_RESP_TOK:
+                continue
+            full_ids = out[0].tolist()
+            key = ",".join(map(str, full_ids[len(base):]))  # 组内去重（响应段）
+            if any(",".join(map(str, it["full_ids"][len(base):])) == key for it in new_group):
+                continue
+            new_group.append({"prompt_ids": base, "full_ids": full_ids})
+            if len(new_group) >= 2:  # 至少 2 个即可用于训练；若想强制 G 个，改成 == G
+                regrouped.append(new_group[:G])
+                break
+
+    return regrouped[:NUM_GROUPS], {"buckets": len(buckets), "rebuilt_groups": len(regrouped)}
+
 def main():
     set_seed(SEED)
     os.makedirs(OUT_DIR, exist_ok=True)
     ensure_dir(SGLANG_SYNC_DIR)
 
-    # =============== W&B 初始化（离线） ===============
     run = None
     if WANDB_ON and _HAS_WANDB:
         try:
-            run_name = f"ppo_gpt2l_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            run_name = f"dapo_gpt2l_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             run = wandb.init(
-                project="hlhf-ppo",
+                project="hlhf-dapo",
                 name=run_name,
                 dir=OUT_DIR,
                 mode="offline",
                 config={
-                    "seed": SEED,
-                    "device": DEVICE,
-                    "block_size": BLOCK_SIZE,
-                    "max_iters": MAX_ITERS,
-                    "eval_interval": EVAL_INTERVAL,
-                    "init_from": INIT_FROM,
-                    "dropout": DROPOUT,
-                    "bias": BIAS,
-                    "batch_size": BATCH_SIZE,
-                    "policy_epochs": POLICY_EPOCHS,
-                    "lr_actor": LR_ACTOR,
-                    "lr_critic": LR_CRITIC,
-                    "wd_actor": WD_ACTOR,
-                    "wd_critic": WD_CRITIC,
-                    "beta1": BETA1,
-                    "beta2": BETA2,
-                    "max_grad_norm": MAX_GRAD_NORM,
-                    "vf_clip": VF_CLIP,
-                    "ppo_clip": PPO_CLIP,
-                    "entropy_coef": ENTROPY_COEF,
-                    "kl_ctl_init": KL_CTL_INIT,
-                    "gen_temp": TEMP,
-                    "gen_top_p": TOP_P,
-                    "gen_top_k": TOP_K,
-                    "rep_penalty": REP_PENALTY,
-                    "min_resp_tok": MIN_RESP_TOK,
-                    "max_new_tok": MAX_NEW_TOK,
-                    "sglang_on": SGLANG_ON,
-                    "sglang_refill_chunk": SGLANG_REFILL_CHUNK,
-                    "roll_low_watermark": ROLL_LOW_WATERMARK,
-                    "roll_min_free_mb": ROLL_MIN_FREE_MB,
-                    "roll_cooldown_sec": ROLL_COOLDOWN_SEC,
+                    "seed": SEED, "device": DEVICE, "block_size": BLOCK_SIZE,
+                    "max_iters": MAX_ITERS, "eval_interval": EVAL_INTERVAL,
+                    "init_from": INIT_FROM, "dropout": DROPOUT, "bias": BIAS,
+                    "group_size": GROUP_SIZE, "num_groups": NUM_GROUPS,
+                    "lr_actor": LR_ACTOR, "wd_actor": WD_ACTOR,
+                    "beta1": BETA1, "beta2": BETA2,
+                    "max_grad_norm": MAX_GRAD_NORM, "tau": TAU,
+                    "kl_ctl_init": KL_CTL_INIT, "length_norm": LENGTH_NORM,
+                    "gen_temp": TEMP, "gen_top_p": TOP_P, "gen_top_k": TOP_K,
+                    "rep_penalty": REP_PENALTY, "min_resp_tok": MIN_RESP_TOK, "max_new_tok": MAX_NEW_TOK,
+                    "sglang_on": SGLANG_ON, "sglang_refill_chunk": SGLANG_REFILL_CHUNK,
+                    "roll_min_free_mb": ROLL_MIN_FREE_MB, "roll_cooldown_sec": ROLL_COOLDOWN_SEC,
                     "reward_model": REWARD_MODEL_NAME,
                 },
             )
@@ -392,12 +355,10 @@ def main():
         except Exception as e:
             print(f"[wandb][warn] init failed: {e}; continue without wandb.", flush=True)
             run = None
-    # ================================================
 
-    # 加载固定 prompts
+    # 数据
     print(f"[data] loading prompts from {PROMPT_BIN}")
     blob = torch.load(PROMPT_BIN, map_location="cpu")
-    PROMPTS_TEXT = blob["prompts"]
     PROMPT_TOKEN_IDS = blob["gpt2_token_ids"]
     EOS_ID = blob["eos_id"]
     TRAIN_INDICES = blob.get("train_indices", None)
@@ -424,7 +385,7 @@ def main():
         choice = rng.choice(len(PROMPT_TOKEN_IDS), size=min(16, len(PROMPT_TOKEN_IDS)), replace=False) if len(PROMPT_TOKEN_IDS)>0 else []
         EVAL_PROMPT_IDS = [PROMPT_TOKEN_IDS[int(i)] for i in choice]
 
-    # 初始化 actor/ref/critic（nanoGPT 模型）
+    # 模型
     from model import GPT, GPTConfig
     print(f"[model] init from {INIT_FROM}")
     m = GPT.from_pretrained(INIT_FROM, dict(dropout=DROPOUT))
@@ -438,17 +399,16 @@ def main():
     base_sd = m.state_dict(); del m
 
     dev = torch.device(DEVICE)
+    # 参考策略（可选）：DAPO 支持 KL=0 关闭；如需打开，保持一份 ref
     ref = GPT(GPTConfig(**model_args)).to(dev); ref.load_state_dict(base_sd)
     for p in ref.parameters(): p.requires_grad=False
     ref.eval()
     ref = ref.to(dtype=(torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16))
 
     actor = GPT(GPTConfig(**model_args)).to(dev); actor.load_state_dict(base_sd)
-    raw_actor = actor  # 单机单卡简化
+    raw_actor = actor
 
-    critic = Critic(raw_actor).to(dev)
-
-    # 初始导出给 sglang（保证 symlink 可用）
+    # 初始导出给 sglang
     if SGLANG_ON:
         try:
             os.makedirs(os.path.dirname(SGLANG_MODEL_SYMLINK), exist_ok=True)
@@ -456,15 +416,13 @@ def main():
         except Exception as e:
             print(f"[export][warn] initial export failed: {e}", flush=True)
 
-    # 优化器（优先 8bit）
+    # 优化器
     try:
         from bitsandbytes.optim import AdamW8bit
         opt_a = AdamW8bit(raw_actor.parameters(), lr=LR_ACTOR, betas=(BETA1,BETA2), weight_decay=WD_ACTOR)
-        opt_c = AdamW8bit(critic.parameters(),    lr=LR_CRITIC, betas=(BETA1,BETA2), weight_decay=WD_CRITIC)
         print("[optim] AdamW8bit")
     except Exception:
         opt_a = torch.optim.AdamW(raw_actor.parameters(), lr=LR_ACTOR, betas=(BETA1,BETA2), weight_decay=WD_ACTOR)
-        opt_c = torch.optim.AdamW(critic.parameters(),    lr=LR_CRITIC, betas=(BETA1,BETA2), weight_decay=WD_CRITIC)
         print("[optim] torch.optim.AdamW")
 
     # 奖励模型（CPU）
@@ -476,106 +434,124 @@ def main():
     try: reward_tok.padding_side = "right"
     except Exception: pass
 
-    # PPO 训练器
-    trainer = PPOTrainer(
-        actor_model=raw_actor, ref_model=ref, reward_model=reward_model,
-        critic_model=critic, actor_tokenizer=tok, reward_tokenizer=reward_tok,
-        optimizer_actor=opt_a, optimizer_critic=opt_c,
-        device=dev, mb_size_logits=1, mb_size_values=1,
-        kl_ctl=KL_CTL_INIT, ppo_clip=PPO_CLIP, vf_clip=VF_CLIP,
-        entropy_coef=ENTROPY_COEF, max_grad_norm=MAX_GRAD_NORM,
+    # —— 构建 DAPOTrainer —— #
+    # 若想完全关闭 KL：kl_ctl=0.0 或者 ref=None（二选一即可）
+    trainer = DAPOTrainer(
+        actor_model=raw_actor,
+        reward_model=reward_model,
+        actor_tokenizer=tok,
+        reward_tokenizer=reward_tok,
+        optimizer_actor=opt_a,
+        ref_model=(ref if KL_CTL_INIT > 0.0 else None),
+        device=dev,
+        mb_size_logits=1,
+        tau=TAU,
+        kl_ctl=KL_CTL_INIT,
+        length_norm=LENGTH_NORM,
+        max_grad_norm=MAX_GRAD_NORM,
     )
 
-    # -------- baseline：iter0 贪心奖励 --------
+    # baseline
     if len(EVAL_PROMPT_IDS) > 0:
         r0 = greedy_eval_reward(raw_actor, tok, EVAL_PROMPT_IDS, reward_tok, reward_model, BLOCK_SIZE, max_new_eval=min(64, MAX_NEW_TOK))
         print(f"[baseline] iter0_reward_greedy={r0:.4f}", flush=True)
-        # W&B 记录 baseline
         if run is not None:
             wandb.log({"baseline/iter0_reward_greedy": float(r0)}, step=0)
 
-    # 日志 CSV（精简）
-    METRICS_CSV = os.path.join(OUT_DIR, "metrics.csv")
+    METRICS_CSV = os.path.join(OUT_DIR, "metrics_dapo.csv")
     if not os.path.exists(METRICS_CSV):
         with open(METRICS_CSV, "w") as f:
-            f.write("iter,policy_loss,value_loss,avg_kl,reward_raw,reward_eval_greedy,resp_p50,lr\n")
+            f.write("iter,loss,kl_mean,rm_mean,pstar_entropy,r_eval_greedy,items,lr,pool\n")
 
     last_export_it = 0
     last_roll_t = 0.0
 
-    for it in range(1, MAX_ITERS+1):
-        # —— 补货：只有在池量不足时触发 —— #
-        pool_est = estimate_size(SGLANG_SYNC_DIR, SGLANG_REFILL_CHUNK) if SGLANG_ON else -1
-        if SGLANG_ON and pool_est < ROLL_LOW_WATERMARK:
-            now = time.time()
-            if (now - last_roll_t) >= ROLL_COOLDOWN_SEC and cuda_free_mb(DEVICE) >= ROLL_MIN_FREE_MB:
-                spawn_rollout(PROMPT_BIN, SGLANG_REFILL_CHUNK, SGLANG_SYNC_DIR, MAX_NEW_TOK)
-                last_roll_t = now
-
-        # —— 取样：先从池拿，不够就在线补齐 —— #
-        batch = dequeue_items(SGLANG_SYNC_DIR, BATCH_SIZE) if SGLANG_ON else []
-        dev_t = torch.device(DEVICE)
-
-        @torch.no_grad()
-        def _gen_one():
-            ids = random.choice(TRAIN_PROMPT_IDS)
-            x = torch.tensor(ids, dtype=torch.long, device=dev_t).unsqueeze(0)
+    # ---- 在线生成：组内去重（避免 bytes 报错）----
+    import hashlib
+    def _gen_group(G):
+        base = random.choice(TRAIN_PROMPT_IDS)
+        g, seen = [], set()
+        for _ in range(G * 3):
+            x = torch.tensor(base, dtype=torch.long, device=dev).unsqueeze(0)
             room = BLOCK_SIZE - x.size(1) - 1
-            if room <= 0: return None
+            if room <= 0: break
             out = decode_with_sampling(
                 raw_actor, x, max_new=min(room, MAX_NEW_TOK), eos_id=tok.eos_id, block_size=BLOCK_SIZE,
                 temperature=TEMP, top_p=TOP_P, top_k=TOP_K, rep_penalty=REP_PENALTY,
                 stop_strs=STOP_STRS, tokenizer_decode=tok.decode, min_resp=MIN_RESP_TOK
             )
-            if (out.size(1) - x.size(1)) < MIN_RESP_TOK: return None
-            return {"prompt_ids": ids, "full_ids": out[0].tolist()}
+            if (out.size(1) - x.size(1)) < MIN_RESP_TOK: continue
+            full_ids = out[0].tolist()
+            resp_ids = full_ids[len(base):]
+            key = hashlib.md5(",".join(map(str, resp_ids)).encode("utf-8")).hexdigest()
+            if key in seen: continue
+            seen.add(key)
+            g.append({"prompt_ids": base, "full_ids": full_ids})
+            if len(g) >= G: break
+        return g if len(g) >= 2 else []
 
-        while len(batch) < BATCH_SIZE:
-            g = _gen_one()
-            if g is None: break
-            batch.append(g)
+    # ---- 主循环 ----
+    demand = GROUP_SIZE * NUM_GROUPS
+    LOW_WATER = max(demand * 3, SGLANG_REFILL_CHUNK)
+    BURST_MULT = 4
 
-        samples = pack_samples(batch, pad_id=tok.eos_id, block_size=BLOCK_SIZE, device=dev_t)
-        if int(samples.action_mask.sum().item()) == 0:
-            print(f"[iter {it:04d}] skip(empty batch) pool={pool_est}", flush=True)
+    for it in range(1, MAX_ITERS+1):
+        # —— 估算池量 & 补货策略 —— #
+        pool_est = estimate_size(SGLANG_SYNC_DIR, SGLANG_REFILL_CHUNK) if SGLANG_ON else -1
+        if SGLANG_ON:
+            need_burst = (pool_est <= 0)
+            should_refill = need_burst or (pool_est < LOW_WATER)
+            if should_refill and cuda_free_mb(DEVICE) >= ROLL_MIN_FREE_MB:
+                n_jobs = (BURST_MULT if need_burst else 1)
+                now = time.time()
+                if need_burst or (now - last_roll_t) >= ROLL_COOLDOWN_SEC:
+                    for _ in range(n_jobs):
+                        spawn_rollout(PROMPT_BIN, SGLANG_REFILL_CHUNK, SGLANG_SYNC_DIR, MAX_NEW_TOK)
+                    last_roll_t = now
+
+        # —— 从池取组，允许部分组；不足在线补齐 —— #
+        groups = dequeue_groups(SGLANG_SYNC_DIR, GROUP_SIZE, NUM_GROUPS, allow_partial=True) if SGLANG_ON else []
+        while len(groups) < NUM_GROUPS:
+            g = _gen_group(GROUP_SIZE)
+            if not g: break
+            groups.append(g)
+
+        groups, gstats = _rebucket_and_topup(groups, GROUP_SIZE, dev, raw_actor, tok)
+        print(f"[iter {it:04d}] regrouped_groups={gstats['rebuilt_groups']} buckets={gstats['buckets']} pool={pool_est}", flush=True)
+
+        total_items = sum(len(g) for g in groups)
+        if total_items < 2:
+            print(f"[iter {it:04d}] skip(empty) pool={pool_est}", flush=True)
             if run is not None:
                 wandb.log({"iter/skip_empty": 1, "pool/size_est": pool_est}, step=it)
             continue
 
-        # —— 评估经验 —— #
-        experiences, report_kl, r_raw, _, _, _ = trainer.evaluate_experience(samples)
+        stats = trainer.step_on_groups(groups, BLOCK_SIZE)
 
-        # —— 训练（标准 PPO；不做奇怪补丁） —— #
-        pl, vl = [], []
-        for _ in range(int(POLICY_EPOCHS)):
-            for exp in experiences:
-                p, v = trainer.train_on_experience(exp, use_token_entropy=False)
-                pl.append(float(p)); vl.append(float(v))
-
-        mean_p = float(np.mean(pl)) if pl else float("nan")
-        mean_v = float(np.mean(vl)) if vl else float("nan")
-        # —— 固定评测：贪心 —— #
+        # —— 评测：固定间隔 —— #
         r_eval_greedy = float("nan")
         if (it % EVAL_INTERVAL == 0) and len(EVAL_PROMPT_IDS) > 0:
             r_eval_greedy = greedy_eval_reward(raw_actor, tok, EVAL_PROMPT_IDS, reward_tok, reward_model, BLOCK_SIZE, max_new_eval=min(64, MAX_NEW_TOK))
 
-        # —— 日志 —— #
-        resp_lengths = samples.response_length.detach().cpu().numpy().tolist()
-        p50 = float(np.percentile(resp_lengths, 50)) if resp_lengths else 0.0
-        cur_lr = opt_a.param_groups[0]['lr']
-        print(f"[iter {it:04d}] p={mean_p:.4f} v={mean_v:.4f} kl={report_kl:.6f} r_raw={r_raw:.4f} r_eval_greedy={r_eval_greedy:.4f} resp_p50={p50:.1f} lr={cur_lr:.2e} pool={pool_est}", flush=True)
-        with open(METRICS_CSV, "a") as f:
-            f.write(f"{it},{mean_p},{mean_v},{report_kl},{r_raw},{r_eval_greedy},{p50},{cur_lr}\n")
+        # —— 打点 —— #
+        cur_lr = [pg['lr'] for pg in opt_a.param_groups][0]
+        loss = stats.get("loss", float("nan"))
+        klm  = stats.get("kl_mean", float("nan"))
+        rmm  = stats.get("rm_mean", float("nan"))
+        pent = stats.get("pstar_entropy", float("nan"))
+        items= int(stats.get("items", total_items))
 
-        # —— W&B 记录（离线） —— #
+        print(f"[iter {it:04d}] loss={loss:.4f} kl={klm:.6f} rm={rmm:.4f} p*H={pent:.3f} r_eval_greedy={r_eval_greedy:.4f} items={items} lr={cur_lr:.2e} pool={pool_est}", flush=True)
+        with open(METRICS_CSV, "a") as f:
+            f.write(f"{it},{loss},{klm},{rmm},{pent},{r_eval_greedy},{items},{cur_lr},{pool_est}\n")
+
         if run is not None:
             wandb.log({
-                "loss/policy": mean_p,
-                "loss/value": mean_v,
-                "kl/avg": report_kl,
-                "reward/raw": r_raw,
+                "loss/total": loss,
+                "kl/avg": klm,
+                "reward/rm_mean": rmm,
+                "pstar/entropy": pent,
                 "reward/eval_greedy": r_eval_greedy,
-                "resp/p50": p50,
                 "optim/lr_actor": cur_lr,
                 "pool/size_est": pool_est,
                 "iter": it,
@@ -594,19 +570,20 @@ def main():
             ckpt = {
                 "iter": it,
                 "actor": raw_actor.state_dict(),
-                "critic": critic.state_dict(),
-                "ref": ref.state_dict(),
+                "ref": ref.state_dict(),          # 即使 KL 关掉，也保留 ref 以便随时开 KL
                 "opt_actor": opt_a.state_dict(),
-                "opt_critic": opt_c.state_dict(),
             }
-            torch.save(ckpt, os.path.join(OUT_DIR, "PPO_ckpt.pt"))
+            torch.save(ckpt, os.path.join(OUT_DIR, "DAPO_ckpt.pt"))
 
-    # ====== 结束 W&B（离线） ======
+        if stats.get("skip"):
+            print(f"[iter {it:04d}] skip(step) pool={pool_est} r_eval_greedy={r_eval_greedy:.4f}", flush=True)
+            if run is not None and not math.isnan(r_eval_greedy):
+                wandb.log({"reward/eval_greedy": r_eval_greedy, "iter": it, "pool/size_est": pool_est}, step=it)
+            continue
+
     if run is not None:
-        try:
-            wandb.finish()
-        except Exception:
-            pass
+        try: wandb.finish()
+        except Exception: pass
 
 if __name__ == "__main__":
     main()

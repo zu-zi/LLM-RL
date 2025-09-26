@@ -550,7 +550,7 @@ def main():
             }, step=it)
 
         # —— 定期导出给 sglang（保证新鲜；避免过度频繁引发 worker reload） —— #
-        if SGLANG_ON and (it - last_export_it) >= 30:  #40
+        if SGLANG_ON and (it - last_export_it) >= 40:  #40
             try:
                 export_actor_for_sglang(raw_actor, INIT_FROM, SGLANG_EXPORT_BASE, SGLANG_MODEL_SYMLINK)
                 last_export_it = it
