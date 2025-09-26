@@ -33,34 +33,56 @@ INIT_FROM       = "gpt2-large"
 DROPOUT         = 0.0
 BIAS            = False
 
+# sglang 池（与训练竞争显存，长期充足且新鲜）
+SGLANG_ON       = True
+SGLANG_MODEL_SYMLINK = "/root/autodl-tmp/actor_exports/current"
+SGLANG_EXPORT_BASE   = "/root/autodl-tmp/actor_exports"
+SGLANG_SYNC_DIR      = "/root/autodl-tmp/sgl_pool"
+
 # DAPO（与 GRPO 基本相同；kl_ctl 可设为 0 以关闭 ref KL）
 GROUP_SIZE      = 4
 NUM_GROUPS      = 4
-LR_ACTOR        = 4e-6
 WD_ACTOR        = 3e-3
 BETA1, BETA2    = 0.9, 0.95
-MAX_GRAD_NORM   = 0.5
-TAU             = 0.4         # 软目标温度（小 -> 更尖）
-KL_CTL_INIT     = 0.1         # DAPO 推荐默认 0；如需轻量约束可设 0.05~0.2
 LENGTH_NORM     = True
 
 # 生成
-TEMP            = 0.9
-TOP_P           = 0.95
 TOP_K           = 0
 REP_PENALTY     = 1.0
 STOP_STRS       = ["\nHuman:", "\n\nHuman:"]
 MIN_RESP_TOK    = 24
 MAX_NEW_TOK     = 96
 
-# sglang 池（与训练竞争显存，长期充足且新鲜）
-SGLANG_ON       = True
-SGLANG_MODEL_SYMLINK = "/root/autodl-tmp/actor_exports/current"
-SGLANG_EXPORT_BASE   = "/root/autodl-tmp/actor_exports"
-SGLANG_SYNC_DIR      = "/root/autodl-tmp/sgl_pool"
-SGLANG_REFILL_CHUNK  = 64
-ROLL_MIN_FREE_MB     = 3000      # 你之前改的值，保留
-ROLL_COOLDOWN_SEC    = 7
+# 熵
+HE_ON   = True   # or False
+HE_FRAC = 0.2
+HE_TEMP = 1.0
+
+# === 选择生效参数（下面代码其他地方都用这些统一变量）===
+if HE_ON:
+    LR_ACTOR      = 2e-6      # ↓ 学习率
+    MAX_GRAD_NORM = 0.3       # ↓ 裁剪
+    TAU           = 0.6       # ↑ 组内温度，p* 更平滑
+    KL_CTL_INIT   = 0.01      # 只给“轻约束”
+    TEMP          = 0.7       # ↑ 更探索
+    TOP_P         = 0.98
+    SGLANG_REFILL_CHUNK = 48
+    ROLL_MIN_FREE_MB    = 3000
+    ROLL_COOLDOWN_SEC   = 5
+    BURST_MULT          = 3
+    ROLLOUT_MB          = 2
+else:
+    LR_ACTOR      = 4e-6
+    MAX_GRAD_NORM = 0.5
+    TAU           = 0.4
+    KL_CTL_INIT   = 0.10
+    TEMP          = 0.9
+    TOP_P         = 0.95
+    SGLANG_REFILL_CHUNK = 64
+    ROLL_MIN_FREE_MB    = 3000
+    ROLL_COOLDOWN_SEC   = 7
+    BURST_MULT          = 4
+    ROLLOUT_MB          = 3
 
 # 奖励模型
 REWARD_MODEL_NAME = "OpenAssistant/reward-model-deberta-v3-large-v2"
@@ -254,7 +276,7 @@ def spawn_rollout(prompt_bin_path, count, sync_dir, max_new):
         "--count", str(int(count)),
         "--max-new", str(int(max_new)),
         "--block-size", str(int(BLOCK_SIZE)),
-        "--mb", "3",
+        "--mb", str(int(ROLLOUT_MB)),
         "--use-only-train",
         "--min-resp", str(int(MIN_RESP_TOK)),
         "--refresh-every-batches","30",
@@ -449,6 +471,7 @@ def main():
         kl_ctl=KL_CTL_INIT,
         length_norm=LENGTH_NORM,
         max_grad_norm=MAX_GRAD_NORM,
+        he_on=HE_ON, he_frac=HE_FRAC, he_temp=HE_TEMP,
     )
 
     # baseline
@@ -493,7 +516,6 @@ def main():
     # ---- 主循环 ----
     demand = GROUP_SIZE * NUM_GROUPS
     LOW_WATER = max(demand * 3, SGLANG_REFILL_CHUNK)
-    BURST_MULT = 4
 
     for it in range(1, MAX_ITERS+1):
         # —— 估算池量 & 补货策略 —— #
@@ -555,6 +577,9 @@ def main():
                 "optim/lr_actor": cur_lr,
                 "pool/size_est": pool_est,
                 "iter": it,
+                "fork/high_entropy_ratio": stats.get("he_ratio", float("nan")),
+                "fork/H_mean": stats.get("H_mean", float("nan")),
+                "fork/H_sel_mean": stats.get("H_sel_mean", float("nan")),
             }, step=it)
 
         # —— 定期导出给 sglang —— #
