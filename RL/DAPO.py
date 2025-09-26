@@ -15,7 +15,7 @@ from .PPO import (
     _clean_logp,
 )
 
-# ---------- 工具：组展开 / 切片 ----------
+# utils
 def _flatten_groups(groups: List[List[dict]]) -> Tuple[List[dict], List[Tuple[int, int]]]:
     flat, meta = [], []
     s = 0
@@ -31,7 +31,7 @@ def _group_slices(n: int, meta: List[Tuple[int, int]]):
         if 0 <= s < e <= n and (e - s) >= 2:
             yield s, e
 
-# ---------- DAPO ----------
+# DAPO
 class DAPOTrainer:
     def __init__(
         self,
@@ -79,17 +79,9 @@ class DAPOTrainer:
         self.he_frac = float(he_frac)
         self.he_temp = float(he_temp)
 
-    # 熵
+    # token entropy
     @torch.no_grad()
     def _forking_mask(self, logits_next: torch.Tensor, mask_t: torch.Tensor):
-        """
-        logits_next: [B, L, V] 与响应段 mask_t 对齐（通常传 logits_a[:, 1:, :][:, :L, :]）
-        mask_t:      [B, L]     响应段的 token mask（actm[:, 1:][:, :L]）
-        返回:
-          he_mask:   [B, L]     仅 top-entropy token 为 1
-          H_resp:    [B, L]     响应段 token 的熵
-          sel_ratio: float      实际被选中的比例（≈ he_frac）
-        """
         logits = logits_next / max(self.he_temp, 1e-6)
         probs  = torch.softmax(logits, dim=-1)                       # [B, L, V]
         H      = -(probs * (probs.clamp_min(1e-12).log())).sum(-1)   # [B, L]
@@ -115,7 +107,7 @@ class DAPOTrainer:
         return he_mask, H_resp, float(sel_ratio)
     
 
-    # ---------- 奖励模型打分 ----------
+    # RM
     @torch.no_grad()
     def _rm_score(self, seqs: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         B, _ = seqs.size()
@@ -144,13 +136,13 @@ class DAPOTrainer:
             logits = logits.squeeze(-1)
         return logits.detach().to(self.device).float()
 
-    # ---------- 序列上 actor/ref 的 token logp ----------
+    # token logp
     def _seq_logp(self, seqs: torch.Tensor):
-        # actor logits（保留梯度）
+        # actor logits: 保留梯度
         logits_a = model_all_logits(self.actor, seqs, self.device_type, ptdtype=torch.float32, micro_batch_size=self.mb_logits)
         lp_a = token_logprobs_from_logits(logits_a, seqs)  # [B, T-1]
 
-        # 参考策略（若存在；无梯度）
+        # 参考策略: 若存在；无梯度
         if self.ref is not None:
             with torch.no_grad():
                 logits_r = model_all_logits(self.ref, seqs, self.device_type, ptdtype=torch.float32, micro_batch_size=self.mb_logits)
@@ -166,13 +158,13 @@ class DAPOTrainer:
 
         return logits_a, lp_a, lp_r
 
-    # ---------- 打包样本 ----------
+    # 
     def _pack(self, groups: List[List[dict]], block_size: int) -> Tuple[Samples, List[Tuple[int, int]]]:
         flat, meta = _flatten_groups(groups)
         smp = build_samples_from_generations(flat, block_size=block_size, device=self.device)
         return smp, meta
 
-    # ---------- 单步训练 ----------
+    # 
     def step_on_groups(self, groups: List[List[dict]], block_size: int) -> Dict[str, float]:
         smp, meta = self._pack(groups, block_size)
         if int(smp.action_mask.sum().item()) == 0:
@@ -192,7 +184,7 @@ class DAPOTrainer:
         lp_a = lp_a_full[:, :L]
         mask_t = mask_t[:, :L]
     
-        # === 新增：高熵掩码（可选） ===
+        # 新增：高熵掩码
         if self.he_on and self.he_frac > 0.0:
             he_mask, H_resp, he_ratio = self._forking_mask(logits_a[:, 1:, :][:, :L, :], mask_t)
             mask_use = he_mask
@@ -201,25 +193,24 @@ class DAPOTrainer:
             he_ratio = 1.0
             mask_use = mask_t
     
-        # —— 从这往下，聚合与统计一律用 mask_use —— #
+        # 从这往下，聚合与统计一律用 mask_use
         denom = mask_use.sum(dim=1).clamp_min(1e-8).float()
     
         # 序列响应 logp（可导），α-长度归一
         alpha = 1.0 if self.length_norm else 0.0
         lp_resp = (lp_a * mask_use).sum(dim=1) / (denom ** alpha)  # [B]
     
-        # 可选 KL：对参考策略（若存在）
+        # KL：对参考策略（若存在）
         if (self.ref is not None) and (self.kl_ctl > 0.0) and (lp_r_full is not None):
             with torch.no_grad():
                 lp_r = lp_r_full[:, :L]
-                d = (lp_a - lp_r).clamp(-4.0, 4.0)      # ★ 防爆：先夹住差值
-                k3 = torch.expm1(d) - d                  # ~ forward KL 的稳定近似
-                k3 = torch.clamp(k3, 0.0, 10.0)          # ★ 上限保护（防罕见尖峰）
+                d = (lp_a - lp_r).clamp(-4.0, 4.0)      
+                k3 = torch.expm1(d) - d                  
+                k3 = torch.clamp(k3, 0.0, 10.0)      
                 kl_seq = (k3 * mask_use).sum(dim=1) / denom
         else:
             kl_seq = None
     
-        # 奖励分数（CPU / 任意设备）
         with torch.no_grad():
             r = self._rm_score(seqs, attn)  # [B]
     
@@ -253,15 +244,14 @@ class DAPOTrainer:
             groups_cnt += 1
             total_items += (e - s)
     
-            # 监控 p* 的熵（衡量候选差异度）
+            # 监控 p* 的熵
             pstar_ent_list.append(float(-(p_star * p_star.clamp_min(1e-12).log()).sum().item()))
     
         if not group_losses:
             return {"skip": True}
     
         loss = torch.stack(group_losses).mean()
-    
-        # 反传
+
         self.actor.train()
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -269,14 +259,14 @@ class DAPOTrainer:
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
         self.opt.step()
     
-        # 统计（注意用 mask_use 对齐）
+        # 统计
         with torch.no_grad():
             ent_tok = float(entropy_from_logits(logits_a[:, 1:, :], mask_use).item())
             r_mean = float(r.mean().item())
             pstar_entropy = sum(pstar_ent_list) / max(len(pstar_ent_list), 1)
             kl_mean = float(kl_seq.mean().item()) if kl_seq is not None else 0.0
     
-            # 高熵监控（可视化选择强度）
+            # 高熵监控
             H_mean     = float((H_resp.sum() / mask_t.sum().clamp_min(1)).item()) if mask_t.sum() > 0 else 0.0
             H_sel_mean = float(((H_resp * mask_use).sum() / mask_use.sum().clamp_min(1)).item()) if mask_use.sum() > 0 else 0.0
     

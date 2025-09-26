@@ -12,11 +12,10 @@ ROLL_DEDUP_PROMPT_IN_BATCH = True
 ROLL_FILE_ORDER = "mtime_desc"
 ROLL_VERBOSE = True
 
-# 估算用
 ROLL_SCAN_CAP_FILES = 12
 ROLL_APPROX_PER_FILE = 64
 
-# ---- 基础 IO ----
+# IO
 def ensure_dir(d: str) -> None:
     os.makedirs(d, exist_ok=True)
 
@@ -55,7 +54,7 @@ def _clean_tmp_leftovers(dirpath: str) -> None:
 def _now_ts() -> float:
     return time.time()
 
-# ---- 校验 / 规范化 ----
+# 校验/规范化
 def _is_int_list(x) -> bool:
     return isinstance(x, list) and all(isinstance(t, int) for t in x)
 
@@ -68,7 +67,7 @@ def _sanitize_item(it: dict) -> Optional[dict]:
     if not isinstance(it, dict): return None
     p, f = it.get("prompt_ids"), it.get("full_ids")
     if not (_is_int_list(p) and _is_int_list(f)): return None
-    if len(f) <= len(p): return None  # 必须含响应
+    if len(f) <= len(p): return None
 
     ts = it.get("ts"); ts = float(ts) if isinstance(ts, (int, float)) else _now_ts()
     pid = it.get("pid") or _hash_ids(p)
@@ -79,7 +78,7 @@ def _sanitize_item(it: dict) -> Optional[dict]:
         if k in it: out[k] = it[k]
     return out
 
-# ---- 写入 ----
+# 写入
 def enqueue_items(dirpath: str, items: List[Dict]) -> str:
     ensure_dir(dirpath); _clean_tmp_leftovers(dirpath)
     path = os.path.join(dirpath, f"roll_{uuid.uuid4().hex}.jsonl")
@@ -95,14 +94,14 @@ def enqueue_items(dirpath: str, items: List[Dict]) -> str:
         kept += 1
 
     if not buf:
-        return path  # 不落盘：用于上层拿到拟写入路径也不影响逻辑
+        return path  
 
     _atomic_write(path, "\n".join(buf) + "\n")
     if ROLL_VERBOSE:
         print(f"[rollout_pool.enqueue] file={os.path.basename(path)} kept={kept} dropped={dropped}")
     return path
 
-# ---- 读取 ----
+# 读取
 def _file_order(files: List[str]) -> List[str]:
     if not files: return files
     mode = ROLL_FILE_ORDER
@@ -126,6 +125,7 @@ def _resp_len_ok(obj: dict) -> bool:
 def _stringify(obj: dict) -> str:
     return json.dumps(obj, ensure_ascii=False)
 
+# PPO
 def dequeue_items(dirpath: str, n: int) -> List[Dict]:
     ensure_dir(dirpath); _clean_tmp_leftovers(dirpath)
     want = max(int(n), 0)
@@ -196,8 +196,8 @@ def dequeue_items(dirpath: str, n: int) -> List[Dict]:
         )
     return out
 
+# GRPO/DAPO
 def dequeue_groups(dirpath: str, group_size: int, num_groups: int, allow_partial: bool = False):
-    """按同一 pid 聚合成组出队；不影响现有 PPO 逻辑。"""
     ensure_dir(dirpath); _clean_tmp_leftovers(dirpath)
     G = max(int(group_size), 1); K = max(int(num_groups), 0)
     if K == 0: return []
@@ -206,7 +206,7 @@ def dequeue_groups(dirpath: str, group_size: int, num_groups: int, allow_partial
     now_ts = _now_ts()
 
     buckets = {}          # pid -> {"items": [dict...], "hids": set(...)}
-    used_hid = set()      # 扫描阶段临时防重复
+    used_hid = set()      
 
     cnt_scanned = cnt_kept = cnt_drop_stale = cnt_drop_short = 0
 
@@ -285,7 +285,7 @@ def dequeue_groups(dirpath: str, group_size: int, num_groups: int, allow_partial
         )
     return groups
 
-# ---- 估算 / 统计 ----
+# 估算/统计
 def estimate_size(dirpath: str, approx_per_file: int = None, scan_cap_files: int = None) -> int:
     try:
         _clean_tmp_leftovers(dirpath)

@@ -1,4 +1,4 @@
-# train_GRPO.py —— 极简 GRPO 训练脚本（无 warmup，显存博弈下保持供给新鲜且不断流）
+# train_GRPO.py
 import os, sys, time, json, glob, shutil, random
 from datetime import datetime
 import numpy as np
@@ -8,9 +8,9 @@ from transformers import AutoModelForSequenceClassification, AutoTokenizer, Auto
 from utils.rollout_pool import dequeue_groups, estimate_size, ensure_dir
 
 from RL.GRPO import GRPOTrainer
-from RL.PPO import Samples, normalize_for_reward  # 复用工具/结构
+from RL.PPO import Samples, normalize_for_reward
 
-# ========= W&B（离线） =========
+# W&B（离线）
 WANDB_ON = True
 os.environ.setdefault("WANDB_MODE", "offline")
 os.environ.setdefault("WANDB_SILENT", "true")
@@ -19,9 +19,8 @@ try:
     _HAS_WANDB = True
 except Exception:
     _HAS_WANDB = False
-# ==============================
 
-# 路径 / 运行
+# 路径
 OUT_DIR         = "/root/autodl-tmp/Results"
 DEVICE          = "cuda"
 BLOCK_SIZE      = 256
@@ -54,19 +53,19 @@ STOP_STRS       = ["\nHuman:", "\n\nHuman:"]
 MIN_RESP_TOK    = 24
 MAX_NEW_TOK     = 96
 
-# sglang 池（与训练竞争显存，长期充足且新鲜）
+# sglang 池
 SGLANG_ON       = True
 SGLANG_MODEL_SYMLINK = "/root/autodl-tmp/actor_exports/current"
 SGLANG_EXPORT_BASE   = "/root/autodl-tmp/actor_exports"
 SGLANG_SYNC_DIR      = "/root/autodl-tmp/sgl_pool"
 SGLANG_REFILL_CHUNK  = 64          # 72
 ROLL_MIN_FREE_MB     = 3000        # 6000
-ROLL_COOLDOWN_SEC    = 7           # 适度更快的补货节奏
+ROLL_COOLDOWN_SEC    = 7           # 7
 
-# 奖励模型
+# RM
 REWARD_MODEL_NAME = "OpenAssistant/reward-model-deberta-v3-large-v2"
 
-# 数据
+# data
 PROMPT_BIN = os.path.join(os.path.dirname(__file__), "data/RL_dataset/prompt.bin")
 
 def set_seed(s):
@@ -108,7 +107,7 @@ def decode_with_sampling(model, idx, max_new, eos_id, block_size,
                 kth = torch.topk(last, k=min(int(top_k), last.size(-1)), dim=-1).values[..., -1:]
                 last = torch.where(last < kth, torch.full_like(last, -1e10), last)
             probs = torch.softmax(last, dim=-1)
-            # nucleus
+
             sorted_probs, sorted_idx = torch.sort(probs, descending=True, dim=-1)
             cumsum = torch.cumsum(sorted_probs, dim=-1)
             cutoff = (cumsum > float(top_p)).float().argmax(dim=-1, keepdim=True)
@@ -117,7 +116,7 @@ def decode_with_sampling(model, idx, max_new, eos_id, block_size,
             kept = kept / kept.sum(dim=-1, keepdim=True).clamp_min(1e-12)
             next_sorted = torch.multinomial(kept, num_samples=1)
             next_id = sorted_idx.gather(1, next_sorted)
-            # 保底最短响应
+
             if (out.size(1) - start) < int(min_resp) and eos_id is not None and int(next_id.item()) == int(eos_id):
                 alt = sorted_idx[:, 1:2] if sorted_idx.size(1) > 1 else next_id
                 next_id = alt
@@ -269,19 +268,16 @@ def spawn_rollout(prompt_bin_path, count, sync_dir, max_new):
         print(f"[rollout] worker exit code {ret}", flush=True)
         
 def _rebucket_and_topup(groups, G, dev, raw_actor, tok):
-    # 1) 拉平成列表
     flat = []
     for g in groups:
         flat.extend(g)
 
-    # 2) 按 prompt_ids 分桶
     from collections import defaultdict
     buckets = defaultdict(list)
     for item in flat:
-        k = tuple(item["prompt_ids"])  # 列表不可哈希，转成 tuple
+        k = tuple(item["prompt_ids"])  
         buckets[k].append(item)
 
-    # 3) 对每个桶，尽量产出 size=G 的组；不足 G 但 >=2 也保留
     regrouped = []
     singles = []
     for k, lst in buckets.items():
@@ -293,12 +289,10 @@ def _rebucket_and_topup(groups, G, dev, raw_actor, tok):
         else:
             singles.append(k)
 
-    # 4) 在线补齐“只有 1 个候选的 prompt”
     for k in singles:
         base = list(k)
         need = G - 1
         new_group = [buckets[k][0]]
-        # 多试几次以防短答/重复
         for _ in range(need * 3):
             x = torch.tensor(base, dtype=torch.long, device=dev).unsqueeze(0)
             room = BLOCK_SIZE - x.size(1) - 1
@@ -312,11 +306,11 @@ def _rebucket_and_topup(groups, G, dev, raw_actor, tok):
             if (out.size(1) - x.size(1)) < MIN_RESP_TOK:
                 continue
             full_ids = out[0].tolist()
-            key = ",".join(map(str, full_ids[len(base):]))  # 组内去重（响应段）
+            key = ",".join(map(str, full_ids[len(base):]))  
             if any(",".join(map(str, it["full_ids"][len(base):])) == key for it in new_group):
                 continue
             new_group.append({"prompt_ids": base, "full_ids": full_ids})
-            if len(new_group) >= 2:  # 至少 2 个即可用于训练；若想强制 G 个，改成 == G
+            if len(new_group) >= 2:  
                 regrouped.append(new_group[:G])
                 break
 
@@ -425,7 +419,7 @@ def main():
         opt_a = torch.optim.AdamW(raw_actor.parameters(), lr=LR_ACTOR, betas=(BETA1,BETA2), weight_decay=WD_ACTOR)
         print("[optim] torch.optim.AdamW")
 
-    # 奖励模型（CPU）
+    # RM（CPU）
     print(f"[reward] loading {REWARD_MODEL_NAME} on CPU...")
     reward_model = AutoModelForSequenceClassification.from_pretrained(REWARD_MODEL_NAME, device_map="cpu", torch_dtype=torch.float32).eval()
     reward_tok = AutoTokenizer.from_pretrained(REWARD_MODEL_NAME, use_fast=True)
@@ -456,12 +450,11 @@ def main():
     last_export_it = 0
     last_roll_t = 0.0
 
-    # ---- 在线生成：组内去重（避免 bytes 报错）----
+    # 在线生成
     import hashlib
     def _gen_group(G):
         base = random.choice(TRAIN_PROMPT_IDS)
         g, seen = [], set()
-        # 适当重试：避免核采样偶发短答/重复
         for _ in range(G * 3):
             x = torch.tensor(base, dtype=torch.long, device=dev).unsqueeze(0)
             room = BLOCK_SIZE - x.size(1) - 1
@@ -481,19 +474,17 @@ def main():
             if len(g) >= G: break
         return g if len(g) >= 2 else []
 
-    # ---- 主循环 ----
+    # 主循环
     demand = GROUP_SIZE * NUM_GROUPS
     LOW_WATER = max(demand * 3, SGLANG_REFILL_CHUNK)  # 低水位（按需求 *3）
     BURST_MULT = 4                                    # 当池空时，突发并发倍数
 
     for it in range(1, MAX_ITERS+1):
-        # —— 估算池量 & 补货策略 —— #
         pool_est = estimate_size(SGLANG_SYNC_DIR, SGLANG_REFILL_CHUNK) if SGLANG_ON else -1
         if SGLANG_ON:
             need_burst = (pool_est <= 0)
             should_refill = need_burst or (pool_est < LOW_WATER)
             if should_refill and cuda_free_mb(DEVICE) >= ROLL_MIN_FREE_MB:
-                # 池空 -> 突发多份；否则按冷却周期补一次
                 n_jobs = (BURST_MULT if need_burst else 1)
                 now = time.time()
                 if need_burst or (now - last_roll_t) >= ROLL_COOLDOWN_SEC:
@@ -501,7 +492,6 @@ def main():
                         spawn_rollout(PROMPT_BIN, SGLANG_REFILL_CHUNK, SGLANG_SYNC_DIR, MAX_NEW_TOK)
                     last_roll_t = now
 
-        # —— 从池取组，允许部分组；不足在线补齐 —— #
         groups = dequeue_groups(SGLANG_SYNC_DIR, GROUP_SIZE, NUM_GROUPS, allow_partial=True) if SGLANG_ON else []
         while len(groups) < NUM_GROUPS:
             g = _gen_group(GROUP_SIZE)
@@ -520,12 +510,11 @@ def main():
 
         stats = trainer.step_on_groups(groups, BLOCK_SIZE)
 
-        # —— 评测：固定间隔 —— #
+        # 评测：固定间隔 & 固定集合
         r_eval_greedy = float("nan")
         if (it % EVAL_INTERVAL == 0) and len(EVAL_PROMPT_IDS) > 0:
             r_eval_greedy = greedy_eval_reward(raw_actor, tok, EVAL_PROMPT_IDS, reward_tok, reward_model, BLOCK_SIZE, max_new_eval=min(64, MAX_NEW_TOK))
 
-        # —— 打点 —— #
         cur_lr = [pg['lr'] for pg in opt_a.param_groups][0]
         loss = stats.get("loss", float("nan"))
         klm  = stats.get("kl_mean", float("nan"))
@@ -549,7 +538,7 @@ def main():
                 "iter": it,
             }, step=it)
 
-        # —— 定期导出给 sglang（保证新鲜；避免过度频繁引发 worker reload） —— #
+        # 定期导出给 sglang
         if SGLANG_ON and (it - last_export_it) >= 40:  #40
             try:
                 export_actor_for_sglang(raw_actor, INIT_FROM, SGLANG_EXPORT_BASE, SGLANG_MODEL_SYMLINK)
@@ -557,7 +546,6 @@ def main():
             except Exception as e:
                 print(f"[export][warn] export failed: {e}", flush=True)
 
-        # —— 轻量 ckpt —— #
         if it % EVAL_INTERVAL == 0:
             ckpt = {
                 "iter": it,
@@ -569,7 +557,6 @@ def main():
 
         if stats.get("skip"):
             print(f"[iter {it:04d}] skip(step) pool={pool_est} r_eval_greedy={r_eval_greedy:.4f}", flush=True)
-            # 这里也可以 wandb.log 一下 r_eval_greedy
             if run is not None and not math.isnan(r_eval_greedy):
                 wandb.log({"reward/eval_greedy": r_eval_greedy, "iter": it, "pool/size_est": pool_est}, step=it)
             continue

@@ -1,4 +1,4 @@
-# train_DAPO.py —— 极简 DAPO 训练脚本（与 GRPO 同构；rollout 逻辑不变）
+# train_DAPO.py
 import os, sys, time, json, glob, shutil, random, math
 from datetime import datetime
 import numpy as np
@@ -6,10 +6,10 @@ import torch, tiktoken
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, AutoModelForCausalLM
 from utils.rollout_pool import dequeue_groups, estimate_size, ensure_dir
 
-from RL.DAPO import DAPOTrainer                 # ← 仅此处换 Trainer
+from RL.DAPO import DAPOTrainer             
 from RL.PPO import Samples, normalize_for_reward
 
-# ========= W&B（离线） =========
+# W&B（离线）
 WANDB_ON = True
 os.environ.setdefault("WANDB_MODE", "offline")
 os.environ.setdefault("WANDB_SILENT", "true")
@@ -18,9 +18,8 @@ try:
     _HAS_WANDB = True
 except Exception:
     _HAS_WANDB = False
-# ==============================
 
-# 路径 / 运行
+# 
 OUT_DIR         = "/root/autodl-tmp/Results"
 DEVICE          = "cuda"
 BLOCK_SIZE      = 256
@@ -33,13 +32,13 @@ INIT_FROM       = "gpt2-large"
 DROPOUT         = 0.0
 BIAS            = False
 
-# sglang 池（与训练竞争显存，长期充足且新鲜）
+# sglang
 SGLANG_ON       = True
 SGLANG_MODEL_SYMLINK = "/root/autodl-tmp/actor_exports/current"
 SGLANG_EXPORT_BASE   = "/root/autodl-tmp/actor_exports"
 SGLANG_SYNC_DIR      = "/root/autodl-tmp/sgl_pool"
 
-# DAPO（与 GRPO 基本相同；kl_ctl 可设为 0 以关闭 ref KL）
+# DAPO（kl_ctl可设为0以关闭ref KL）
 GROUP_SIZE      = 4
 NUM_GROUPS      = 4
 WD_ACTOR        = 3e-3
@@ -58,7 +57,7 @@ HE_ON   = True   # or False
 HE_FRAC = 0.2
 HE_TEMP = 1.0
 
-# === 选择生效参数（下面代码其他地方都用这些统一变量）===
+# 选择生效参数：因为 token entropy
 if HE_ON:
     LR_ACTOR      = 2e-6      # ↓ 学习率
     MAX_GRAD_NORM = 0.3       # ↓ 裁剪
@@ -84,10 +83,10 @@ else:
     BURST_MULT          = 4
     ROLLOUT_MB          = 3
 
-# 奖励模型
+# RM
 REWARD_MODEL_NAME = "OpenAssistant/reward-model-deberta-v3-large-v2"
 
-# 数据
+# data
 PROMPT_BIN = os.path.join(os.path.dirname(__file__), "data/RL_dataset/prompt.bin")
 
 def set_seed(s):
@@ -129,7 +128,7 @@ def decode_with_sampling(model, idx, max_new, eos_id, block_size,
                 kth = torch.topk(last, k=min(int(top_k), last.size(-1)), dim=-1).values[..., -1:]
                 last = torch.where(last < kth, torch.full_like(last, -1e10), last)
             probs = torch.softmax(last, dim=-1)
-            # nucleus
+          
             sorted_probs, sorted_idx = torch.sort(probs, descending=True, dim=-1)
             cumsum = torch.cumsum(sorted_probs, dim=-1)
             cutoff = (cumsum > float(top_p)).float().argmax(dim=-1, keepdim=True)
@@ -290,19 +289,17 @@ def spawn_rollout(prompt_bin_path, count, sync_dir, max_new):
         print(f"[rollout] worker exit code {ret}", flush=True)
 
 def _rebucket_and_topup(groups, G, dev, raw_actor, tok):
-    # 1) 拉平成列表
     flat = []
     for g in groups:
         flat.extend(g)
 
-    # 2) 按 prompt_ids 分桶
     from collections import defaultdict
     buckets = defaultdict(list)
     for item in flat:
-        k = tuple(item["prompt_ids"])  # 列表不可哈希，转成 tuple
+        k = tuple(item["prompt_ids"])  
         buckets[k].append(item)
 
-    # 3) 对每个桶，尽量产出 size=G 的组；不足 G 但 >=2 也保留
+    # 对每个桶，尽量产出 size=G 的组；不足 G 但 >=2 也保留
     regrouped = []
     singles = []
     for k, lst in buckets.items():
@@ -314,7 +311,7 @@ def _rebucket_and_topup(groups, G, dev, raw_actor, tok):
         else:
             singles.append(k)
 
-    # 4) 在线补齐“只有 1 个候选的 prompt”
+    # 在线补齐只有 1 个候选的 prompt
     for k in singles:
         base = list(k)
         need = G - 1
@@ -378,7 +375,6 @@ def main():
             print(f"[wandb][warn] init failed: {e}; continue without wandb.", flush=True)
             run = None
 
-    # 数据
     print(f"[data] loading prompts from {PROMPT_BIN}")
     blob = torch.load(PROMPT_BIN, map_location="cpu")
     PROMPT_TOKEN_IDS = blob["gpt2_token_ids"]
@@ -407,7 +403,7 @@ def main():
         choice = rng.choice(len(PROMPT_TOKEN_IDS), size=min(16, len(PROMPT_TOKEN_IDS)), replace=False) if len(PROMPT_TOKEN_IDS)>0 else []
         EVAL_PROMPT_IDS = [PROMPT_TOKEN_IDS[int(i)] for i in choice]
 
-    # 模型
+
     from model import GPT, GPTConfig
     print(f"[model] init from {INIT_FROM}")
     m = GPT.from_pretrained(INIT_FROM, dict(dropout=DROPOUT))
@@ -447,7 +443,7 @@ def main():
         opt_a = torch.optim.AdamW(raw_actor.parameters(), lr=LR_ACTOR, betas=(BETA1,BETA2), weight_decay=WD_ACTOR)
         print("[optim] torch.optim.AdamW")
 
-    # 奖励模型（CPU）
+    # RM（CPU）
     print(f"[reward] loading {REWARD_MODEL_NAME} on CPU...")
     reward_model = AutoModelForSequenceClassification.from_pretrained(REWARD_MODEL_NAME, device_map="cpu", torch_dtype=torch.float32).eval()
     reward_tok = AutoTokenizer.from_pretrained(REWARD_MODEL_NAME, use_fast=True)
@@ -456,7 +452,6 @@ def main():
     try: reward_tok.padding_side = "right"
     except Exception: pass
 
-    # —— 构建 DAPOTrainer —— #
     # 若想完全关闭 KL：kl_ctl=0.0 或者 ref=None（二选一即可）
     trainer = DAPOTrainer(
         actor_model=raw_actor,
@@ -474,7 +469,6 @@ def main():
         he_on=HE_ON, he_frac=HE_FRAC, he_temp=HE_TEMP,
     )
 
-    # baseline
     if len(EVAL_PROMPT_IDS) > 0:
         r0 = greedy_eval_reward(raw_actor, tok, EVAL_PROMPT_IDS, reward_tok, reward_model, BLOCK_SIZE, max_new_eval=min(64, MAX_NEW_TOK))
         print(f"[baseline] iter0_reward_greedy={r0:.4f}", flush=True)
@@ -489,7 +483,7 @@ def main():
     last_export_it = 0
     last_roll_t = 0.0
 
-    # ---- 在线生成：组内去重（避免 bytes 报错）----
+    # 在线生成
     import hashlib
     def _gen_group(G):
         base = random.choice(TRAIN_PROMPT_IDS)
@@ -513,12 +507,12 @@ def main():
             if len(g) >= G: break
         return g if len(g) >= 2 else []
 
-    # ---- 主循环 ----
+    # 主循环
     demand = GROUP_SIZE * NUM_GROUPS
     LOW_WATER = max(demand * 3, SGLANG_REFILL_CHUNK)
 
     for it in range(1, MAX_ITERS+1):
-        # —— 估算池量 & 补货策略 —— #
+        # 估算池量&补货策略
         pool_est = estimate_size(SGLANG_SYNC_DIR, SGLANG_REFILL_CHUNK) if SGLANG_ON else -1
         if SGLANG_ON:
             need_burst = (pool_est <= 0)
@@ -531,7 +525,6 @@ def main():
                         spawn_rollout(PROMPT_BIN, SGLANG_REFILL_CHUNK, SGLANG_SYNC_DIR, MAX_NEW_TOK)
                     last_roll_t = now
 
-        # —— 从池取组，允许部分组；不足在线补齐 —— #
         groups = dequeue_groups(SGLANG_SYNC_DIR, GROUP_SIZE, NUM_GROUPS, allow_partial=True) if SGLANG_ON else []
         while len(groups) < NUM_GROUPS:
             g = _gen_group(GROUP_SIZE)
@@ -550,12 +543,11 @@ def main():
 
         stats = trainer.step_on_groups(groups, BLOCK_SIZE)
 
-        # —— 评测：固定间隔 —— #
+        # 评测：固定间隔, 固定集合
         r_eval_greedy = float("nan")
         if (it % EVAL_INTERVAL == 0) and len(EVAL_PROMPT_IDS) > 0:
             r_eval_greedy = greedy_eval_reward(raw_actor, tok, EVAL_PROMPT_IDS, reward_tok, reward_model, BLOCK_SIZE, max_new_eval=min(64, MAX_NEW_TOK))
 
-        # —— 打点 —— #
         cur_lr = [pg['lr'] for pg in opt_a.param_groups][0]
         loss = stats.get("loss", float("nan"))
         klm  = stats.get("kl_mean", float("nan"))
@@ -582,7 +574,7 @@ def main():
                 "fork/H_sel_mean": stats.get("H_sel_mean", float("nan")),
             }, step=it)
 
-        # —— 定期导出给 sglang —— #
+        # 定期导出给 sglang
         if SGLANG_ON and (it - last_export_it) >= 40:
             try:
                 export_actor_for_sglang(raw_actor, INIT_FROM, SGLANG_EXPORT_BASE, SGLANG_MODEL_SYMLINK)
@@ -590,7 +582,7 @@ def main():
             except Exception as e:
                 print(f"[export][warn] export failed: {e}", flush=True)
 
-        # —— 轻量 ckpt —— #
+        # 
         if it % EVAL_INTERVAL == 0:
             ckpt = {
                 "iter": it,

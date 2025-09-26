@@ -51,7 +51,7 @@ def _retry_sleep(backoff_s: float) -> float:
     time.sleep(backoff_s)
     return min(backoff_s * 2.0, 8.0)
 
-# -------- 热重载签名 --------
+# 热重载
 def _dir_mtime_signature(path: str, glob_pat: str = "**/*", limit: int = 4096) -> float:
     if not os.path.isdir(path): return 0.0
     sig, cnt = 0.0, 0
@@ -114,7 +114,7 @@ class EngineWrapper:
             return _dir_mtime_signature(self.path, self.mtime_glob)
         if self.strategy == "realpath":
             return _realpath_signature(self.path)
-        return None  # "none"
+        return None  
 
     def _update_signature(self, first=False):
         self._last_sig = self._current_signature()
@@ -133,7 +133,7 @@ class EngineWrapper:
         if self.eng is None: return None
         return self.eng.generate(inputs, params)
 
-# -------- 主流程 --------
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
@@ -144,7 +144,7 @@ def main():
     ap.add_argument("--min-resp", type=int, default=16)
     ap.add_argument("--mb", type=int, default=4)
     ap.add_argument("--seed", type=int, default=1337)
-    ap.add_argument("--block-size", type=int, default=256)  # 保留以兼容调用
+    ap.add_argument("--block-size", type=int, default=256)  
     ap.add_argument("--flush-interval", type=float, default=2.0)
     ap.add_argument("--flush-batch", type=int, default=256)
 

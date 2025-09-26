@@ -9,12 +9,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import amp
 
-# ===================== 常量（稳定，不暴露为超参） =====================
+# 常量（稳定，不暴露为超参）
 _CAP_LOGR = 0.5      # clamp on Δlogp per token
 _CAP_K3   = 1.5      # clamp on k3 per token
 _ENT_KEEP = 0.25     # entropy mask keep ratio
 
-# ===================== Data structs =====================
+# Data structs: 放到PPO里实现，GRPO和DAPO直接复用
 @dataclass
 class Samples:
     seqs: torch.Tensor
@@ -49,7 +49,7 @@ class ExperienceBuffer:
     def clear(self):
         self.buffer = []
 
-# ===================== 文本归一 =====================
+# 文本归一
 def contains_chinese(text: str) -> bool:
     return any('\u4e00' <= c <= '\u9fff' for c in text)
 
@@ -61,7 +61,7 @@ def normalize_for_reward(text: str, reward_tokenizer=None) -> str:
     text = "".join(c for c in text if c.isprintable()).replace("\ufffd", "")
     return text.strip()
 
-# ===================== Ragged -> Padded =====================
+# Ragged -> Padded
 def _pad_to_multiple(length: int, multiple: int) -> int:
     if multiple <= 1: return length
     r = length % multiple
@@ -120,7 +120,7 @@ def build_samples_from_generations(
         num_actions=num_actions, response_length=response_length, total_length=total_length,
     )
 
-# ===================== Forward helpers =====================
+# helpers
 def iter_batch_indices(n_items: int, micro_batch_size: int) -> Iterable[Tuple[int, int]]:
     if micro_batch_size is None or micro_batch_size <= 0 or micro_batch_size >= n_items:
         yield 0, n_items; return
@@ -146,11 +146,11 @@ def token_logprobs_from_logits(logits: torch.Tensor, seqs: torch.Tensor) -> torc
     tgt  = seqs[:, 1:].unsqueeze(-1)                  # [B, T-1, 1]
     return torch.gather(logp, dim=-1, index=tgt).squeeze(-1).contiguous()
 
-# ===================== Basic math =====================
+# 
 def masked_mean(x: torch.Tensor, mask: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     denom = mask.sum().clamp_min(eps); return (x * mask).sum() / denom
 
-# ===================== KL / Entropy / Critic routing =====================
+# KL / Entropy / Critic routing
 def compute_approx_kl(log_probs: torch.Tensor, ref_log_probs: torch.Tensor, action_mask: Optional[torch.Tensor]=None) -> torch.Tensor:
     lr = log_probs.float() - ref_log_probs.float()
     return lr if action_mask is None else (lr * action_mask)
@@ -186,7 +186,7 @@ def forward_values_via_actor(
         chunks.append(v); del h, v
     return torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
 
-# ===================== GAE / returns =====================
+# GAE / returns
 def gae_compute(
     values: torch.Tensor, rewards: torch.Tensor, mask_time: torch.Tensor,
     gamma: float = 1.0, lam: float = 0.95, use_last_as_terminal: bool = True,
@@ -216,7 +216,7 @@ def gae_compute(
 def get_advantages_and_returns(values: torch.Tensor, rewards: torch.Tensor, action_mask: torch.Tensor, gamma: float, lambd: float):
     return gae_compute(values, rewards, action_mask, gamma=gamma, lam=lambd)
 
-# ===================== Reward 与杂项 =====================
+# Reward 与杂项
 @torch.no_grad()
 def _ref_logits(ref: nn.Module, seqs: torch.Tensor, device_type: str, micro_batch_size: int):
     return model_all_logits(ref, seqs, device_type, ptdtype=None, micro_batch_size=micro_batch_size)
@@ -262,7 +262,7 @@ def scatter_uniform_rewards(r_seq, mask_time, beta_kl=None):
     k3, beta = beta_kl; pen = beta * (k3 * m) / denom
     return base - pen
 
-# ===================== Diagnostics =====================
+# 
 def ratio_stats(log_ratio: torch.Tensor, mask: torch.Tensor) -> Tuple[float, float, float, float]:
     with torch.no_grad():
         m = mask.float(); r_delta = (log_ratio).exp() - 1.0
@@ -276,7 +276,7 @@ def adv_abs_mean(advantages: torch.Tensor, mask: torch.Tensor) -> float:
         a = (advantages.abs() * mask.float()); denom = mask.sum().clamp_min(1.0)
         return float(a.sum().item() / denom.item())
 
-# ===================== Utils =====================
+# utils
 def to_device_rec(obj, device):
     if torch.is_tensor(obj): return obj.to(device)
     if isinstance(obj, dict): return {k: to_device_rec(v, device) for k, v in obj.items()}
@@ -313,13 +313,13 @@ def apply_entropy_mask(logits: torch.Tensor, action_mask: torch.Tensor, keep_rat
         new_mask[i, selected_pos] = 1
     return new_mask
 
-# ===================== 数值稳定 =====================
+# 数值稳定
 def _clean_logp(x: torch.Tensor, fallback: torch.Tensor = None):
     if fallback is not None and fallback.shape == x.shape:
         return torch.where(torch.isfinite(x), x, fallback)
     return torch.where(torch.isfinite(x), x, torch.zeros_like(x))
 
-# ===================== Critic =====================
+# Critic
 class Critic(nn.Module):
     def __init__(self, actor_like: nn.Module, width: int = 2, depth: int = 2, dropout: float = 0.0):
         super().__init__()
@@ -334,7 +334,7 @@ class Critic(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         z = self.adapter(hidden_states); return self.value_head(z)
 
-# ===================== PPO Trainer =====================
+# PPO
 class PPOTrainer:
     def __init__(
         self,
@@ -365,7 +365,7 @@ class PPOTrainer:
         self.kl_adapt_rate = 0.20  
         self.kl_ctl_min, self.kl_ctl_max = 0.05, 10.0  
         
-    # ----- Reward scoring -----
+    # RM
     @torch.no_grad()
     def _decode_dialogue_and_score(self, seqs: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         B, T = seqs.size(); texts = []
@@ -384,7 +384,7 @@ class PPOTrainer:
         if logits.dim() == 2 and logits.size(-1) == 1: logits = logits.squeeze(-1)
         return logits.detach().to(self.device).float()
 
-    # ----- Step1: rollouts -> Experience -----
+    # rollouts -> Experience
     @torch.no_grad()
     def evaluate_experience(self, samples: Samples):
         seqs = samples.seqs.to(self.device)
@@ -467,7 +467,7 @@ class PPOTrainer:
 
         return experiences, report_kl, r_raw_mean, r_shaped_mean, r_centered_mean, safe_kl
 
-    # ----- Step2: train (actor + critic) -----
+    # train (actor + critic)
     def train_on_experience(self, exp: Experience, use_token_entropy: bool = False):
         seqs, attn, action_mask = exp.seqs, exp.attention_mask, exp.action_mask
         old_logp, returns, old_values, adv = exp.action_log_probs, exp.returns, exp.values, exp.advantages
@@ -480,7 +480,7 @@ class PPOTrainer:
             std  = var.sqrt().clamp_min(1e-6)
             adv.copy_(((adv - mean) / std).clamp_(-5.0, 5.0))
 
-        # ----- Actor -----
+        # Actor
         self.actor.train(); self.opt_actor.zero_grad(set_to_none=True)
 
         logits = model_all_logits(self.actor, seqs, self.device_type, ptdtype=torch.float32, micro_batch_size=self.mb_logits)  # [B, T, V]
@@ -496,7 +496,7 @@ class PPOTrainer:
             sel_mask = action_mask
 
         raw_delta = logp - old_logp
-        ratio = torch.exp(raw_delta)  # 不再引入额外 ratio_min/max
+        ratio = torch.exp(raw_delta)
 
         surr1 = ratio * (adv * sel_mask)
         surr2 = torch.clamp(ratio, 1.0 - self.ppo_clip, 1.0 + self.ppo_clip) * (adv * sel_mask)
@@ -540,7 +540,7 @@ class PPOTrainer:
             clipped = over * sel; denom = sel.sum().clamp_min(1e-8)
             self.last_stats["clip_frac"] = float((clipped.sum() / denom).item())
 
-        # ----- Critic -----
+        # Critic
         self.critic.train(); self.opt_critic.zero_grad(set_to_none=True)
 
         values_full = forward_values_via_actor(self.actor, self.critic, seqs, self.device_type, ptdtype=torch.float32, micro_batch_size=self.mb_values, detach_hidden=True)

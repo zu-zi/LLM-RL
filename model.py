@@ -262,7 +262,7 @@ class GPT(nn.Module):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
 
 
-    #从Hugging Face的GPT2权重加载到当前nanoGPT
+    #从Hugging Face的GPT2权重加载到当前nanoGPT(需要转权重)
     @classmethod
     def from_pretrained(cls, model_type, override_args=None):
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
@@ -393,6 +393,7 @@ class GPT(nn.Module):
     #         idx = torch.cat((idx, idx_next), dim=1)#把新采样的token拼接到当前序列末尾，继续下一轮生成
 
     #     return idx
+    
     # 根据forwrd的接口改变，相应改变
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, eos_token_id=None, eos_id=None):

@@ -1,7 +1,5 @@
-# train_PPO.py  —— 极简单文件训练脚本（仅 PPO）
-# --------------------------------------------------------
-# 统一配置（不要外部 config 覆盖；减少超参）
-# --------------------------------------------------------
+# train_PPO.py
+# 不同于原nanoGPT：不要外部 config 覆盖；减少超参
 import os, sys, time, json, glob, shutil, random
 from datetime import datetime
 import numpy as np
@@ -11,18 +9,18 @@ from utils.rollout_pool import dequeue_items, estimate_size, ensure_dir
 
 from RL.PPO import PPOTrainer, Critic, Samples, normalize_for_reward
 
-# ========= W&B（离线）开关与导入：仅新增，不影响原逻辑 =========
+# W&B（离线）
 WANDB_ON = True  # 需要时可改为 False 完全关闭
 os.environ.setdefault("WANDB_MODE", "offline")  # 强制离线
-os.environ.setdefault("WANDB_SILENT", "true")   # 安静模式（仍然保留我们自己的print）
+os.environ.setdefault("WANDB_SILENT", "true")   # 安静模式（仍然保留print）
 try:
     import wandb
     _HAS_WANDB = True
 except Exception:
     _HAS_WANDB = False
-# ======================================================
 
-# 路径 / 运行
+
+# 路径
 OUT_DIR         = "/root/autodl-tmp/Results"
 DEVICE          = "cuda"
 BLOCK_SIZE      = 256
@@ -31,11 +29,11 @@ EVAL_INTERVAL   = 10
 MAX_ITERS       = 1000
 
 # 模型
-INIT_FROM       = "gpt2-large"   # 仅支持 gpt2* 系列的 from_pretrained 对齐
+INIT_FROM       = "gpt2-large"
 DROPOUT         = 0.0
 BIAS            = False
 
-# 批次 & 优化（稳定默认）
+# 
 BATCH_SIZE      = 8
 POLICY_EPOCHS = 1
 LR_ACTOR        = 7e-7
@@ -49,7 +47,7 @@ PPO_CLIP        = 0.07  # 0.07
 ENTROPY_COEF    = 0.0
 KL_CTL_INIT     = 0.6  # 0.6
 
-# 生成口径（与 rollout 对齐）
+# 
 TEMP            = 0.55
 TOP_P           = 0.9
 TOP_K           = 0
@@ -58,7 +56,7 @@ STOP_STRS       = ["\nHuman:", "\n\nHuman:"]
 MIN_RESP_TOK    = 24
 MAX_NEW_TOK     = 96
 
-# sglang 池（最小闭环）
+# sglang
 SGLANG_ON       = True
 SGLANG_MODEL_SYMLINK = "/root/autodl-tmp/actor_exports/current"
 SGLANG_EXPORT_BASE   = "/root/autodl-tmp/actor_exports"
@@ -68,15 +66,13 @@ ROLL_LOW_WATERMARK   = BATCH_SIZE*3
 ROLL_MIN_FREE_MB     = 3000 # 6000
 ROLL_COOLDOWN_SEC    = 7  # 12
 
-# 奖励模型（英文 RM）
+# RM
 REWARD_MODEL_NAME = "OpenAssistant/reward-model-deberta-v3-large-v2"
 
 # 固定 prompts
 PROMPT_BIN = os.path.join(os.path.dirname(__file__), "data/RL_dataset/prompt.bin")
 
-# --------------------------------------------------------
-# 工具
-# --------------------------------------------------------
+# utils
 def set_seed(s):
     random.seed(s); np.random.seed(s); torch.manual_seed(s)
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(s)
@@ -119,7 +115,7 @@ def decode_with_sampling(model, idx, max_new, eos_id, block_size,
                 last = torch.where(last < kth, torch.full_like(last, -1e10), last)
 
             probs = torch.softmax(last, dim=-1)
-            # nucleus
+
             sorted_probs, sorted_idx = torch.sort(probs, descending=True, dim=-1)
             cumsum = torch.cumsum(sorted_probs, dim=-1)
             cutoff = (cumsum > float(top_p)).float().argmax(dim=-1, keepdim=True)
@@ -129,7 +125,6 @@ def decode_with_sampling(model, idx, max_new, eos_id, block_size,
             next_sorted = torch.multinomial(kept, num_samples=1)
             next_id = sorted_idx.gather(1, next_sorted)
 
-            # 保底最短响应
             if (out.size(1) - start) < int(min_resp) and eos_id is not None and int(next_id.item()) == int(eos_id):
                 alt = sorted_idx[:, 1:2] if sorted_idx.size(1) > 1 else next_id
                 next_id = alt
@@ -195,9 +190,9 @@ def atomic_symlink_update(target_dir: str, link_path: str):
     os.symlink(target_dir, tmp)
     os.replace(tmp, link_path)
 
+# 将当前 actor 权重对齐到 HF 目录
 @torch.no_grad()
 def export_actor_for_sglang(raw_actor, init_from: str, export_base: str, symlink_path: str):
-    """将当前 actor 权重对齐到 HF 目录（优先处理需转置的矩阵）。"""
     os.makedirs(export_base, exist_ok=True)
 
     hf_model = AutoModelForCausalLM.from_pretrained(init_from, torch_dtype=torch.float16)
@@ -223,13 +218,12 @@ def export_actor_for_sglang(raw_actor, init_from: str, export_base: str, symlink
             skipped += 1
             continue
 
-        # 先处理“需要转置”的键（即使形状相同也要 .T）
         if any(k.endswith(suf) for suf in TRANSPOSE_SUFFIXES):
             if w_src.T.shape == w_tgt.shape:
                 w_tgt.copy_(w_src.T.to(w_tgt.dtype))
                 transposed += 1
                 continue
-            # 若没法转置匹配，再试同形状直拷（容错）
+
             if w_src.shape == w_tgt.shape:
                 w_tgt.copy_(w_src.to(w_tgt.dtype))
                 matched += 1
@@ -237,14 +231,12 @@ def export_actor_for_sglang(raw_actor, init_from: str, export_base: str, symlink
             skipped += 1
             continue
 
-        # 其他权重：同形状直接拷贝
         if w_src.shape == w_tgt.shape:
             w_tgt.copy_(w_src.to(w_tgt.dtype))
             matched += 1
         else:
             skipped += 1
 
-    #（HF 已 tying，这里显式再绑一次以防万一）
     try:
         hf_model.transformer.wte.weight = hf_model.lm_head.weight
     except Exception:
@@ -334,15 +326,13 @@ def spawn_rollout(prompt_bin_path, count, sync_dir, max_new):
     if ret != 0:
         print(f"[rollout] worker exit code {ret}", flush=True)
 
-# --------------------------------------------------------
-# 主流程
-# --------------------------------------------------------
+
 def main():
     set_seed(SEED)
     os.makedirs(OUT_DIR, exist_ok=True)
     ensure_dir(SGLANG_SYNC_DIR)
 
-    # =============== W&B 初始化（离线） ===============
+    # W&B 初始化
     run = None
     if WANDB_ON and _HAS_WANDB:
         try:
@@ -392,7 +382,6 @@ def main():
         except Exception as e:
             print(f"[wandb][warn] init failed: {e}; continue without wandb.", flush=True)
             run = None
-    # ================================================
 
     # 加载固定 prompts
     print(f"[data] loading prompts from {PROMPT_BIN}")
@@ -424,7 +413,7 @@ def main():
         choice = rng.choice(len(PROMPT_TOKEN_IDS), size=min(16, len(PROMPT_TOKEN_IDS)), replace=False) if len(PROMPT_TOKEN_IDS)>0 else []
         EVAL_PROMPT_IDS = [PROMPT_TOKEN_IDS[int(i)] for i in choice]
 
-    # 初始化 actor/ref/critic（nanoGPT 模型）
+    # 初始化 actor/ref/critic
     from model import GPT, GPTConfig
     print(f"[model] init from {INIT_FROM}")
     m = GPT.from_pretrained(INIT_FROM, dict(dropout=DROPOUT))
@@ -444,11 +433,11 @@ def main():
     ref = ref.to(dtype=(torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16))
 
     actor = GPT(GPTConfig(**model_args)).to(dev); actor.load_state_dict(base_sd)
-    raw_actor = actor  # 单机单卡简化
+    raw_actor = actor 
 
     critic = Critic(raw_actor).to(dev)
 
-    # 初始导出给 sglang（保证 symlink 可用）
+    # 初始导出给 sglang
     if SGLANG_ON:
         try:
             os.makedirs(os.path.dirname(SGLANG_MODEL_SYMLINK), exist_ok=True)
@@ -467,7 +456,7 @@ def main():
         opt_c = torch.optim.AdamW(critic.parameters(),    lr=LR_CRITIC, betas=(BETA1,BETA2), weight_decay=WD_CRITIC)
         print("[optim] torch.optim.AdamW")
 
-    # 奖励模型（CPU）
+    # RM（CPU）
     print(f"[reward] loading {REWARD_MODEL_NAME} on CPU...")
     reward_model = AutoModelForSequenceClassification.from_pretrained(REWARD_MODEL_NAME, device_map="cpu", torch_dtype=torch.float32).eval()
     reward_tok = AutoTokenizer.from_pretrained(REWARD_MODEL_NAME, use_fast=True)
@@ -476,7 +465,6 @@ def main():
     try: reward_tok.padding_side = "right"
     except Exception: pass
 
-    # PPO 训练器
     trainer = PPOTrainer(
         actor_model=raw_actor, ref_model=ref, reward_model=reward_model,
         critic_model=critic, actor_tokenizer=tok, reward_tokenizer=reward_tok,
@@ -486,7 +474,7 @@ def main():
         entropy_coef=ENTROPY_COEF, max_grad_norm=MAX_GRAD_NORM,
     )
 
-    # -------- baseline：iter0 贪心奖励 --------
+    # baseline：iter0 贪心奖励
     if len(EVAL_PROMPT_IDS) > 0:
         r0 = greedy_eval_reward(raw_actor, tok, EVAL_PROMPT_IDS, reward_tok, reward_model, BLOCK_SIZE, max_new_eval=min(64, MAX_NEW_TOK))
         print(f"[baseline] iter0_reward_greedy={r0:.4f}", flush=True)
@@ -494,7 +482,7 @@ def main():
         if run is not None:
             wandb.log({"baseline/iter0_reward_greedy": float(r0)}, step=0)
 
-    # 日志 CSV（精简）
+    # 日志 CSV
     METRICS_CSV = os.path.join(OUT_DIR, "metrics.csv")
     if not os.path.exists(METRICS_CSV):
         with open(METRICS_CSV, "w") as f:
@@ -504,7 +492,7 @@ def main():
     last_roll_t = 0.0
 
     for it in range(1, MAX_ITERS+1):
-        # —— 补货：只有在池量不足时触发 —— #
+        # 补货：只有在池量不足时触发
         pool_est = estimate_size(SGLANG_SYNC_DIR, SGLANG_REFILL_CHUNK) if SGLANG_ON else -1
         if SGLANG_ON and pool_est < ROLL_LOW_WATERMARK:
             now = time.time()
@@ -512,7 +500,7 @@ def main():
                 spawn_rollout(PROMPT_BIN, SGLANG_REFILL_CHUNK, SGLANG_SYNC_DIR, MAX_NEW_TOK)
                 last_roll_t = now
 
-        # —— 取样：先从池拿，不够就在线补齐 —— #
+        # 取样：先从池拿，不够就在线补齐
         batch = dequeue_items(SGLANG_SYNC_DIR, BATCH_SIZE) if SGLANG_ON else []
         dev_t = torch.device(DEVICE)
 
@@ -542,10 +530,10 @@ def main():
                 wandb.log({"iter/skip_empty": 1, "pool/size_est": pool_est}, step=it)
             continue
 
-        # —— 评估经验 —— #
+        # 评估经验
         experiences, report_kl, r_raw, _, _, _ = trainer.evaluate_experience(samples)
 
-        # —— 训练（标准 PPO；不做奇怪补丁） —— #
+        # 训练
         pl, vl = [], []
         for _ in range(int(POLICY_EPOCHS)):
             for exp in experiences:
@@ -554,12 +542,13 @@ def main():
 
         mean_p = float(np.mean(pl)) if pl else float("nan")
         mean_v = float(np.mean(vl)) if vl else float("nan")
-        # —— 固定评测：贪心 —— #
+
+        # 固定评测：贪心
         r_eval_greedy = float("nan")
         if (it % EVAL_INTERVAL == 0) and len(EVAL_PROMPT_IDS) > 0:
             r_eval_greedy = greedy_eval_reward(raw_actor, tok, EVAL_PROMPT_IDS, reward_tok, reward_model, BLOCK_SIZE, max_new_eval=min(64, MAX_NEW_TOK))
 
-        # —— 日志 —— #
+        # 日志
         resp_lengths = samples.response_length.detach().cpu().numpy().tolist()
         p50 = float(np.percentile(resp_lengths, 50)) if resp_lengths else 0.0
         cur_lr = opt_a.param_groups[0]['lr']
@@ -567,7 +556,6 @@ def main():
         with open(METRICS_CSV, "a") as f:
             f.write(f"{it},{mean_p},{mean_v},{report_kl},{r_raw},{r_eval_greedy},{p50},{cur_lr}\n")
 
-        # —— W&B 记录（离线） —— #
         if run is not None:
             wandb.log({
                 "loss/policy": mean_p,
@@ -581,7 +569,7 @@ def main():
                 "iter": it,
             }, step=it)
 
-        # —— 定期导出给 sglang —— #
+        # 定期导出给 sglang
         if SGLANG_ON and (it - last_export_it) >= 40:
             try:
                 export_actor_for_sglang(raw_actor, INIT_FROM, SGLANG_EXPORT_BASE, SGLANG_MODEL_SYMLINK)
@@ -589,7 +577,6 @@ def main():
             except Exception as e:
                 print(f"[export][warn] export failed: {e}", flush=True)
 
-        # —— 轻量 ckpt —— #
         if it % EVAL_INTERVAL == 0:
             ckpt = {
                 "iter": it,
@@ -601,7 +588,6 @@ def main():
             }
             torch.save(ckpt, os.path.join(OUT_DIR, "PPO_ckpt.pt"))
 
-    # ====== 结束 W&B（离线） ======
     if run is not None:
         try:
             wandb.finish()

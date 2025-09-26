@@ -17,7 +17,7 @@ from .PPO import (
     _clean_logp,
 )
 
-# ---- 组打平 / 索引 ----
+# utils
 def _flatten_groups(groups: List[List[dict]]) -> Tuple[List[dict], List[Tuple[int, int]]]:
     flat, meta = [], []
     s = 0
@@ -33,7 +33,7 @@ def _group_slices(n: int, meta: List[Tuple[int, int]]):
         if 0 <= s < e <= n and (e - s) >= 2:
             yield s, e
 
-# ---- GRPO ----
+# GRPO
 class GRPOTrainer:
     def __init__(
         self,
@@ -72,7 +72,7 @@ class GRPOTrainer:
 
         self.last_stats: Dict[str, float] = {}
 
-    # ---- RM 分数（CPU/任意设备安全）----
+    # RM
     @torch.no_grad()
     def _rm_score(self, seqs: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         B, T = seqs.size()
@@ -98,7 +98,7 @@ class GRPOTrainer:
             logits = logits.squeeze(-1)
         return logits.detach().to(self.device).float()
 
-    # ---- 计算 actor/ref 的 token logp ----
+    # actor/ref 的 token logp
     def _seq_logp(self, seqs: torch.Tensor):
         logits_a = model_all_logits(self.actor, seqs, self.device_type, ptdtype=torch.float32, micro_batch_size=self.mb_logits)
         lp_a = token_logprobs_from_logits(logits_a, seqs)  # [B, T-1]
@@ -116,7 +116,7 @@ class GRPOTrainer:
         smp = build_samples_from_generations(flat, block_size=block_size, device=self.device)
         return smp, meta
 
-    # ---- 单步：一批 group ----
+    # 
     def step_on_groups(self, groups: List[List[dict]], block_size: int) -> Dict[str, float]:
         smp, meta = self._pack(groups, block_size)
         if int(smp.action_mask.sum().item()) == 0:
@@ -135,7 +135,7 @@ class GRPOTrainer:
         mask_t = mask_t[:, :L]
         denom = mask_t.sum(dim=1).clamp_min(1e-8).float()
     
-        # ✅ 完全长度归一
+        # 长度归一
         alpha = 1.0 if self.length_norm else 0.0
         lp_resp = (lp_a * mask_t).sum(dim=1) / (denom ** alpha)
     
@@ -164,7 +164,7 @@ class GRPOTrainer:
             r_g  = r[s:e]
             lp_g = lp_resp[s:e]
     
-            # ✅ 组内标准化 + τ
+            # 组内标准化
             mu = r_g.mean()
             std = r_g.std()
             if float(std.item()) < 1e-6:
@@ -185,7 +185,7 @@ class GRPOTrainer:
             ps = p_star
             pstar_ent_list.append(float(-(ps * ps.clamp_min(1e-12).log()).sum().item()))
             r_std_acc += float(std.item())
-            # IQR（可选）
+            # IQR
             q25, q75 = torch.quantile(r_g, 0.25), torch.quantile(r_g, 0.75)
             r_iqr_acc += float((q75 - q25).item())
             r_grp_cnt += 1
@@ -214,15 +214,15 @@ class GRPOTrainer:
         self.last_stats.update({
             "loss": float(loss.item()),
             "kl_mean": kl_mean,
-            "kl_forward_mean": kl_fwd_mean,   # ✅ 新增
+            "kl_forward_mean": kl_fwd_mean,
             "rm_mean": r_mean,
             "entropy_tok": ent_tok,
             "tau": float(self.tau),
             "groups": int(groups_cnt),
             "items": int(total_items),
             "pstar_entropy": float(pstar_entropy),
-            "r_std": float(r_std_mean),        # ✅ 新增
-            "r_iqr": float(r_iqr_mean),        # ✅ 新增
+            "r_std": float(r_std_mean),    
+            "r_iqr": float(r_iqr_mean),     
             "skip": False,
         })
         return dict(self.last_stats)
