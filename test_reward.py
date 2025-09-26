@@ -1,23 +1,18 @@
-import os
-os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
-os.environ['TRANSFORMERS_OFFLINE'] = '0'
-os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
-
 import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 def test_reward_model():
     device = "cuda:0"
-    model_name = "Skywork/Skywork-Reward-V2-Qwen3-0.6B"
+    model_name = "Skywork/Skywork-Reward-V2-Qwen3-0.6B" # 
 
-    # 加载tokenizer和模型（不指定device_map）
+    # 加载tokenizer和模型
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForSequenceClassification.from_pretrained(
         model_name,
         torch_dtype=torch.float16,  # 用半精度节省显存
         # num_labels=1,
     )
-    model.to(device)  # 手动搬到GPU
+    model.to(device) 
     model.eval()
 
     candidates = [

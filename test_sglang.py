@@ -1,9 +1,3 @@
-"""
-Quick test: verify SGLang offline engine with GPT2 small
-- 不依赖 train.py / RL 部分
-- 仅测试加载 & 单次生成
-"""
-
 import torch
 
 def main():
