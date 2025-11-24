@@ -347,7 +347,6 @@ class GPT(nn.Module):
 
         return optimizer
 
-    #用于估算实际运行时的 MFU
     def estimate_mfu(self, fwdbwd_per_iter, dt):
         """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
         # first estimate the number of flops we do per iteration.

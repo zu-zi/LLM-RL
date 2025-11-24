@@ -116,7 +116,7 @@ rm -f /root/autodl-tmp/Results/rollout_logs/*.log
 sudo rm -rf /root/autodl-tmp/.Trash-0/*
 
 # 项目结构
-```
+<!-- ```
 LLM-RL
 ├── data
 │   └── RL_dataset
@@ -141,8 +141,8 @@ LLM-RL
 ├── train_GRPO.py
 ├── train_PPO.py
 └── train.py
-```
-+ data/RL_dataset/prepare.py：RL 训练数据的清洗与标准化
+``` -->
+<!-- + data/RL_dataset/prepare.py：RL 训练数据的清洗与标准化
 + Results/：训练产出目录（权重、日志、评测结果等）,默认放到/root/autodl-tmp/,可改
 + RL/DAPO.py：DAPO 算法实现
 + RL/GRPO.py：GRPO 算法实现
@@ -159,4 +159,25 @@ LLM-RL
 + train_DAPO.py：DAPO 训练入口脚本
 + train_GRPO.py：GRPO 训练入口脚本
 + train_PPO.py：PPO 训练入口脚本
-+ train.py：原nanoGPT训练脚本，RL扩展基础
++ train.py：原nanoGPT训练脚本，RL扩展基础 -->
+
+```
+.
+├── model.py                   
+├── rollout_worker.py            
+├── RL/
+│   ├── PPO.py                   
+│   ├── GRPO.py                 
+│   ├── DAPO.py                  
+│   └── common/
+│       ├── tokenizers.py        
+│       ├── sampling.py        
+│       ├── export_sglang.py      
+│       ├── device_utils.py      
+│       └── train_utils.py     
+├── utils/
+│   └── rollout_pool.py          
+├── train_PPO.py
+├── train_GRPO.py
+└── train_DAPO.py
+```
