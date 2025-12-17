@@ -31,6 +31,72 @@ python3 -m pip install --index-url https://download.pytorch.org/whl/cu128 torch 
 
 python3 -m pip install -U numpy transformers datasets tiktoken bitsandbytes accelerate
 
+# （新增）修复 tvm_ffi 的 dlpack JIT warning
+python3 -m pip install -U torch-c-dlpack-ext
+
+# 1 环境变量
+export HF_ENDPOINT=https://hf-mirror.com
+export TRANSFORMERS_OFFLINE=0
+export HF_HUB_DISABLE_TELEMETRY=1
+export TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9"    # 兼容 20/30/40 系
+export PYTORCH_ALLOC_CONF=expandable_segments:True
+export CUDA_LAUNCH_BLOCKING=0
+
+# Hugging Face 缓存放到大盘
+mkdir -p /root/autodl-tmp/hf
+export HF_HOME=/root/autodl-tmp/hf
+
+# CUDA Path
+export CUDA_HOME=/usr/local/cuda-12.8
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+
+# 2 SGLang
+python3 -m pip install -U "sglang[all]"
+python3 -m pip install -U sgl-kernel
+
+# 3 FlashInfer
+python3 -m pip install -U flashinfer-python flashinfer-cubin
+python3 -m pip install -U --index-url https://flashinfer.ai/whl/cu128 flashinfer-jit-cache
+
+# 4 版本校验
+python3 - <<'PY'
+import torch, importlib
+print("torch:", torch.__version__, "cuda:", torch.version.cuda)
+try:
+    import sglang
+    print("sglang:", sglang.__version__)
+except Exception as e:
+    print("sglang import error:", e)
+try:
+    fi = importlib.import_module("flashinfer")
+    print("flashinfer imported OK")
+except Exception as e:
+    print("flashinfer import error:", e)
+PY
+
+# python3 test_sglang.py
+
+# data
+python3 data/RL_dataset/prepare.py
+
+# train
+python3 train_PPO.py
+# python3 train_GRPO.py
+# python3 train_DAPO.py
+```
+<!-- apt-get update
+apt-get install -y git
+git clone https://github.com/zu-zi/LLM-RL.git
+cd LLM-RL
+
+# 0 基础环境
+python3 -m pip install -U pip
+
+# PyTorch 2.8 + cu128
+python3 -m pip install --index-url https://download.pytorch.org/whl/cu128 torch torchvision torchaudio
+
+python3 -m pip install -U numpy transformers datasets tiktoken bitsandbytes accelerate
+
 # 1 环境变量
 export HF_ENDPOINT=https://hf-mirror.com
 export TRANSFORMERS_OFFLINE=0
@@ -80,10 +146,7 @@ PY
 python3 data/RL_dataset/prepare.py
 
 # train
-python3 train_PPO.py
-# python3 train_GRPO.py
-# python3 train_DAPO.py
-```
+python3 train_PPO.py -->
 
 # 运行时：
 + 每次开机重新执行：export HF_ENDPOINT=https://hf-mirror.com
