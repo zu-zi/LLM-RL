@@ -31,72 +31,6 @@ python3 -m pip install --index-url https://download.pytorch.org/whl/cu128 torch 
 
 python3 -m pip install -U numpy transformers datasets tiktoken bitsandbytes accelerate
 
-# （新增）修复 tvm_ffi 的 dlpack JIT warning
-python3 -m pip install -U torch-c-dlpack-ext
-
-# 1 环境变量
-export HF_ENDPOINT=https://hf-mirror.com
-export TRANSFORMERS_OFFLINE=0
-export HF_HUB_DISABLE_TELEMETRY=1
-export TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9"    # 兼容 20/30/40 系
-export PYTORCH_ALLOC_CONF=expandable_segments:True
-export CUDA_LAUNCH_BLOCKING=0
-
-# Hugging Face 缓存放到大盘
-mkdir -p /root/autodl-tmp/hf
-export HF_HOME=/root/autodl-tmp/hf
-
-# CUDA Path
-export CUDA_HOME=/usr/local/cuda-12.8
-export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
-
-# 2 SGLang
-python3 -m pip install -U "sglang[all]"
-python3 -m pip install -U sgl-kernel
-
-# 3 FlashInfer
-python3 -m pip install -U flashinfer-python flashinfer-cubin
-python3 -m pip install -U --index-url https://flashinfer.ai/whl/cu128 flashinfer-jit-cache
-
-# 4 版本校验
-python3 - <<'PY'
-import torch, importlib
-print("torch:", torch.__version__, "cuda:", torch.version.cuda)
-try:
-    import sglang
-    print("sglang:", sglang.__version__)
-except Exception as e:
-    print("sglang import error:", e)
-try:
-    fi = importlib.import_module("flashinfer")
-    print("flashinfer imported OK")
-except Exception as e:
-    print("flashinfer import error:", e)
-PY
-
-# python3 test_sglang.py
-
-# data
-python3 data/RL_dataset/prepare.py
-
-# train
-python3 train_PPO.py
-# python3 train_GRPO.py
-# python3 train_DAPO.py
-```
-<!-- apt-get update
-apt-get install -y git
-git clone https://github.com/zu-zi/LLM-RL.git
-cd LLM-RL
-
-# 0 基础环境
-python3 -m pip install -U pip
-
-# PyTorch 2.8 + cu128
-python3 -m pip install --index-url https://download.pytorch.org/whl/cu128 torch torchvision torchaudio
-
-python3 -m pip install -U numpy transformers datasets tiktoken bitsandbytes accelerate
-
 # 1 环境变量
 export HF_ENDPOINT=https://hf-mirror.com
 export TRANSFORMERS_OFFLINE=0
@@ -146,7 +80,10 @@ PY
 python3 data/RL_dataset/prepare.py
 
 # train
-python3 train_PPO.py -->
+python3 train_PPO.py
+# python3 train_GRPO.py
+# python3 train_DAPO.py
+```
 
 # 运行时：
 + 每次开机重新执行：export HF_ENDPOINT=https://hf-mirror.com
@@ -179,7 +116,7 @@ rm -f /root/autodl-tmp/Results/rollout_logs/*.log
 sudo rm -rf /root/autodl-tmp/.Trash-0/*
 
 # 项目结构
-<!-- ```
+```
 LLM-RL
 ├── data
 │   └── RL_dataset
@@ -204,8 +141,8 @@ LLM-RL
 ├── train_GRPO.py
 ├── train_PPO.py
 └── train.py
-``` -->
-<!-- + data/RL_dataset/prepare.py：RL 训练数据的清洗与标准化
+```
++ data/RL_dataset/prepare.py：RL 训练数据的清洗与标准化
 + Results/：训练产出目录（权重、日志、评测结果等）,默认放到/root/autodl-tmp/,可改
 + RL/DAPO.py：DAPO 算法实现
 + RL/GRPO.py：GRPO 算法实现
@@ -222,25 +159,4 @@ LLM-RL
 + train_DAPO.py：DAPO 训练入口脚本
 + train_GRPO.py：GRPO 训练入口脚本
 + train_PPO.py：PPO 训练入口脚本
-+ train.py：原nanoGPT训练脚本，RL扩展基础 -->
-
-```
-.
-├── model.py                   
-├── rollout_worker.py            
-├── RL/
-│   ├── PPO.py                   
-│   ├── GRPO.py                 
-│   ├── DAPO.py                  
-│   └── common/
-│       ├── tokenizers.py        
-│       ├── sampling.py        
-│       ├── export_sglang.py      
-│       ├── device_utils.py      
-│       └── train_utils.py     
-├── utils/
-│   └── rollout_pool.py          
-├── train_PPO.py
-├── train_GRPO.py
-└── train_DAPO.py
-```
++ train.py：原nanoGPT训练脚本，RL扩展基础
