@@ -21,7 +21,11 @@ except Exception:
     _HAS_WANDB = False
 
 # 路径
-OUT_DIR         = "/root/autodl-tmp/Results"
+# Project root: default = directory of this file, or override by env var
+WORK_DIR = os.environ.get("LLMRL_WORKDIR", os.path.dirname(os.path.abspath(__file__)))
+
+# All outputs / caches are stored INSIDE the repo root
+OUT_DIR = os.path.join(WORK_DIR, "Results")
 DEVICE          = "cuda"
 BLOCK_SIZE      = 256
 SEED            = 1337
@@ -55,9 +59,9 @@ MAX_NEW_TOK     = 96
 
 # sglang 池
 SGLANG_ON       = True
-SGLANG_MODEL_SYMLINK = "/root/autodl-tmp/actor_exports/current"
-SGLANG_EXPORT_BASE   = "/root/autodl-tmp/actor_exports"
-SGLANG_SYNC_DIR      = "/root/autodl-tmp/sgl_pool"
+SGLANG_SYNC_DIR      = os.path.join(WORK_DIR, ".cache/sglang/sgl_pool")
+SGLANG_EXPORT_BASE   = os.path.join(WORK_DIR, ".cache/sglang/actor_exports")
+SGLANG_MODEL_SYMLINK = os.path.join(WORK_DIR, ".cache/sglang/actor_exports/current")
 SGLANG_REFILL_CHUNK  = 64          # 72
 ROLL_MIN_FREE_MB     = 3000        # 6000
 ROLL_COOLDOWN_SEC    = 7           # 7

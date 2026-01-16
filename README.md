@@ -84,7 +84,40 @@ python3 train_PPO.py
 # python3 train_GRPO.py
 # python3 train_DAPO.py
 ```
+h200新版本环境：
+```
+conda activate /mnt/afs/wanzunian/wenwen/envs/env-efftoken
+python -m pip install -U pip
+python -m pip install --index-url https://download.pytorch.org/whl/cu128 torch torchvision torchaudio
+python -m pip install -U numpy transformers datasets tiktoken bitsandbytes accelerate wandb
+python -m pip install -U torch-c-dlpack-ext
 
+python -m pip install -U --no-cache-dir --timeout 300 --retries 30 \
+  -i https://pypi.org/simple \
+  --trusted-host pypi.org --trusted-host files.pythonhosted.org \
+  "sglang[all]"
+
+python -m pip install -U --no-cache-dir --timeout 300 --retries 30 \
+  -i https://pypi.org/simple \
+  --trusted-host pypi.org --trusted-host files.pythonhosted.org \
+  sgl-kernel
+
+python -m pip install -U flashinfer-python flashinfer-cubin
+python -m pip install -U --index-url https://flashinfer.ai/whl/cu128 flashinfer-jit-cache
+
+cd /mnt/afs/wanzunian/wenwen/LLM-RL
+
+mkdir -p .cache/hf
+mkdir -p .cache/sglang/sgl_pool
+mkdir -p .cache/sglang/actor_exports
+mkdir -p Results
+mkdir -p .tmp
+
+# 每次开新 shell
+conda activate /mnt/afs/wanzunian/wenwen/envs/env-efftoken
+cd /mnt/afs/wanzunian/wenwen/LLM-RL
+source env_h200.sh
+```
 # 运行时：
 + 每次开机重新执行：export HF_ENDPOINT=https://hf-mirror.com
 
