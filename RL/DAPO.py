@@ -50,6 +50,11 @@ class DAPOTrainer:
         he_on: bool = False, 
         he_frac: float = 0.2, 
         he_temp: float = 1.0,
+        # token selection (new, backward compatible)
+        toksel_mode: Optional[str] = None,  # full | entropy_ratio | entropy_budget | random_budget
+        toksel_rho: Optional[float] = None,
+        toksel_k: Optional[int] = None,
+        toksel_seed: Optional[int] = None,
     ):
         # 模型 / 设备
         self.actor = actor_model
@@ -79,6 +84,17 @@ class DAPOTrainer:
         self.he_frac = float(he_frac)
         self.he_temp = float(he_temp)
 
+        # new selection controls
+        self.toksel_mode = (str(toksel_mode).strip().lower() if toksel_mode is not None else None)
+        self.toksel_rho = float(toksel_rho) if toksel_rho is not None else None
+        self.toksel_k = int(toksel_k) if toksel_k is not None else None
+        self._toksel_gen = None
+        if toksel_seed is not None:
+            try:
+                self._toksel_gen = torch.Generator(device="cpu").manual_seed(int(toksel_seed))
+            except Exception:
+                self._toksel_gen = None
+
     # token entropy
     @torch.no_grad()
     def _forking_mask(self, logits_next: torch.Tensor, mask_t: torch.Tensor):
@@ -105,6 +121,103 @@ class DAPOTrainer:
     
         sel_ratio = (total_sel / max(total_resp, 1)) if total_resp > 0 else 0.0
         return he_mask, H_resp, float(sel_ratio)
+
+    @torch.no_grad()
+    def _select_mask(self, logits_next: torch.Tensor, mask_t: torch.Tensor):
+        """Return (mask_use, H_resp, sel_ratio, mode_str).
+
+        mask_t: [B, L] action-token mask (0/1) aligned to lp_a (T-1).
+        logits_next: [B, L, V] aligned to the *next-token* distribution.
+        """
+        # compute per-token entropy on action positions
+        logits = logits_next / max(self.he_temp, 1e-6)
+        probs = torch.softmax(logits, dim=-1)
+        H = -(probs * (probs.clamp_min(1e-12).log())).sum(-1)  # [B, L]
+        H_resp = H * mask_t.float()
+
+        # decide effective mode (backward compatible)
+        mode = self.toksel_mode
+        if mode is None:
+            # legacy behavior: he_on -> entropy_ratio; else -> full
+            if self.he_on and self.he_frac > 0.0:
+                mode = "entropy_ratio"
+            else:
+                mode = "full"
+
+        mode = str(mode).strip().lower()
+        if mode not in {"full", "entropy_ratio", "entropy_budget", "random_budget"}:
+            mode = "full"
+
+        total_resp = int(mask_t.sum().item())
+        if total_resp <= 0:
+            return mask_t.clone(), H_resp, 0.0, mode
+
+        if mode == "full":
+            mask_use = mask_t.clone()
+            sel_ratio = 1.0
+            return mask_use, H_resp, float(sel_ratio), mode
+
+        if mode == "entropy_ratio":
+            # legacy per-sequence top-rho selection
+            rho = self.toksel_rho
+            if rho is None:
+                rho = self.he_frac
+            rho = float(rho)
+            rho = max(0.0, min(1.0, rho))
+
+            he_mask = torch.zeros_like(mask_t)
+            total_sel = 0
+            for i in range(H_resp.size(0)):
+                m = mask_t[i].bool()
+                n = int(m.sum().item())
+                if n <= 0:
+                    continue
+                k = max(1, int(round(n * rho)))
+                vals = H_resp[i][m]
+                if k >= vals.numel():
+                    sel = m
+                else:
+                    thr = torch.topk(vals, k=k, largest=True).values.min()
+                    sel = (H_resp[i] >= thr) & m
+                he_mask[i] = sel.long()
+                total_sel += int(sel.sum().item())
+            sel_ratio = (total_sel / max(total_resp, 1))
+            return he_mask, H_resp, float(sel_ratio), mode
+
+        # budget modes: global K across the whole batch
+        K = self.toksel_k
+        if K is None:
+            # sensible default: at least 1, at most total_resp
+            K = total_resp
+        K = int(K)
+        K = max(1, K)
+        K = min(K, total_resp)
+
+        flat_idx = torch.nonzero(mask_t.bool(), as_tuple=False)  # [N, 2] (b, t)
+        if flat_idx.numel() == 0:
+            return mask_t.clone(), H_resp, 0.0, mode
+        flat_H = H_resp[flat_idx[:, 0], flat_idx[:, 1]]  # [N]
+
+        if K >= flat_H.numel():
+            mask_use = mask_t.clone()
+            sel_ratio = 1.0
+            return mask_use, H_resp, float(sel_ratio), mode
+
+        if mode == "entropy_budget":
+            topk = torch.topk(flat_H, k=K, largest=True).indices
+        else:  # random_budget
+            # sample K unique indices
+            try:
+                perm = torch.randperm(flat_H.numel(), generator=self._toksel_gen)
+            except Exception:
+                perm = torch.randperm(flat_H.numel())
+            topk = perm[:K]
+
+        sel_pairs = flat_idx[topk]
+        mask_use = torch.zeros_like(mask_t)
+        mask_use[sel_pairs[:, 0], sel_pairs[:, 1]] = 1
+        sel_ratio = float(K / max(total_resp, 1))
+        return mask_use.long(), H_resp, sel_ratio, mode
     
 
     # RM
@@ -184,14 +297,8 @@ class DAPOTrainer:
         lp_a = lp_a_full[:, :L]
         mask_t = mask_t[:, :L]
     
-        # 新增：高熵掩码
-        if self.he_on and self.he_frac > 0.0:
-            he_mask, H_resp, he_ratio = self._forking_mask(logits_a[:, 1:, :][:, :L, :], mask_t)
-            mask_use = he_mask
-        else:
-            H_resp = torch.zeros_like(mask_t, dtype=torch.float)
-            he_ratio = 1.0
-            mask_use = mask_t
+        # Token selection (Quantity×Quality control)
+        mask_use, H_resp, he_ratio, mode_str = self._select_mask(logits_a[:, 1:, :][:, :L, :], mask_t)
     
         # 从这往下，聚合与统计一律用 mask_use
         denom = mask_use.sum(dim=1).clamp_min(1e-8).float()
@@ -255,8 +362,13 @@ class DAPOTrainer:
         self.actor.train()
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
+        grad_norm = 0.0
         if self.max_grad_norm and self.max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+            try:
+                gn = torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+                grad_norm = float(gn.item()) if torch.is_tensor(gn) else float(gn)
+            except Exception:
+                grad_norm = 0.0
         self.opt.step()
     
         # 统计
@@ -267,8 +379,14 @@ class DAPOTrainer:
             kl_mean = float(kl_seq.mean().item()) if kl_seq is not None else 0.0
     
             # 高熵监控
+            resp_tokens_total = int(mask_t.sum().item())
+            sel_tokens_total  = int(mask_use.sum().item())
+            sel_ratio = float(sel_tokens_total / max(resp_tokens_total, 1))
+            avg_resp_len = float(resp_tokens_total / max(int(mask_t.size(0)), 1))
+
             H_mean     = float((H_resp.sum() / mask_t.sum().clamp_min(1)).item()) if mask_t.sum() > 0 else 0.0
             H_sel_mean = float(((H_resp * mask_use).sum() / mask_use.sum().clamp_min(1)).item()) if mask_use.sum() > 0 else 0.0
+            delta_H    = float(H_sel_mean - H_mean)
     
         self.last_stats.update({
             "loss": float(loss.item()),
@@ -282,6 +400,15 @@ class DAPOTrainer:
             "he_ratio": float(he_ratio),
             "H_mean": H_mean,
             "H_sel_mean": H_sel_mean,
+            "delta_H": delta_H,
+            "resp_tokens_total": resp_tokens_total,
+            "sel_tokens_total": sel_tokens_total,
+            "sel_ratio": sel_ratio,
+            "avg_resp_len": avg_resp_len,
+            "grad_norm": float(grad_norm),
+            "toksel_mode": mode_str,
+            "toksel_k": int(self.toksel_k) if self.toksel_k is not None else -1,
+            "toksel_rho": float(self.toksel_rho) if self.toksel_rho is not None else -1.0,
             "skip": False,
         })
         return dict(self.last_stats)

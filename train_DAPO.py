@@ -22,9 +22,10 @@ except Exception:
 WORK_DIR = os.environ.get("LLMRL_WORKDIR", os.path.dirname(os.path.abspath(__file__)))
 
 # All outputs / caches are stored INSIDE the repo root
-OUT_DIR = os.path.join(WORK_DIR, "Results")
+BASE_OUT_DIR = os.path.join(WORK_DIR, "Results")
+OUT_DIR = BASE_OUT_DIR  # will be rewritten in main() to a unique run dir
 DEVICE          = "cuda"
-BLOCK_SIZE      = 256
+BLOCK_SIZE      = 384
 SEED            = 1337
 EVAL_INTERVAL   = 10
 MAX_ITERS       = 1000
@@ -35,7 +36,7 @@ DROPOUT         = 0.0
 BIAS            = False
 
 # sglang
-SGLANG_ON       = True
+SGLANG_ON       = False
 SGLANG_SYNC_DIR      = os.path.join(WORK_DIR, ".cache/sglang/sgl_pool")
 SGLANG_EXPORT_BASE   = os.path.join(WORK_DIR, ".cache/sglang/actor_exports")
 SGLANG_MODEL_SYMLINK = os.path.join(WORK_DIR, ".cache/sglang/actor_exports/current")
@@ -51,13 +52,40 @@ LENGTH_NORM     = True
 TOP_K           = 0
 REP_PENALTY     = 1.0
 STOP_STRS       = ["\nHuman:", "\n\nHuman:"]
-MIN_RESP_TOK    = 24
-MAX_NEW_TOK     = 96
+MIN_RESP_TOK    = 32
+MAX_NEW_TOK     = 128
 
 # 熵
 HE_ON   = True   # or False
 HE_FRAC = 0.2
 HE_TEMP = 1.0
+
+# Token selection (Quantity×Quality control)
+# If TOKSEL_MODE is not set, trainer falls back to legacy behavior:
+#   HE_ON=True  -> entropy_ratio with rho=HE_FRAC
+#   HE_ON=False -> full
+TOKSEL_MODE = os.environ.get("TOKSEL_MODE", "").strip().lower() or None
+
+def _env_float(name: str, default: float) -> float:
+    v = os.environ.get(name, "").strip()
+    if not v:
+        return float(default)
+    try:
+        return float(v)
+    except Exception:
+        return float(default)
+
+def _env_int(name: str, default: int) -> int:
+    v = os.environ.get(name, "").strip()
+    if not v:
+        return int(default)
+    try:
+        return int(float(v))
+    except Exception:
+        return int(default)
+
+TOKSEL_RHO = _env_float("TOKSEL_RHO", HE_FRAC)
+TOKSEL_K   = _env_int("TOKSEL_K", -1)
 
 # 选择生效参数：因为 token entropy
 LR_ACTOR      = 4e-6
@@ -330,14 +358,32 @@ def _rebucket_and_topup(groups, G, dev, raw_actor, tok):
     return regrouped[:NUM_GROUPS], {"buckets": len(buckets), "rebuilt_groups": len(regrouped)}
 
 def main():
+    global OUT_DIR
     set_seed(SEED)
+
+    # Unique run directory (avoid appending different experiments to the same CSV)
+    _mode = TOKSEL_MODE
+    if _mode is None:
+        _mode = "entropy_ratio" if (HE_ON and HE_FRAC > 0.0) else "full"
+    _mode = str(_mode).strip().lower()
+    _tag = _mode
+    if _mode == "entropy_ratio":
+        _tag += f"_rho{TOKSEL_RHO:g}"
+    elif _mode in ("entropy_budget", "random_budget"):
+        if TOKSEL_K is not None and int(TOKSEL_K) > 0:
+            _tag += f"_K{int(TOKSEL_K)}"
+        else:
+            _tag += "_Kauto"
+
+    _ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    run_name = f"dapo_{INIT_FROM.replace('/', '-')}_{_tag}_seed{SEED}_{_ts}"
+    OUT_DIR = os.path.join(BASE_OUT_DIR, run_name)
     os.makedirs(OUT_DIR, exist_ok=True)
     ensure_dir(SGLANG_SYNC_DIR)
 
     run = None
     if WANDB_ON and _HAS_WANDB:
         try:
-            run_name = f"dapo_gpt2l_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             run = wandb.init(
                 project="hlhf-dapo",
                 name=run_name,
@@ -357,6 +403,9 @@ def main():
                     "sglang_on": SGLANG_ON, "sglang_refill_chunk": SGLANG_REFILL_CHUNK,
                     "roll_min_free_mb": ROLL_MIN_FREE_MB, "roll_cooldown_sec": ROLL_COOLDOWN_SEC,
                     "reward_model": REWARD_MODEL_NAME,
+                    "toksel_mode": _mode,
+                    "toksel_rho": float(TOKSEL_RHO),
+                    "toksel_k": int(TOKSEL_K),
                 },
             )
             print(f"[wandb] offline run started -> {run_name} (dir={OUT_DIR})", flush=True)
@@ -456,6 +505,10 @@ def main():
         length_norm=LENGTH_NORM,
         max_grad_norm=MAX_GRAD_NORM,
         he_on=HE_ON, he_frac=HE_FRAC, he_temp=HE_TEMP,
+        toksel_mode=TOKSEL_MODE,
+        toksel_rho=TOKSEL_RHO,
+        toksel_k=(TOKSEL_K if (TOKSEL_K is not None and int(TOKSEL_K) > 0) else None),
+        toksel_seed=SEED,
     )
 
     if len(EVAL_PROMPT_IDS) > 0:
@@ -464,10 +517,14 @@ def main():
         if run is not None:
             wandb.log({"baseline/iter0_reward_greedy": float(r0)}, step=0)
 
-    METRICS_CSV = os.path.join(OUT_DIR, "metrics_dapo.csv")
+    METRICS_CSV = os.path.join(OUT_DIR, "metrics.csv")
     if not os.path.exists(METRICS_CSV):
         with open(METRICS_CSV, "w") as f:
-            f.write("iter,loss,kl_mean,rm_mean,pstar_entropy,r_eval_greedy,items,lr,pool\n")
+            f.write(
+                "iter,loss,kl_mean,rm_mean,pstar_entropy,r_eval_greedy,items,lr,pool,"
+                "resp_tokens_total,sel_tokens_total,sel_ratio,avg_resp_len,"
+                "H_mean,H_sel_mean,delta_H,grad_norm,toksel_mode,toksel_k,toksel_rho\n"
+            )
 
     last_export_it = 0
     last_roll_t = 0.0
@@ -546,7 +603,13 @@ def main():
 
         print(f"[iter {it:04d}] loss={loss:.4f} kl={klm:.6f} rm={rmm:.4f} p*H={pent:.3f} r_eval_greedy={r_eval_greedy:.4f} items={items} lr={cur_lr:.2e} pool={pool_est}", flush=True)
         with open(METRICS_CSV, "a") as f:
-            f.write(f"{it},{loss},{klm},{rmm},{pent},{r_eval_greedy},{items},{cur_lr},{pool_est}\n")
+            f.write(
+                f"{it},{loss},{klm},{rmm},{pent},{r_eval_greedy},{items},{cur_lr},{pool_est},"
+                f"{stats.get('resp_tokens_total', float('nan'))},{stats.get('sel_tokens_total', float('nan'))},"
+                f"{stats.get('sel_ratio', float('nan'))},{stats.get('avg_resp_len', float('nan'))},"
+                f"{stats.get('H_mean', float('nan'))},{stats.get('H_sel_mean', float('nan'))},{stats.get('delta_H', float('nan'))},"
+                f"{stats.get('grad_norm', float('nan'))},{stats.get('toksel_mode', '')},{stats.get('toksel_k', -1)},{stats.get('toksel_rho', -1.0)}\n"
+            )
 
         if run is not None:
             wandb.log({
@@ -561,6 +624,15 @@ def main():
                 "fork/high_entropy_ratio": stats.get("he_ratio", float("nan")),
                 "fork/H_mean": stats.get("H_mean", float("nan")),
                 "fork/H_sel_mean": stats.get("H_sel_mean", float("nan")),
+                "fork/delta_H": stats.get("delta_H", float("nan")),
+                "fork/resp_tokens_total": stats.get("resp_tokens_total", float("nan")),
+                "fork/sel_tokens_total": stats.get("sel_tokens_total", float("nan")),
+                "fork/sel_ratio": stats.get("sel_ratio", float("nan")),
+                "fork/avg_resp_len": stats.get("avg_resp_len", float("nan")),
+                "fork/grad_norm": stats.get("grad_norm", float("nan")),
+                "fork/toksel_mode": stats.get("toksel_mode", ""),
+                "fork/toksel_k": stats.get("toksel_k", -1),
+                "fork/toksel_rho": stats.get("toksel_rho", -1.0),
             }, step=it)
 
         # 定期导出给 sglang

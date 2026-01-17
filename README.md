@@ -193,3 +193,44 @@ LLM-RL
 + train_GRPO.py：GRPO 训练入口脚本
 + train_PPO.py：PPO 训练入口脚本
 + train.py：原nanoGPT训练脚本，RL扩展基础
+
+***
+## run
+```
+source /mnt/afs/wanzunian/wenwen/bin/env_common.sh
+export CONDARC=$W/.condarc
+conda activate $W/envs/env-efftoken
+source env_h200.sh
+python3 data/RL_dataset/prepare.py
+
+TOKSEL_MODE=full python -u train_DAPO.py
+
+TOKSEL_MODE=entropy_ratio TOKSEL_RHO=0.2 python -u train_DAPO.py
+TOKSEL_MODE=entropy_ratio TOKSEL_RHO=0.8 python -u train_DAPO.py
+
+TOKSEL_MODE=entropy_budget TOKSEL_K=256 python -u train_DAPO.py
+TOKSEL_MODE=entropy_budget TOKSEL_K=512 python -u train_DAPO.py
+
+TOKSEL_MODE=random_budget TOKSEL_K=256 python -u train_DAPO.py
+TOKSEL_MODE=random_budget TOKSEL_K=512 python -u train_DAPO.py
+
+# 画图
+python tools/plot_metrics.py --csv Results/<你的run目录>/metrics.csv
+python tools/plot_metrics.py \
+  --csv  Results/<entropy_budget_run>/metrics.csv \
+  --csv2 Results/<random_budget_run>/metrics.csv \
+  --label2 randomK256
+
+
+# baseline
+TOKSEL_MODE=full python -u train_DAPO.py
+
+# “现象复现”：比例太小可能不稳
+TOKSEL_MODE=entropy_ratio TOKSEL_RHO=0.2 python -u train_DAPO.py
+
+# 固定预算：量化 Neff
+TOKSEL_MODE=entropy_budget TOKSEL_K=256 python -u train_DAPO.py
+
+# 同预算对照：验证质量是否有贡献
+TOKSEL_MODE=random_budget TOKSEL_K=256 python -u train_DAPO.py
+```
