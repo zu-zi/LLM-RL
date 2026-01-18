@@ -203,34 +203,45 @@ conda activate $W/envs/env-efftoken
 source env_h200.sh
 python3 data/RL_dataset/prepare.py
 
+tmux new -s dapo_full
 TOKSEL_MODE=full python -u train_DAPO.py
 
+tmux new -s dapo_r02
 TOKSEL_MODE=entropy_ratio TOKSEL_RHO=0.2 python -u train_DAPO.py
+
+tmux new -s dapo_r08
 TOKSEL_MODE=entropy_ratio TOKSEL_RHO=0.8 python -u train_DAPO.py
 
+# 需要先根据前三条判断K值
+tmux new -s dapo_k256
 TOKSEL_MODE=entropy_budget TOKSEL_K=256 python -u train_DAPO.py
-TOKSEL_MODE=entropy_budget TOKSEL_K=512 python -u train_DAPO.py
 
+tmux new -s dapo_rand256
 TOKSEL_MODE=random_budget TOKSEL_K=256 python -u train_DAPO.py
-TOKSEL_MODE=random_budget TOKSEL_K=512 python -u train_DAPO.py
 
 # 画图
-python tools/plot_metrics.py --csv Results/<你的run目录>/metrics.csv
+python tools/plot_metrics.py --csv Results/dapo_gpt2-large_entropy_ratio_rho0.2_seed1337_20260117_173144/metrics.csv
 python tools/plot_metrics.py \
   --csv  Results/<entropy_budget_run>/metrics.csv \
   --csv2 Results/<random_budget_run>/metrics.csv \
   --label2 randomK256
 
+tmux new -s dapo
 
 # baseline
 TOKSEL_MODE=full python -u train_DAPO.py
+tmux attach -t dapo
+
+bash
 
 # “现象复现”：比例太小可能不稳
 TOKSEL_MODE=entropy_ratio TOKSEL_RHO=0.2 python -u train_DAPO.py
 
+TOKSEL_MODE=entropy_ratio TOKSEL_RHO=0.8 python -u train_DAPO.py
+
 # 固定预算：量化 Neff
-TOKSEL_MODE=entropy_budget TOKSEL_K=256 python -u train_DAPO.py
+STOP_AT=300 TOKSEL_MODE=entropy_budget TOKSEL_K=256 python -u train_DAPO.py
 
 # 同预算对照：验证质量是否有贡献
-TOKSEL_MODE=random_budget TOKSEL_K=256 python -u train_DAPO.py
+STOP_AT=300 TOKSEL_MODE=random_budget  TOKSEL_K=256 python -u train_DAPO.py
 ```

@@ -274,7 +274,9 @@ def greedy_eval_reward(actor_model, gpt2_tok, eval_prompt_ids, reward_tokenizer,
         if was_train: actor_model.train()
     texts = [normalize_for_reward(t, reward_tokenizer) for t in texts]
     toks = reward_tokenizer(texts, padding=True, truncation=True, max_length=1024, return_tensors="pt")
-    outs = reward_model(**toks)
+    toks = {k: v.to(dev) for k, v in toks.items()}
+    with torch.no_grad():
+        outs = reward_model(**toks)
     logits = getattr(outs, "logits", None)
     if logits is None: return float("nan")
     if logits.dim() == 2 and logits.size(-1) == 1: logits = logits.squeeze(-1)
@@ -481,14 +483,20 @@ def main():
         opt_a = torch.optim.AdamW(raw_actor.parameters(), lr=LR_ACTOR, betas=(BETA1,BETA2), weight_decay=WD_ACTOR)
         print("[optim] torch.optim.AdamW")
 
-    # RM（CPU）
-    print(f"[reward] loading {REWARD_MODEL_NAME} on CPU...")
-    reward_model = AutoModelForSequenceClassification.from_pretrained(REWARD_MODEL_NAME, device_map="cpu", torch_dtype=torch.float32).eval()
+    # RM（GPU）
+    print(f"[reward] loading {REWARD_MODEL_NAME} on GPU...")
+    reward_model = AutoModelForSequenceClassification.from_pretrained(
+        REWARD_MODEL_NAME,
+        torch_dtype=torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16,
+    ).eval().to(dev)
+
     reward_tok = AutoTokenizer.from_pretrained(REWARD_MODEL_NAME, use_fast=True)
     if getattr(reward_tok, "pad_token", None) is None and getattr(reward_tok, "eos_token", None) is not None:
         reward_tok.pad_token = reward_tok.eos_token
-    try: reward_tok.padding_side = "right"
-    except Exception: pass
+    try:
+        reward_tok.padding_side = "right"
+    except Exception:
+        pass
 
     # 若想完全关闭 KL：kl_ctl=0.0 或者 ref=None（二选一即可）
     trainer = DAPOTrainer(
