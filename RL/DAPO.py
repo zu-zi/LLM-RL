@@ -130,10 +130,24 @@ class DAPOTrainer:
         logits_next: [B, L, V] aligned to the *next-token* distribution.
         """
         # compute per-token entropy on action positions
-        logits = logits_next / max(self.he_temp, 1e-6)
-        probs = torch.softmax(logits, dim=-1)
-        H = -(probs * (probs.clamp_min(1e-12).log())).sum(-1)  # [B, L]
-        H_resp = H * mask_t.float()
+        temp = max(self.he_temp, 1e-6)
+
+        # always keep entropy stats in fp32 (selection is under no_grad, doesn't affect gradients)
+        H_resp = torch.zeros(
+            mask_t.size(0), mask_t.size(1),
+            device=mask_t.device,
+            dtype=torch.float32
+        )
+
+        flat_idx = torch.nonzero(mask_t.bool(), as_tuple=False)  # [N,2] (b,t)
+        if flat_idx.numel() > 0:
+            # logits_next may be bf16/fp16 for speed; cast to fp32 for stable entropy computation
+            flat_logits = logits_next[flat_idx[:, 0], flat_idx[:, 1], :].float() / temp  # [N,V] fp32
+            flat_probs = torch.softmax(flat_logits, dim=-1)  # fp32
+            flat_H = -(flat_probs * flat_probs.clamp_min(1e-12).log()).sum(-1)  # [N] fp32
+
+            # ensure dtype matches destination
+            H_resp[flat_idx[:, 0], flat_idx[:, 1]] = flat_H
 
         # decide effective mode (backward compatible)
         mode = self.toksel_mode
@@ -239,7 +253,7 @@ class DAPOTrainer:
             texts.append(txt)
 
         rm_dev = next(self.rm.parameters()).device
-        toks = self.rm_tok(texts, padding=True, truncation=True, max_length=1024, return_tensors="pt")
+        toks = self.rm_tok(texts, padding=True, truncation=True, max_length=512, return_tensors="pt")
         toks = {k: v.to(rm_dev) for k, v in toks.items()}
         outs = self.rm(**toks)
         logits = getattr(outs, "logits", None)
@@ -251,14 +265,24 @@ class DAPOTrainer:
 
     # token logp
     def _seq_logp(self, seqs: torch.Tensor):
+        use_dtype = torch.bfloat16 if (self.device_type != "cpu" and torch.cuda.is_bf16_supported()) else torch.float16
+
         # actor logits: 保留梯度
-        logits_a = model_all_logits(self.actor, seqs, self.device_type, ptdtype=torch.float32, micro_batch_size=self.mb_logits)
+        logits_a = model_all_logits(
+            self.actor, seqs, self.device_type,
+            ptdtype=use_dtype,
+            micro_batch_size=self.mb_logits
+        )
         lp_a = token_logprobs_from_logits(logits_a, seqs)  # [B, T-1]
 
         # 参考策略: 若存在；无梯度
         if self.ref is not None:
             with torch.no_grad():
-                logits_r = model_all_logits(self.ref, seqs, self.device_type, ptdtype=torch.float32, micro_batch_size=self.mb_logits)
+                logits_r = model_all_logits(
+                    self.ref, seqs, self.device_type,
+                    ptdtype=use_dtype,
+                    micro_batch_size=self.mb_logits
+                )
                 lp_r = token_logprobs_from_logits(logits_r, seqs)
         else:
             lp_r = None
@@ -270,6 +294,7 @@ class DAPOTrainer:
             lp_a = _clean_logp(lp_a, fallback=None)
 
         return logits_a, lp_a, lp_r
+
 
     # 
     def _pack(self, groups: List[List[dict]], block_size: int) -> Tuple[Samples, List[Tuple[int, int]]]:

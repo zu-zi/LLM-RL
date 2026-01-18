@@ -10,7 +10,7 @@ from RL.DAPO import DAPOTrainer
 from RL.PPO import Samples, normalize_for_reward
 
 # W&B（离线）
-WANDB_ON = True
+WANDB_ON = False
 os.environ.setdefault("WANDB_MODE", "offline")
 os.environ.setdefault("WANDB_SILENT", "true")
 try:
@@ -51,7 +51,8 @@ LENGTH_NORM     = True
 # 生成
 TOP_K           = 0
 REP_PENALTY     = 1.0
-STOP_STRS       = ["\nHuman:", "\n\nHuman:"]
+# STOP_STRS       = ["\nHuman:", "\n\nHuman:"]
+STOP_STRS       = []
 MIN_RESP_TOK    = 32
 MAX_NEW_TOK     = 128
 
@@ -138,8 +139,9 @@ def decode_with_sampling(model, idx, max_new, eos_id, block_size,
             logits = model(x)
             if isinstance(logits, tuple): logits = logits[0]
             last = logits[:, -1, :]
-            if rep_penalty and out.numel() > 0:
-                uniq = torch.unique(out); last[:, uniq] = last[:, uniq] / float(rep_penalty)
+            if rep_penalty and float(rep_penalty) != 1.0 and out.numel() > 0:
+                uniq = torch.unique(out)
+                last[:, uniq] = last[:, uniq] / float(rep_penalty)
             last = last / max(float(temperature), 1e-6)
             if top_k and top_k > 0:
                 kth = torch.topk(last, k=min(int(top_k), last.size(-1)), dim=-1).values[..., -1:]
@@ -160,10 +162,13 @@ def decode_with_sampling(model, idx, max_new, eos_id, block_size,
                 next_id = alt
             out = torch.cat((out, next_id.to(device)), dim=1)
             if (out.size(1) - start) >= int(min_resp):
-                if eos_id is not None and int(next_id.item()) == int(eos_id): break
-                if stop_strs and tokenizer_decode is not None:
+                if eos_id is not None and int(next_id.item()) == int(eos_id):
+                    break
+
+                if stop_strs and tokenizer_decode is not None and ((out.size(1) - start) % 8 == 0):
                     tail = tokenizer_decode(out[0][-min(out.size(1), block_size):].tolist())
-                    if any(s in tail for s in stop_strs): break
+                    if any(s in tail for s in stop_strs):
+                        break
         return out
     finally:
         if was_train: model.train()
@@ -273,7 +278,7 @@ def greedy_eval_reward(actor_model, gpt2_tok, eval_prompt_ids, reward_tokenizer,
     finally:
         if was_train: actor_model.train()
     texts = [normalize_for_reward(t, reward_tokenizer) for t in texts]
-    toks = reward_tokenizer(texts, padding=True, truncation=True, max_length=1024, return_tensors="pt")
+    toks = reward_tokenizer(texts, padding=True, truncation=True, max_length=512, return_tensors="pt")
     toks = {k: v.to(dev) for k, v in toks.items()}
     with torch.no_grad():
         outs = reward_model(**toks)
